@@ -903,12 +903,29 @@ def main():
     """Main CLI entry point"""
     parser = argparse.ArgumentParser(
         description='HueCLI - Generate multi-color 3D print STLs from images',
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        epilog='Example: python3 huecli.py image.png'
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='Example: python3 huecli.py image.png --colors 5 --size 120x160'
     )
 
-    # Single positional argument: image path
     parser.add_argument('image', help='Input image path (PNG/JPG/WEBP)')
+    parser.add_argument('-f', '--filaments', type=str, default=None,
+                        help='Filament library CSV path (default: filaments.csv)')
+    parser.add_argument('-c', '--colors', type=int, default=None,
+                        help='Number of colors/filaments (default: 4)')
+    parser.add_argument('-n', '--nozzle', type=float, default=None,
+                        help='Nozzle diameter in mm (default: 0.2)')
+    parser.add_argument('-l', '--layer-height', type=float, default=None,
+                        help='Layer height in mm (default: 0.08)')
+    parser.add_argument('-m', '--model-height', type=float, default=None,
+                        help='Total model height in mm (default: 2.0)')
+    parser.add_argument('-s', '--size', type=str, default=None,
+                        help='Print size as WIDTHxHEIGHT in mm, e.g. 100x140 (default: 100x140)')
+    parser.add_argument('-o', '--output', type=str, default=None,
+                        help='Output filename (default: <input_stem>.stl)')
+    parser.add_argument('-d', '--min-delta-e', type=float, default=None,
+                        help='Min color difference delta-E between filaments (default: 5.0)')
+    parser.add_argument('--cap-layers', type=str, default=None, metavar='BOOL',
+                        help='Use cap layers (black base + auto colors + clear top) [yes/no]')
 
     args = parser.parse_args()
 
@@ -921,7 +938,7 @@ def main():
         print("\nHueCLI - Multi-Color 3D Print STL Generator")
         print(f"Input: {args.image}\n")
 
-        filaments_csv = prompt_with_default(
+        filaments_csv = args.filaments if args.filaments is not None else prompt_with_default(
             "Filament library CSV path",
             "filaments.csv",
             str
@@ -932,32 +949,31 @@ def main():
             logger.error(f"Filaments CSV not found: {filaments_csv}")
             return 1
 
-        color_count = prompt_with_default(
+        color_count = args.colors if args.colors is not None else prompt_with_default(
             "Number of colors/filaments",
             4,
             int
         )
 
-        nozzle_diameter = prompt_with_default(
+        nozzle_diameter = args.nozzle if args.nozzle is not None else prompt_with_default(
             "Nozzle diameter (mm)",
             0.2,
             float
         )
 
-        layer_height = prompt_with_default(
+        layer_height = args.layer_height if args.layer_height is not None else prompt_with_default(
             "Layer height (mm)",
             0.08,
             float
         )
 
-        model_height = prompt_with_default(
+        model_height = args.model_height if args.model_height is not None else prompt_with_default(
             "Total model height (mm)",
             2.0,
             float
         )
 
-        # Size prompt (width x height format)
-        size_input = prompt_with_default(
+        size_input = args.size if args.size is not None else prompt_with_default(
             "Print size - width x height (mm)",
             "100x140",
             str
@@ -980,19 +996,19 @@ def main():
         input_path = Path(args.image)
         default_output = input_path.stem + ".stl"
 
-        output_name = prompt_with_default(
+        output_name = args.output if args.output is not None else prompt_with_default(
             "Output filename",
             default_output,
             str
         )
 
-        min_color_difference = prompt_with_default(
+        min_color_difference = args.min_delta_e if args.min_delta_e is not None else prompt_with_default(
             "Min color difference (delta-E)",
             5.0,
             float
         )
 
-        use_cap_layers = prompt_with_default(
+        use_cap_layers = (args.cap_layers.lower() in ('y', 'yes', 'true', '1')) if args.cap_layers is not None else prompt_with_default(
             "Use cap layers (black base + auto colors + clear top)",
             False,
             bool
