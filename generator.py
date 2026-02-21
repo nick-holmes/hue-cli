@@ -726,10 +726,10 @@ class STLGenerator:
         return thickness_maps
 
     def generate_all(self, output_base_path, single_stl=True):
-        """Generate STL files with cumulative stacking and Beer-Lambert thickness mapping
+        """Generate STL files with global heightmap and fixed color boundaries
 
-        Each color sits directly on top of the previous one (per-pixel varying z_bottom).
-        Thickness within each color varies per pixel based on brightness + Beer-Lambert gamma.
+        One global heightmap maps brightness to height. Color boundaries are flat
+        planes at fixed z-values, ensuring no color intermingling at any print layer.
 
         Args:
             output_base_path: Path for output files
@@ -785,7 +785,7 @@ class STLGenerator:
             height = lc * self.layer_height
             logger.info(f"  {name}: TD={td:.1f}mm → {lc} layers ({height:.2f}mm)")
 
-        # Generate STL for each color with CUMULATIVE STACKING
+        # Generate STL for each color with fixed z-boundaries
         from scipy import ndimage
 
         # Compute global max brightness for full-range normalization
@@ -794,13 +794,17 @@ class STLGenerator:
 
         height_px, width_px = enhanced_grayscale.shape
 
-        # Cumulative z tracking: each color sits on top of the previous
-        z_prev_top = np.zeros((height_px, width_px))
+        # Compute single global heightmap (brightness → height)
+        min_height = 2 * self.layer_height  # bed adhesion minimum
+        pixel_height = min_height + enhanced_grayscale / max(global_brightness_max, 1e-6) * (self.model_height - min_height)
+        pixel_height = np.clip(pixel_height, min_height, self.model_height)
+        pixel_height = np.where(alpha_pixels, pixel_height, 0)
 
-        # For single-STL mode
-        z_top_combined = np.zeros((height_px, width_px))
-        combined_mask = np.zeros((height_px, width_px), dtype=bool)
+        # Fixed color boundary z-values (flat planes — no intermingling)
+        z_boundaries = layer_boundaries * self.layer_height
+
         filament_schedule = []
+        min_thickness = self.layer_height * 0.5
 
         for i, filament in sorted_filaments.iterrows():
             color_name = filament['name'].replace(' ', '_').replace('/', '_')
@@ -809,12 +813,15 @@ class STLGenerator:
             layer_start = layer_boundaries[i]
             layer_end = layer_boundaries[i + 1]
 
-            # All pixels participate in every color
-            pixel_mask = self.alpha_mask >= 0.5
+            # Fixed z boundaries for this color band
+            z_bottom_flat = float(z_boundaries[i])
+            z_top_boundary = float(z_boundaries[i + 1])
+
+            # Pixels that reach into this color's z-band
+            pixel_mask = (pixel_height > z_bottom_flat + min_thickness) & alpha_pixels
 
             pixel_count = np.sum(pixel_mask)
-            total_pixels = np.sum(self.alpha_mask >= 0.5)
-            coverage_pct = pixel_count / total_pixels * 100 if total_pixels > 0 else 0
+            total_pixels = np.sum(alpha_pixels)
 
             # Clean up small disconnected regions
             labeled, num_regions = ndimage.label(pixel_mask)
@@ -830,63 +837,26 @@ class STLGenerator:
                 removed_pixels = pixel_count - pixel_count_filtered
                 if removed_pixels > 0:
                     logger.info(f"  Filtered {removed_pixels} pixels in {np.sum(small_regions) - 1} small regions (< {min_region_size} pixels)")
-                labeled, num_regions = ndimage.label(pixel_mask)
                 pixel_count = pixel_count_filtered
-                coverage_pct = pixel_count / total_pixels * 100 if total_pixels > 0 else 0
 
             logger.info(f"  {color_name}: layers {layer_start}-{layer_end} ({layer_end - layer_start} layers, {pixel_count} px)")
 
             if pixel_count > 0:
-                # Height range from TD-proportional layer allocation
-                height_range = (layer_end - layer_start) * self.layer_height
+                # z_top: pixel height clamped to this color's band
+                z_top_color = np.clip(pixel_height, z_bottom_flat, z_top_boundary)
+                z_bottom_color = np.full_like(pixel_height, z_bottom_flat)
 
-                # BEER-LAMBERT ENHANCED MAPPING
-                td = filament_tds[i]
-
-                # TD-based gamma curve
-                td_reference = 6.0
-                gamma = np.clip(0.5 + 0.5 * np.log2(td / td_reference + 0.01), 0.3, 2.0)
-
-                logger.debug(f"    TD={td:.1f}mm, gamma={gamma:.2f}")
-
-                # Normalize brightness to 0-1 (full range for all colors)
-                normalized = enhanced_grayscale / max(global_brightness_max, 1e-6)
-                normalized = np.clip(normalized, 0.0, 1.0)
-
-                # Apply Beer-Lambert gamma curve
-                normalized = np.power(normalized, gamma)
-
-                # CUMULATIVE STACKING: this color sits on top of previous
-                z_bottom_color = z_prev_top.copy()
-                z_top_color = z_bottom_color + normalized * height_range
-
-                # First color: minimum 2 layers for bed adhesion
-                if i == 0:
-                    min_height = 2 * self.layer_height
-                    z_top_color = np.maximum(z_top_color, min_height)
-
-                z_top_color = np.where(pixel_mask, z_top_color, z_bottom_color)
-
-                # Filter pixels with insufficient thickness
-                min_thickness = self.layer_height * 0.5
-                thickness = z_top_color - z_bottom_color
+                # Effective mask: pixels with enough thickness in this band
+                thickness = z_top_color - z_bottom_flat
                 color_effective_mask = pixel_mask & (thickness >= min_thickness)
-
-                # Update cumulative z for next color
-                z_prev_top = np.where(color_effective_mask, z_top_color, z_prev_top)
 
                 pixels_after_filter = np.sum(color_effective_mask)
                 if pixels_after_filter < pixel_count:
                     logger.debug(f"    Filtered {pixel_count - pixels_after_filter} thin pixels")
 
                 if color_effective_mask.any():
-                    z_bot_min = np.min(z_bottom_color[color_effective_mask])
                     z_top_max = np.max(z_top_color[color_effective_mask])
-                    logger.info(f"    z: {z_bot_min:.2f} - {z_top_max:.2f}mm")
-
-                # Accumulate for single-STL mode
-                z_top_combined = np.where(color_effective_mask, z_top_color, z_top_combined)
-                combined_mask |= color_effective_mask
+                    logger.info(f"    z: {z_bottom_flat:.2f} - {z_top_max:.2f}mm")
 
                 filament_schedule.append((filament['name'], layer_start, layer_end))
 
@@ -898,7 +868,7 @@ class STLGenerator:
                     if len(mesh.vertices) > 0:
                         mesh.export(str(output_path))
                         max_z_top = np.max(z_top_color[color_effective_mask])
-                        layer_start_actual = int(np.floor(z_bot_min / self.layer_height))
+                        layer_start_actual = int(np.floor(z_bottom_flat / self.layer_height))
                         layer_end_actual = int(np.ceil(max_z_top / self.layer_height))
                         generated_files.append((output_path, filament['name'], layer_start_actual, layer_end_actual))
                         logger.info(f"  Generated: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
@@ -908,16 +878,17 @@ class STLGenerator:
                 logger.warning(f"  No pixels for {color_name} - skipping")
 
         if single_stl:
-            # Generate single combined STL (z=0 to cumulative z_top)
+            # Generate single combined STL (z=0 to global heightmap)
             logger.info("Generating combined STL...")
             output_path = output_base_path.parent / f"{output_base_path.stem}.stl"
 
-            z_bottom_combined = np.zeros_like(z_top_combined)
-            mesh = self._generate_topographical_stl(z_bottom_combined, z_top_combined, combined_mask)
+            z_bottom_combined = np.zeros_like(pixel_height)
+            combined_mask = alpha_pixels & (pixel_height > min_thickness)
+            mesh = self._generate_topographical_stl(z_bottom_combined, pixel_height, combined_mask)
 
             if len(mesh.vertices) > 0:
                 mesh.export(str(output_path))
-                max_z_top = np.max(z_top_combined[combined_mask])
+                max_z_top = np.max(pixel_height[combined_mask])
                 layer_end_actual = int(np.ceil(max_z_top / self.layer_height))
                 generated_files.append((output_path, "Combined", 0, layer_end_actual))
                 logger.info(f"  Generated: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
