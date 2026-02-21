@@ -47,3 +47,6 @@ output/
 # Temporary files
 *.tmp
 *.bak
+*.webp
+/.zed
+/CLAUDE.md
