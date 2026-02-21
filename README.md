@@ -21,10 +21,35 @@ pip install -r requirements.txt
 ## Usage
 
 ```bash
+# Interactive mode (prompts for all parameters)
 python3 huecli.py image.png
+
+# Non-interactive with all flags
+python3 huecli.py image.png \
+  -f filaments.csv \
+  -c 5 \
+  -n 0.4 \
+  -l 0.04 \
+  -m 3.0 \
+  -s 120x160 \
+  -o output_name.stl \
+  -d 10.0 \
+  --cap-layers yes
 ```
 
-You'll be prompted for print parameters (filament library, colours, layer height, model height, print size, etc.). A preview window shows the expected result before generating STLs.
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-f, --filaments` | Filament library CSV path | `filaments.csv` |
+| `-c, --colors` | Number of colours/filaments | `4` |
+| `-n, --nozzle` | Nozzle diameter (mm) | `0.2` |
+| `-l, --layer-height` | Layer height (mm) | `0.08` |
+| `-m, --model-height` | Total model height (mm) | `2.0` |
+| `-s, --size` | Print size WxH (mm) | `100x140` |
+| `-o, --output` | Output filename | `<input_stem>.stl` |
+| `-d, --min-delta-e` | Min colour difference (delta-E) | `5.0` |
+| `--cap-layers` | Cap layers: black base + auto colours + clear top (yes/no) | `no` |
+
+Any flag left out will be prompted interactively. A preview window shows the expected result before generating STLs.
 
 ## Output
 
