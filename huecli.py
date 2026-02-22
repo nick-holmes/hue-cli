@@ -78,7 +78,7 @@ class FilamentLibrary:
             hex_color = hex_color[:6]  # Ignore alpha for now
         return tuple(int(hex_color[i:i+2], 16) / 255.0 for i in (0, 2, 4))
 
-    def select_best_filaments(self, target_colors_lab, count, layer_height=0.08, min_color_difference=15.0, randomize=False, use_cap_layers=False):
+    def select_best_filaments(self, target_colors_lab, count, layer_height=0.08, min_color_difference=15.0, randomize=False, use_cap_layers=False, use_face_down=False):
         """
         Select best matching filaments using direct delta-E color matching.
 
@@ -93,11 +93,12 @@ class FilamentLibrary:
             randomize: Add random perturbation to selection to get variation
             use_cap_layers: Reserve slots for dark base layer and clear cap layer
         """
-        logger.info(f"Selecting {count} unique filaments from library (randomize: {randomize}, cap_layers: {use_cap_layers})")
+        logger.info(f"Selecting {count} unique filaments from library (randomize: {randomize}, cap_layers: {use_cap_layers}, face_down: {use_face_down})")
 
         if use_cap_layers:
             # Cap layers mode: select dark base + clear top + colors
-            return self._select_with_cap_layers(target_colors_lab, count, layer_height, min_color_difference, randomize)
+            result = self._select_with_cap_layers(target_colors_lab, count, layer_height, min_color_difference, randomize)
+            return result
 
         # Standard selection below
 
@@ -160,7 +161,8 @@ class FilamentLibrary:
             logger.warning(f"Only selected {len(selected_indices)} filaments out of {count} requested")
             logger.warning("Try reducing --color-count or using --no-split-colors")
 
-        return self.df.iloc[selected_indices].reset_index(drop=True)
+        result = self.df.iloc[selected_indices].reset_index(drop=True)
+        return result
 
     def _select_with_cap_layers(self, target_colors_lab, count, layer_height, min_color_difference, randomize):
         """Select filaments for cap layers mode: dark base + clear top + colors
@@ -322,7 +324,7 @@ class ImageProcessor:
         self.image_lab = None
         self.alpha_mask = None  # Mask for transparent/rounded corners
 
-    def load_and_prepare(self, nozzle_diameter=0.2):
+    def load_and_prepare(self, nozzle_diameter=0.2, face_down=False):
         """Load image and prepare for processing
 
         CRITICAL: Resolution is set to match nozzle diameter for maximum quality
@@ -376,7 +378,11 @@ class ImageProcessor:
             self.image = np.flipud(self.image)
             self.alpha_mask = np.flipud(self.alpha_mask)
 
-            # NO horizontal flip needed - coordinate system matches STL export
+            # Face-down mode: horizontal flip so text reads correctly when print is flipped over
+            if face_down:
+                self.image = np.fliplr(self.image)
+                self.alpha_mask = np.fliplr(self.alpha_mask)
+                logger.info("Applied horizontal flip for face-down printing")
 
             # DISABLED: Smoothing can reduce detail in high-res images
             # The continuous heightmap creates smooth slopes naturally
@@ -926,6 +932,8 @@ def main():
                         help='Min color difference delta-E between filaments (default: 5.0)')
     parser.add_argument('--cap-layers', type=str, default=None, metavar='BOOL',
                         help='Use cap layers (black base + auto colors + clear top) [yes/no]')
+    parser.add_argument('--face-down', type=str, default=None, metavar='BOOL',
+                        help='Face-down mode: flat voxel grid printed face-down, flipped for display [yes/no]')
 
     args = parser.parse_args()
 
@@ -1014,9 +1022,16 @@ def main():
             bool
         )
 
+        use_face_down = (args.face_down.lower() in ('y', 'yes', 'true', '1')) if args.face_down is not None else prompt_with_default(
+            "Use face-down mode (flat voxel grid, flip after printing)",
+            False,
+            bool
+        )
+
         if use_cap_layers and color_count < 3:
             logger.warning("Cap layers requires at least 3 colors. Setting to 3.")
             color_count = 3
+
 
         print("\n" + "=" * 60)
 
@@ -1028,7 +1043,7 @@ def main():
 
         # 2. Load and prepare image
         img_processor = ImageProcessor(args.image, width, color_count)
-        img_processor.load_and_prepare(nozzle_diameter=nozzle_diameter)
+        img_processor.load_and_prepare(nozzle_diameter=nozzle_diameter, face_down=use_face_down)
 
         # 3. Quantize colors
         dominant_colors_lab, kmeans, sorted_indices = img_processor.quantize_colors()
@@ -1039,7 +1054,8 @@ def main():
             dominant_colors_lab, color_count,
             layer_height=layer_height,
             min_color_difference=min_color_difference,
-            use_cap_layers=use_cap_layers
+            use_cap_layers=use_cap_layers,
+            use_face_down=use_face_down
         )
 
         logger.info("Selected filaments:")
@@ -1084,12 +1100,16 @@ def main():
             # During load_and_prepare, image was flipud for STL orientation
             # Flip it back for display to show original orientation
             original_display = np.flipud(img_processor.image)
+            if use_face_down:
+                original_display = np.fliplr(original_display)
             ax1.imshow(original_display)
             ax1.set_title('Original Image', fontsize=14)
             ax1.axis('off')
 
             # Right: Stacking preview
             preview_display = np.flipud(preview_img)
+            if use_face_down:
+                preview_display = np.fliplr(preview_display)
             ax2.imshow(preview_display)
             ax2.set_title('Color Stacking Preview', fontsize=14)
             ax2.axis('off')
@@ -1128,6 +1148,7 @@ def main():
                     layer_height=layer_height,
                     min_color_difference=min_color_difference,
                     use_cap_layers=use_cap_layers,
+                    use_face_down=use_face_down,
                     randomize=False
                 )
                 logger.info("New filaments selected (dark to light):")
@@ -1160,10 +1181,42 @@ def main():
             alpha_mask=img_processor.alpha_mask,
             use_cap_layers=use_cap_layers,
             image_rgb=img_processor.image,
+            use_face_down=use_face_down,
         )
 
         generated_files = stl_gen.generate_all(output_path, single_stl=False)
         logger.info(f"Generated {len(generated_files)} STL file(s)")
+
+        # Show Beer-Lambert preview for face-down mode
+        if use_face_down and hasattr(stl_gen, 'face_down_pixel_height'):
+            logger.info("Rendering face-down Beer-Lambert preview...")
+            preview_rgb = stl_gen._render_face_down_preview(
+                stl_gen.face_down_pixel_height, stl_gen.face_down_z_boundaries,
+                stl_gen.face_down_filaments
+            )
+            preview_path = output_path.with_name(output_path.stem + '_preview.png')
+
+            import matplotlib.pyplot as plt
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 7))
+
+            original_display = np.flipud(img_processor.image)
+            if use_face_down:
+                original_display = np.fliplr(original_display)
+            ax1.imshow(original_display)
+            ax1.set_title('Original Image', fontsize=14)
+            ax1.axis('off')
+
+            preview_display = np.flipud(preview_rgb)
+            if use_face_down:
+                preview_display = np.fliplr(preview_display)
+            ax2.imshow(preview_display)
+            ax2.set_title('Face-Down Preview (viewed from bed side)', fontsize=14)
+            ax2.axis('off')
+
+            plt.tight_layout()
+            plt.savefig(str(preview_path), dpi=150, bbox_inches='tight')
+            plt.close()
+            logger.info(f"Preview saved to {preview_path}")
 
         # 8. Generate description file
         desc_path = output_path.with_suffix('.txt')
@@ -1185,10 +1238,19 @@ def main():
             # Write filament-change schedule if available
             f.write("\nPrinting Instructions:\n")
             f.write("-" * 60 + "\n")
-            f.write("1. Load all STL files into slicer at once\n")
-            f.write("2. Right-click each part and assign the corresponding filament\n")
-            f.write("3. Print flat (geometry is already optimized)\n")
-            f.write("4. Backlight for best effect\n")
+            if use_face_down:
+                f.write("FACE-DOWN MODE\n")
+                f.write("1. Load all STL files into slicer at once\n")
+                f.write("2. Right-click each part and assign the corresponding filament\n")
+                f.write("3. Print flat on bed (clear/light filament goes first)\n")
+                f.write("4. After printing, flip the model over for display\n")
+                f.write("5. The bed-side surface (smooth) becomes the viewing side\n")
+                f.write("6. Backlight for best effect\n")
+            else:
+                f.write("1. Load all STL files into slicer at once\n")
+                f.write("2. Right-click each part and assign the corresponding filament\n")
+                f.write("3. Print flat (geometry is already optimized)\n")
+                f.write("4. Backlight for best effect\n")
 
         logger.info(f"\nDone! Generated {len(generated_files)} STL files in {output_dir}/")
         for file_path, color_name, layer_start, layer_end in generated_files:
