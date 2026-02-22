@@ -48,6 +48,7 @@ python3 huecli.py image.png \
 | `-o, --output` | Output filename | `<input_stem>.stl` |
 | `-d, --min-delta-e` | Min colour difference (delta-E) | `5.0` |
 | `--cap-layers` | Cap layers: black base + auto colours + clear top (yes/no) | `no` |
+| `--face-down` | Face-down mode: inverted heightmap, flip in slicer (yes/no) | `no` |
 
 Any flag left out will be prompted interactively. A preview window shows the expected result before generating STLs.
 
