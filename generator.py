@@ -913,6 +913,120 @@ class STLGenerator:
 
         return generated_files
 
+    def generate_preview_scene(self):
+        """Generate a trimesh.Scene with colored meshes for interactive 3D preview
+
+        Mirrors the heightmap pipeline from generate_all() / _generate_face_down()
+        and returns a Scene instead of exporting STLs. Downsamples to ~100K pixels
+        for browser-renderable mesh size while preserving good detail.
+
+        Returns:
+            trimesh.Scene with one colored mesh per filament
+        """
+        from math import sqrt
+
+        H, W = self.image_grayscale.shape
+
+        # Downsample for browser rendering (~100K pixels target)
+        ds = max(1, int(sqrt(H * W / 100000)))
+        ds_grayscale = self.image_grayscale[::ds, ::ds]
+        ds_alpha = self.alpha_mask[::ds, ::ds]
+        ds_H, ds_W = ds_grayscale.shape
+        ds_pixel_size = self.width_mm / ds_W
+
+        logger.info(f"3D preview: {H}x{W} -> {ds_H}x{ds_W} (ds={ds}), "
+                     f"pixel_size={ds_pixel_size:.3f}mm")
+
+        # Sort dark-to-light (same as generate_all)
+        sorted_filaments = self.selected_filaments.copy()
+        sorted_filaments['luminosity'] = sorted_filaments['lab'].apply(
+            lambda x: float(np.asarray(x).flat[0]))
+        sorted_filaments = sorted_filaments.sort_values('luminosity').reset_index(drop=True)
+
+        # Swap only pixel_size and alpha_mask (used by called methods)
+        orig_pixel_size = self.pixel_size
+        orig_alpha = self.alpha_mask
+        try:
+            self.pixel_size = ds_pixel_size
+            self.alpha_mask = ds_alpha
+
+            # Contrast enhancement (uses self.alpha_mask internally)
+            enhanced = self._apply_contrast_enhancement(ds_grayscale.copy())
+
+            # TD-proportional layer allocation (same logic as generate_all)
+            filament_tds = np.array([f['transmission_distance'] for _, f in sorted_filaments.iterrows()])
+            td_weights = np.log1p(np.maximum(filament_tds, 1.0))
+            td_weights = td_weights / td_weights.sum()
+
+            min_layers = 1
+            available_layers = self.num_layers - min_layers * self.num_colors
+            if available_layers < 0:
+                available_layers = 0
+                min_layers = max(1, self.num_layers // self.num_colors)
+
+            layer_counts = np.round(td_weights * available_layers).astype(int) + min_layers
+            layer_counts[-1] = self.num_layers - layer_counts[:-1].sum()
+            layer_boundaries = np.concatenate([[0], np.cumsum(layer_counts)]).astype(int)
+            z_boundaries = layer_boundaries * self.layer_height
+
+            # Compute heightmap
+            alpha_pixels = ds_alpha >= 0.5
+            global_brightness_max = np.max(enhanced[alpha_pixels]) if np.any(alpha_pixels) else 1.0
+            min_height = 2 * self.layer_height
+
+            if self.use_face_down:
+                normalized = enhanced / max(global_brightness_max, 1e-6)
+                pixel_height = min_height + (1.0 - normalized) * (self.model_height - min_height)
+            else:
+                pixel_height = min_height + enhanced / max(global_brightness_max, 1e-6) * (self.model_height - min_height)
+
+            pixel_height = np.clip(pixel_height, min_height, self.model_height)
+            pixel_height = np.where(alpha_pixels, pixel_height, 0)
+
+            # Generate colored meshes (uses self.pixel_size internally)
+            scene = trimesh.Scene()
+            min_thickness = self.layer_height * 0.5
+
+            for i in range(len(sorted_filaments)):
+                filament = sorted_filaments.iloc[i]
+                z_bottom_flat = float(z_boundaries[i])
+                z_top_boundary = float(z_boundaries[i + 1])
+
+                pixel_mask = (pixel_height > z_bottom_flat + min_thickness) & alpha_pixels
+
+                if not pixel_mask.any():
+                    continue
+
+                z_top_color = np.clip(pixel_height, z_bottom_flat, z_top_boundary)
+                z_bottom_color = np.full_like(pixel_height, z_bottom_flat)
+
+                thickness = z_top_color - z_bottom_flat
+                effective_mask = pixel_mask & (thickness >= min_thickness)
+
+                if not effective_mask.any():
+                    continue
+
+                mesh = self._generate_topographical_stl(z_bottom_color, z_top_color, effective_mask)
+
+                if len(mesh.vertices) > 0:
+                    rgb = filament['rgb']
+                    face_colors = np.zeros((len(mesh.faces), 4), dtype=np.uint8)
+                    face_colors[:, 0] = int(rgb[0] * 255)
+                    face_colors[:, 1] = int(rgb[1] * 255)
+                    face_colors[:, 2] = int(rgb[2] * 255)
+                    face_colors[:, 3] = 255
+                    mesh.visual.face_colors = face_colors
+
+                    color_name = filament['name'].replace(' ', '_')
+                    scene.add_geometry(mesh, geom_name=color_name)
+
+            logger.info(f"3D preview scene: {len(scene.geometry)} meshes")
+            return scene
+
+        finally:
+            self.pixel_size = orig_pixel_size
+            self.alpha_mask = orig_alpha
+
     def _generate_standard(self, output_base_path):
         """Generate standard topographical STLs.
 

@@ -905,6 +905,170 @@ def simulate_color_stack(color_hex_list):
     return np.mean(rgb_values, axis=0)
 
 
+def show_3d_preview(stl_gen):
+    """Generate and display an interactive 3D preview in the default browser
+
+    Exports the scene as GLB, embeds it as base64 in a custom HTML viewer
+    that uses Three.js (CDN) with GLTFLoader.parse() to avoid data-URL
+    size limits that cause blank pages in some browsers.
+
+    Args:
+        stl_gen: STLGenerator instance with all parameters configured
+    """
+    import base64
+    import tempfile
+    import webbrowser
+
+    logger.info("Generating 3D preview scene...")
+    scene = stl_gen.generate_preview_scene()
+
+    if len(scene.geometry) == 0:
+        logger.warning("No geometry generated for 3D preview")
+        return
+
+    logger.info("Exporting scene to GLB...")
+    glb_data = scene.export(file_type="glb")
+    b64 = base64.b64encode(glb_data).decode("utf-8")
+    logger.info(f"GLB size: {len(glb_data)/1024/1024:.1f} MB")
+
+    html = _build_viewer_html(b64)
+
+    with tempfile.NamedTemporaryFile('w', suffix='.html', delete=False) as f:
+        f.write(html)
+        tmp_path = f.name
+
+    logger.info("Opening 3D preview in browser...")
+    webbrowser.open('file://' + tmp_path)
+
+
+def _build_viewer_html(b64_glb):
+    """Build a self-contained HTML page with an embedded Three.js GLB viewer.
+
+    Uses CDN-loaded Three.js with GLTFLoader.parse() to decode the base64
+    GLB data directly into an ArrayBuffer, bypassing data-URL size limits.
+
+    Args:
+        b64_glb: base64-encoded GLB binary string
+
+    Returns:
+        Complete HTML string
+    """
+    return f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HueCLI — 3D Preview</title>
+<style>
+  body {{ margin: 0; overflow: hidden; background: #2a2a2a; }}
+  canvas {{ display: block; }}
+  #info {{
+    position: absolute; top: 10px; left: 10px; color: #ccc;
+    font: 13px/1.4 system-ui, sans-serif; pointer-events: none;
+  }}
+  #error {{
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+    color: #f44; font: 16px system-ui; text-align: center; display: none;
+  }}
+</style>
+</head>
+<body>
+<div id="info">Drag to rotate &middot; Scroll to zoom &middot; Right-drag to pan</div>
+<div id="error"></div>
+
+<script type="importmap">
+{{
+  "imports": {{
+    "three": "https://unpkg.com/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.170.0/examples/jsm/"
+  }}
+}}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import {{ OrbitControls }} from 'three/addons/controls/OrbitControls.js';
+import {{ GLTFLoader }} from 'three/addons/loaders/GLTFLoader.js';
+
+const base64 = "{b64_glb}";
+
+// Decode base64 → ArrayBuffer (avoids data-URL size limits)
+const bin = atob(base64);
+const buf = new Uint8Array(bin.length);
+for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+
+const scene    = new THREE.Scene();
+scene.background = new THREE.Color(0x2a2a2a);
+
+const renderer = new THREE.WebGLRenderer({{ antialias: true }});
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+document.body.appendChild(renderer.domElement);
+
+// Lighting
+const ambient = new THREE.AmbientLight(0xffffff, 0.6);
+scene.add(ambient);
+const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+dirLight.position.set(5, 10, 7);
+scene.add(dirLight);
+const backLight = new THREE.DirectionalLight(0xffffff, 0.4);
+backLight.position.set(-5, -2, -5);
+scene.add(backLight);
+
+// Camera (will be repositioned after model loads)
+const camera = new THREE.PerspectiveCamera(
+  45, window.innerWidth / window.innerHeight, 0.01, 10000
+);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.12;
+
+// Parse GLB
+const loader = new GLTFLoader();
+loader.parse(buf.buffer, '', (gltf) => {{
+  scene.add(gltf.scene);
+
+  // Auto-fit camera to model bounds
+  const box    = new THREE.Box3().setFromObject(gltf.scene);
+  const center = box.getCenter(new THREE.Vector3());
+  const size   = box.getSize(new THREE.Vector3());
+  const maxDim = Math.max(size.x, size.y, size.z);
+  const dist   = maxDim * 2.0;
+
+  camera.position.set(center.x, center.y - dist * 0.6, center.z + dist * 0.8);
+  camera.near = maxDim * 0.001;
+  camera.far  = maxDim * 100;
+  camera.updateProjectionMatrix();
+
+  controls.target.copy(center);
+  controls.update();
+}},
+(err) => {{
+  console.error('GLB parse error:', err);
+  const el = document.getElementById('error');
+  el.textContent = 'Failed to load 3D model — see console for details.';
+  el.style.display = 'block';
+}});
+
+window.addEventListener('resize', () => {{
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+}});
+
+(function animate() {{
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+}})();
+</script>
+</body>
+</html>'''
+
+
 def main():
     """Main CLI entry point"""
     parser = argparse.ArgumentParser(
@@ -1082,15 +1246,15 @@ def main():
         logger.info("\nGenerating preview...")
 
         preview_approved = False
+        preview_img = generate_preview(
+            grayscale,
+            selected_filaments,
+            layer_height,
+            model_height,
+            use_cap_layers,
+            img_processor.alpha_mask
+        )
         while not preview_approved:
-            preview_img = generate_preview(
-                grayscale,
-                selected_filaments,
-                layer_height,
-                model_height,
-                use_cap_layers,
-                img_processor.alpha_mask
-            )
 
             # Show preview in non-blocking mode
             import matplotlib.pyplot as plt
@@ -1130,13 +1294,14 @@ def main():
             print("Preview window displayed. What would you like to do?")
             print("1. Generate STLs")
             print("2. Regenerate with lower color delta")
-            print("3. Cancel")
+            print("3. View 3D preview (opens in browser)")
+            print("4. Cancel")
             print("=" * 60)
             choice = input("Enter choice [1]: ").strip() or "1"
 
             plt.close(fig)
 
-            if choice == "3":
+            if choice == "4":
                 logger.info("Cancelled by user")
                 return 0
             elif choice == "2":
@@ -1154,7 +1319,29 @@ def main():
                 logger.info("New filaments selected (dark to light):")
                 for i, row in selected_filaments.iterrows():
                     logger.info(f"  {i+1}. {row['name']} ({row['color_hex']}) - L={row['lab'][0]:.1f}")
-                # Loop continues to show new preview
+                preview_img = generate_preview(
+                    grayscale,
+                    selected_filaments,
+                    layer_height,
+                    model_height,
+                    use_cap_layers,
+                    img_processor.alpha_mask
+                )
+            elif choice == "3":
+                # 3D preview in browser
+                preview_stl_gen = STLGenerator(
+                    grayscale,
+                    width,
+                    layer_height,
+                    model_height,
+                    selected_filaments,
+                    alpha_mask=img_processor.alpha_mask,
+                    use_cap_layers=use_cap_layers,
+                    image_rgb=img_processor.image,
+                    use_face_down=use_face_down,
+                )
+                show_3d_preview(preview_stl_gen)
+                # Loop continues to show 2D preview + menu again
             else:
                 # Choice 1 or default - proceed with STL generation
                 preview_approved = True
