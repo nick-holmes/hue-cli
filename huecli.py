@@ -998,24 +998,17 @@ const buf = new Uint8Array(bin.length);
 for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
 
 const scene    = new THREE.Scene();
-scene.background = new THREE.Color(0x2a2a2a);
+scene.background = new THREE.Color(0x1a1a1a);
 
 const renderer = new THREE.WebGLRenderer({{ antialias: true }});
 renderer.setPixelRatio(window.devicePixelRatio);
 renderer.setSize(window.innerWidth, window.innerHeight);
-renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.0;
+renderer.toneMapping = THREE.NoToneMapping;
 document.body.appendChild(renderer.domElement);
 
-// Lighting
-const ambient = new THREE.AmbientLight(0xffffff, 0.6);
+// Lighting — dim ambient only; mesh uses emissive material for backlit effect
+const ambient = new THREE.AmbientLight(0xffffff, 0.15);
 scene.add(ambient);
-const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
-dirLight.position.set(5, 10, 7);
-scene.add(dirLight);
-const backLight = new THREE.DirectionalLight(0xffffff, 0.4);
-backLight.position.set(-5, -2, -5);
-scene.add(backLight);
 
 // Camera (will be repositioned after model loads)
 const camera = new THREE.PerspectiveCamera(
@@ -1029,6 +1022,14 @@ controls.dampingFactor = 0.12;
 // Parse GLB
 const loader = new GLTFLoader();
 loader.parse(buf.buffer, '', (gltf) => {{
+  // Use unlit material so vertex colors display as emitted light (backlit lithophane)
+  gltf.scene.traverse((child) => {{
+    if (child.isMesh) {{
+      child.material = new THREE.MeshBasicMaterial({{
+        vertexColors: true,
+      }});
+    }}
+  }});
   scene.add(gltf.scene);
 
   // Auto-fit camera to model bounds

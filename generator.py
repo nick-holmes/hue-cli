@@ -983,42 +983,57 @@ class STLGenerator:
             pixel_height = np.clip(pixel_height, min_height, self.model_height)
             pixel_height = np.where(alpha_pixels, pixel_height, 0)
 
-            # Generate colored meshes (uses self.pixel_size internally)
             scene = trimesh.Scene()
             min_thickness = self.layer_height * 0.5
 
-            for i in range(len(sorted_filaments)):
-                filament = sorted_filaments.iloc[i]
-                z_bottom_flat = float(z_boundaries[i])
-                z_top_boundary = float(z_boundaries[i + 1])
+            combined_mask = alpha_pixels & (pixel_height > min_thickness)
+            z_bottom_all = np.zeros_like(pixel_height)
 
-                pixel_mask = (pixel_height > z_bottom_flat + min_thickness) & alpha_pixels
+            if self.use_cap_layers:
+                # Flat top for cap-layer mode
+                z_top = np.full_like(pixel_height, self.model_height)
+            else:
+                # Topographical heightmap for standard and face-down modes
+                z_top = pixel_height
 
-                if not pixel_mask.any():
-                    continue
+            z_top = np.where(combined_mask, z_top, 0)
+            mesh = self._generate_topographical_stl(z_bottom_all, z_top, combined_mask)
 
-                z_top_color = np.clip(pixel_height, z_bottom_flat, z_top_boundary)
-                z_bottom_color = np.full_like(pixel_height, z_bottom_flat)
+            if len(mesh.vertices) > 0:
+                preview_rgb = self._render_face_down_preview(
+                    pixel_height, z_boundaries, sorted_filaments)
 
-                thickness = z_top_color - z_bottom_flat
-                effective_mask = pixel_mask & (thickness >= min_thickness)
+                # Auto-contrast: Beer-Lambert output is physically correct but
+                # visually compressed (often near-white or near-black depending
+                # on filament TDs). Stretch to use full display range.
+                valid_pixels = preview_rgb[combined_mask]
+                if len(valid_pixels) > 0:
+                    p_lo = np.percentile(valid_pixels, 0.5)
+                    p_hi = np.percentile(valid_pixels, 99.5)
+                    rng = max(p_hi - p_lo, 0.01)
+                    preview_rgb = (preview_rgb - p_lo) / rng
+                    preview_rgb = np.clip(preview_rgb, 0, 1)
 
-                if not effective_mask.any():
-                    continue
+                centroids = mesh.triangles_center
+                px = np.clip((centroids[:, 0] / self.pixel_size).astype(int),
+                             0, ds_W - 1)
+                py = np.clip((centroids[:, 1] / self.pixel_size).astype(int),
+                             0, ds_H - 1)
 
-                mesh = self._generate_topographical_stl(z_bottom_color, z_top_color, effective_mask)
+                face_colors = np.zeros((len(mesh.faces), 4), dtype=np.uint8)
+                face_colors[:, :3] = (preview_rgb[py, px] * 255).astype(np.uint8)
+                face_colors[:, 3] = 255
+                mesh.visual.face_colors = face_colors
 
-                if len(mesh.vertices) > 0:
-                    rgb = filament['rgb']
-                    face_colors = np.zeros((len(mesh.faces), 4), dtype=np.uint8)
-                    face_colors[:, 0] = int(rgb[0] * 255)
-                    face_colors[:, 1] = int(rgb[1] * 255)
-                    face_colors[:, 2] = int(rgb[2] * 255)
-                    face_colors[:, 3] = 255
-                    mesh.visual.face_colors = face_colors
+                if self.use_face_down:
+                    # Flip to show as-printed view: bed surface up + undo fliplr
+                    max_x = float(np.max(mesh.vertices[:, 0]))
+                    max_z = float(np.max(mesh.vertices[:, 2]))
+                    mesh.vertices[:, 0] = max_x - mesh.vertices[:, 0]
+                    mesh.vertices[:, 2] = max_z - mesh.vertices[:, 2]
+                    mesh.fix_normals()
 
-                    color_name = filament['name'].replace(' ', '_')
-                    scene.add_geometry(mesh, geom_name=color_name)
+                scene.add_geometry(mesh, geom_name='preview')
 
             logger.info(f"3D preview scene: {len(scene.geometry)} meshes")
             return scene
