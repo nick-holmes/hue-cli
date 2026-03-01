@@ -1744,11 +1744,16 @@ class STLGenerator:
         # Start with white backlight
         light = np.ones((H, W, 3))
 
+        # Use subtractive (multiplicative) filter model for cap layers.
+        # The opaque base reduces light to ~20%. With additive model,
+        # colored middles would ADD brightness (filament_rgb > remaining light),
+        # causing inversion. Subtractive model ensures light only decreases.
+
         # 1. Base layer (darkest filament) — always present, uniform thickness
         td = max(filament_tds[0], 0.1)
         transmission = np.exp(-base_thickness / td)
         for c in range(3):
-            light[:, :, c] = light[:, :, c] * transmission + filament_rgbs[0][c] * (1.0 - transmission)
+            light[:, :, c] = light[:, :, c] * (transmission + filament_rgbs[0][c] * (1.0 - transmission))
 
         # 2. Middle colors — present where enhanced_grayscale <= threshold
         clear_td = max(filament_tds[-1], 0.1)
@@ -1761,20 +1766,20 @@ class STLGenerator:
             td = max(filament_tds[i + 1], 0.1)
             rgb = filament_rgbs[i + 1]
 
-            # Where color is present: apply this color's absorption
+            # Where color is present: subtractive filter by this color
             color_trans = np.exp(-middle_thickness / td)
-            # Where color is absent: apply clear fill absorption
+            # Where color is absent: subtractive filter by clear fill
             clear_trans = np.exp(-middle_thickness / clear_td)
 
             for c in range(3):
-                colored = light[:, :, c] * color_trans + rgb[c] * (1.0 - color_trans)
-                cleared = light[:, :, c] * clear_trans + clear_rgb[c] * (1.0 - clear_trans)
+                colored = light[:, :, c] * (color_trans + rgb[c] * (1.0 - color_trans))
+                cleared = light[:, :, c] * (clear_trans + clear_rgb[c] * (1.0 - clear_trans))
                 light[:, :, c] = np.where(present, colored, cleared)
 
         # 3. Clear top layer — always present, uniform thickness
         transmission = np.exp(-top_thickness / clear_td)
         for c in range(3):
-            light[:, :, c] = light[:, :, c] * transmission + clear_rgb[c] * (1.0 - transmission)
+            light[:, :, c] = light[:, :, c] * (transmission + clear_rgb[c] * (1.0 - transmission))
 
         return np.clip(light, 0, 1)
 

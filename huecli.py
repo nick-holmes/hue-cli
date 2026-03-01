@@ -521,11 +521,14 @@ class TransmissionColorSimulator:
         # Exponential decay: transmission = e^(-thickness / TD)
         return np.exp(-thickness_mm / max(td_value, 0.1))
 
-    def simulate_layer_stack_color(self, layer_indices, layer_heights):
+    def simulate_layer_stack_color(self, layer_indices, layer_heights, subtractive=False):
         """
         Simulate the perceived color of a stack of layers
         layer_indices: list of filament indices from bottom to top
         layer_heights: thickness of each layer in mm
+        subtractive: If True, use multiplicative filter model (light only decreases).
+                     Required for cap-layer mode where opaque base + additive model
+                     causes inversion.
         Returns: RGB color (0-1 range)
         """
         # Start with white light from below (backlit assumption)
@@ -540,12 +543,15 @@ class TransmissionColorSimulator:
             # Calculate transmission factor
             transmission = self.calculate_transmission_factor(td, thickness)
 
-            # Beer-Lambert transmissive filter model:
-            # - Transmitted fraction passes through unchanged
-            # - Absorbed fraction takes on the filament's color
-            # At transmission=1 (transparent): light passes through unchanged
-            # At transmission=0 (opaque): output = filament color
-            light_rgb = light_rgb * transmission + filament_rgb * (1 - transmission)
+            if subtractive:
+                # Subtractive filter: filament color acts as per-channel multiplier
+                # on the absorbed fraction. Light can only decrease.
+                # Clear (RGB≈1): filter≈1, no absorption. Black (RGB≈0): filter=t, pure absorption.
+                # Colored: selective wavelength absorption (e.g. red filter passes red, blocks blue)
+                light_rgb = light_rgb * (transmission + filament_rgb * (1 - transmission))
+            else:
+                # Additive model: absorbed fraction replaced with filament color
+                light_rgb = light_rgb * transmission + filament_rgb * (1 - transmission)
 
             # Clamp to [0, 1]
             light_rgb = np.clip(light_rgb, 0, 1)
@@ -889,7 +895,7 @@ def generate_preview(grayscale, selected_filaments, layer_height, model_height, 
                 layer_stack.extend([filament_idx] * layers_per_color)
             layer_stack.extend([num_colors - 1] * top_layers)  # clear top
             layer_heights_list = [layer_height] * len(layer_stack)
-            level_colors[bi] = simulator.simulate_layer_stack_color(layer_stack, layer_heights_list)
+            level_colors[bi] = simulator.simulate_layer_stack_color(layer_stack, layer_heights_list, subtractive=True)
 
         # Normalize range — Beer-Lambert through many layers compresses dynamic range
         # into a narrow band (e.g. 0.6-0.9), making everything look grey.
