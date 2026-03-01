@@ -8,6 +8,7 @@ Smooth shared-vertex grid surfaces with Beer-Lambert thickness mapping.
 """
 
 import numpy as np
+import pandas as pd
 import trimesh
 import logging
 from pathlib import Path
@@ -754,6 +755,9 @@ class STLGenerator:
         if self.use_face_down:
             return self._generate_face_down(output_base_path)
 
+        if self.use_cap_layers:
+            return self._generate_with_cap_layers(output_base_path)
+
         generated_files = []
 
         # Sort dark-to-light by LAB luminosity
@@ -941,7 +945,18 @@ class STLGenerator:
         sorted_filaments = self.selected_filaments.copy()
         sorted_filaments['luminosity'] = sorted_filaments['lab'].apply(
             lambda x: float(np.asarray(x).flat[0]))
-        sorted_filaments = sorted_filaments.sort_values('luminosity').reset_index(drop=True)
+
+        if self.use_cap_layers:
+            # Cap layers: keep base (index 0) and clear (index -1) in place,
+            # sort only middle colors by luminosity for optimal coverage mapping
+            middle = sorted_filaments.iloc[1:-1].sort_values('luminosity').reset_index(drop=True)
+            sorted_filaments = pd.concat([
+                sorted_filaments.iloc[:1],
+                middle,
+                sorted_filaments.iloc[-1:]
+            ]).reset_index(drop=True)
+        else:
+            sorted_filaments = sorted_filaments.sort_values('luminosity').reset_index(drop=True)
 
         # Swap only pixel_size and alpha_mask (used by called methods)
         orig_pixel_size = self.pixel_size
@@ -1000,8 +1015,12 @@ class STLGenerator:
             mesh = self._generate_topographical_stl(z_bottom_all, z_top, combined_mask)
 
             if len(mesh.vertices) > 0:
-                preview_rgb = self._render_face_down_preview(
-                    pixel_height, z_boundaries, sorted_filaments)
+                if self.use_cap_layers:
+                    preview_rgb = self._render_cap_layer_preview(
+                        enhanced, sorted_filaments)
+                else:
+                    preview_rgb = self._render_face_down_preview(
+                        pixel_height, z_boundaries, sorted_filaments)
 
                 # Auto-contrast: Beer-Lambert output is physically correct but
                 # visually compressed (often near-white or near-black depending
@@ -1107,7 +1126,21 @@ class STLGenerator:
         """
         logger.info("Generating cap layers mode: flat base + shaped colors + negative + flat top")
 
+        enhanced_grayscale = self._apply_contrast_enhancement(self.image_grayscale.copy())
+
         generated_files = []
+
+        # Sort middle filaments by luminosity (darkest first = most coverage)
+        # Keep base (index 0) and clear (index -1) in their fixed positions
+        sorted_filaments = self.selected_filaments.copy()
+        sorted_filaments['luminosity'] = sorted_filaments['lab'].apply(
+            lambda x: float(np.asarray(x).flat[0]))
+        middle = sorted_filaments.iloc[1:-1].sort_values('luminosity').reset_index(drop=True)
+        sorted_filaments = pd.concat([
+            sorted_filaments.iloc[:1],
+            middle,
+            sorted_filaments.iloc[-1:]
+        ]).reset_index(drop=True)
 
         # Number of middle color layers (exclude dark base and clear top)
         num_middle_colors = self.num_colors - 2
@@ -1119,7 +1152,7 @@ class STLGenerator:
         layers_per_color = middle_layers // num_middle_colors if num_middle_colors > 0 else 0
 
         # 1. FLAT BASE (darkest filament)
-        darkest_filament = self.selected_filaments.iloc[0]
+        darkest_filament = sorted_filaments.iloc[0]
         color_name = darkest_filament['name'].replace(' ', '_').replace('/', '_')
         output_path = output_base_path.parent / f"{output_base_path.stem}_{color_name}_base.stl"
 
@@ -1136,24 +1169,25 @@ class STLGenerator:
 
         # 2. MIDDLE COLOR LAYERS (shaped)
         for i in range(num_middle_colors):
-            filament = self.selected_filaments.iloc[i + 1]  # Skip darkest (used for base)
+            filament = sorted_filaments.iloc[i + 1]  # Skip darkest (used for base)
             color_name = filament['name'].replace(' ', '_').replace('/', '_')
             output_path = output_base_path.parent / f"{output_base_path.stem}_{color_name}.stl"
 
             layer_start = base_layers + (i * layers_per_color)
             layer_end = base_layers + ((i + 1) * layers_per_color)
 
-            # Brightness threshold: lighter colors appear on brighter pixels only
-            # i=0 (darkest middle color): brightness >= 0.33 (excludes dark text)
-            # i=n-1 (lightest middle color): brightness >= 0.67 (only bright areas)
-            # This creates GAPS over dark text, revealing black base beneath
+            # Brightness threshold: colored layers appear on DARK pixels
+            # (more colored material = more absorption = darker in transmission)
+            # Darkest middle color covers most area, lightest covers least
+            # Lightest middle → highest threshold (widest coverage, base tone)
+            # Darkest middle → lowest threshold (only darkest pixels, detail)
             brightness_threshold = (i + 1) / (num_middle_colors + 1)
 
-            logger.info(f"Generating {color_name}: layers {layer_start}-{layer_end}, brightness >= {brightness_threshold:.2f}")
+            logger.info(f"Generating {color_name}: layers {layer_start}-{layer_end}, brightness <= {brightness_threshold:.2f}")
 
             # Mask of pixels that get this color
-            # Only cover BRIGHT pixels, leave gaps over dark text
-            pixel_mask = self.image_grayscale >= brightness_threshold
+            # Cover DARK pixels where more absorption is needed
+            pixel_mask = enhanced_grayscale <= brightness_threshold
             pixel_mask = pixel_mask & (self.alpha_mask >= 0.5)
 
             if pixel_mask.any():
@@ -1168,7 +1202,7 @@ class STLGenerator:
                 logger.warning(f"  No pixels for {color_name} - skipping")
 
         # 3. CLEAR LAYER (combines negative fill + flat top into single STL)
-        clear_filament = self.selected_filaments.iloc[-1]  # Lightest/clearest
+        clear_filament = sorted_filaments.iloc[-1]  # Lightest/clearest
         color_name = clear_filament['name'].replace(' ', '_').replace('/', '_')
         output_path = output_base_path.parent / f"{output_base_path.stem}_{color_name}.stl"
 
@@ -1672,6 +1706,75 @@ class STLGenerator:
 
             for c in range(3):
                 light[:, :, c] = light[:, :, c] * transmission + rgb[c] * (1.0 - transmission)
+
+        return np.clip(light, 0, 1)
+
+    def _render_cap_layer_preview(self, enhanced_grayscale, sorted_filaments):
+        """Render Beer-Lambert preview for cap-layer mode
+
+        Cap layers use binary brightness thresholds (pixel has a color or not),
+        unlike standard/face-down which use continuous heightmaps.
+
+        Structure: flat base (darkest) + shaped middle colors + clear fill + flat top (lightest)
+
+        Args:
+            enhanced_grayscale: 2D array of contrast-enhanced grayscale values
+            sorted_filaments: DataFrame of filaments sorted dark-to-light
+
+        Returns:
+            HxWx3 RGB preview image (0-1 range)
+        """
+        H, W = enhanced_grayscale.shape
+        num_colors = len(sorted_filaments)
+        num_middle_colors = num_colors - 2
+
+        filament_rgbs = np.array([f['rgb'] for _, f in sorted_filaments.iterrows()])
+        filament_tds = np.array([f['transmission_distance'] for _, f in sorted_filaments.iterrows()])
+
+        # Layer allocation (matches _generate_with_cap_layers)
+        base_layers = 2
+        top_layers = 2
+        middle_layers = self.num_layers - base_layers - top_layers
+        layers_per_color = middle_layers // num_middle_colors if num_middle_colors > 0 else 0
+
+        base_thickness = base_layers * self.layer_height
+        middle_thickness = layers_per_color * self.layer_height
+        top_thickness = top_layers * self.layer_height
+
+        # Start with white backlight
+        light = np.ones((H, W, 3))
+
+        # 1. Base layer (darkest filament) — always present, uniform thickness
+        td = max(filament_tds[0], 0.1)
+        transmission = np.exp(-base_thickness / td)
+        for c in range(3):
+            light[:, :, c] = light[:, :, c] * transmission + filament_rgbs[0][c] * (1.0 - transmission)
+
+        # 2. Middle colors — present where enhanced_grayscale <= threshold
+        clear_td = max(filament_tds[-1], 0.1)
+        clear_rgb = filament_rgbs[-1]
+
+        for i in range(num_middle_colors):
+            threshold = (i + 1) / (num_middle_colors + 1)
+            present = enhanced_grayscale <= threshold
+
+            td = max(filament_tds[i + 1], 0.1)
+            rgb = filament_rgbs[i + 1]
+
+            # Where color is present: apply this color's absorption
+            color_trans = np.exp(-middle_thickness / td)
+            # Where color is absent: apply clear fill absorption
+            clear_trans = np.exp(-middle_thickness / clear_td)
+
+            for c in range(3):
+                colored = light[:, :, c] * color_trans + rgb[c] * (1.0 - color_trans)
+                cleared = light[:, :, c] * clear_trans + clear_rgb[c] * (1.0 - clear_trans)
+                light[:, :, c] = np.where(present, colored, cleared)
+
+        # 3. Clear top layer — always present, uniform thickness
+        transmission = np.exp(-top_thickness / clear_td)
+        for c in range(3):
+            light[:, :, c] = light[:, :, c] * transmission + clear_rgb[c] * (1.0 - transmission)
 
         return np.clip(light, 0, 1)
 

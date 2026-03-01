@@ -822,6 +822,26 @@ def prompt_with_default(prompt_text, default_value, value_type=str):
 
 
 
+def _enhance_contrast(brightness, alpha_mask, strength=2.0):
+    """Apply contrast enhancement matching STLGenerator._apply_contrast_enhancement"""
+    mean_brightness = np.mean(brightness[alpha_mask >= 0.5]) if np.any(alpha_mask >= 0.5) else 0.5
+
+    if mean_brightness > 0.65:
+        gamma = 1.5
+        enhanced = np.power(brightness, gamma)
+        center = np.mean(enhanced)
+        s = 4.0
+        enhanced = 1.0 / (1.0 + np.exp(-s * (enhanced - center)))
+        enhanced = (enhanced - enhanced.min()) / (enhanced.max() - enhanced.min() + 1e-8)
+    elif mean_brightness < 0.35:
+        enhanced = np.power(brightness, 0.7)
+    else:
+        enhanced = 1.0 / (1.0 + np.exp(-strength * (brightness - 0.5)))
+        enhanced = (enhanced - enhanced.min()) / (enhanced.max() - enhanced.min() + 1e-8)
+
+    return enhanced
+
+
 def generate_preview(grayscale, selected_filaments, layer_height, model_height, use_cap_layers, alpha_mask):
     """Generate preview image showing simulated color stacking appearance."""
     height_px, width_px = grayscale.shape
@@ -831,33 +851,62 @@ def generate_preview(grayscale, selected_filaments, layer_height, model_height, 
     num_layers = int(model_height / layer_height)
 
     if use_cap_layers:
-        # Cap layers mode: flat base + shaped colors + clear
+        # Cap layers mode: Beer-Lambert simulation matching STL generation
         num_middle_colors = num_colors - 2
 
-        # For each pixel, determine which layers it gets based on brightness
+        # Apply contrast enhancement to match STL generation
+        enhanced = _enhance_contrast(grayscale, alpha_mask)
+
+        # Sort middle filaments by luminosity (darkest first) to match _generate_with_cap_layers
+        sorted_fils = selected_filaments.copy()
+        sorted_fils['luminosity'] = sorted_fils['lab'].apply(
+            lambda x: float(np.asarray(x).flat[0]))
+        middle = sorted_fils.iloc[1:-1].sort_values('luminosity').reset_index(drop=True)
+        sorted_fils = pd.concat([
+            sorted_fils.iloc[:1],
+            middle,
+            sorted_fils.iloc[-1:]
+        ]).reset_index(drop=True)
+
+        simulator = TransmissionColorSimulator(sorted_fils, layer_height)
+
+        # Layer allocation matching _generate_with_cap_layers
+        base_layers = 2
+        top_layers = 2
+        middle_layers = num_layers - base_layers - top_layers
+        layers_per_color = middle_layers // num_middle_colors if num_middle_colors > 0 else 0
+
+        # Precompute Beer-Lambert color for 256 brightness levels
+        level_colors = np.zeros((256, 3))
+        for bi in range(256):
+            brightness = bi / 255.0
+            layer_stack = [0] * base_layers  # dark base
+            for i in range(num_middle_colors):
+                # Lightest middle → highest threshold (widest coverage)
+                # Darkest middle → lowest threshold (only darkest pixels)
+                threshold = (i + 1) / (num_middle_colors + 1)
+                filament_idx = i + 1 if brightness <= threshold else num_colors - 1
+                layer_stack.extend([filament_idx] * layers_per_color)
+            layer_stack.extend([num_colors - 1] * top_layers)  # clear top
+            layer_heights_list = [layer_height] * len(layer_stack)
+            level_colors[bi] = simulator.simulate_layer_stack_color(layer_stack, layer_heights_list)
+
+        # Normalize range — Beer-Lambert through many layers compresses dynamic range
+        # into a narrow band (e.g. 0.6-0.9), making everything look grey.
+        # Stretch to full [0,1] to restore visible contrast.
+        min_val = level_colors.min()
+        max_val = level_colors.max()
+        if max_val > min_val:
+            level_colors = (level_colors - min_val) / (max_val - min_val)
+
+        # Map pixels to precomputed colors by contrast-enhanced brightness
         for y in range(height_px):
             for x in range(width_px):
                 if alpha_mask[y, x] < 0.5:
-                    preview[y, x] = [1, 1, 1]  # White for transparent areas
+                    preview[y, x] = [1, 1, 1]
                     continue
-
-                brightness = grayscale[y, x]
-
-                # Start with black base
-                color_stack = [selected_filaments.iloc[0]['color_hex']]
-
-                # Add middle colors based on brightness thresholds
-                for i in range(num_middle_colors):
-                    threshold = (i + 1) / (num_middle_colors + 1)
-                    if brightness >= threshold:
-                        color_stack.append(selected_filaments.iloc[i + 1]['color_hex'])
-
-                # Add clear top (always present)
-                color_stack.append(selected_filaments.iloc[-1]['color_hex'])
-
-                # Simulate color mixing (simple average)
-                final_color = simulate_color_stack(color_stack)
-                preview[y, x] = final_color
+                bi = int(np.clip(enhanced[y, x] * 255, 0, 255))
+                preview[y, x] = level_colors[bi]
 
     else:
         # Standard mode: shaped color layers
