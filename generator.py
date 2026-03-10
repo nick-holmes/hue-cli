@@ -883,7 +883,7 @@ class STLGenerator:
                 if not single_stl:
                     # Per-color STL mode: generate individual file
                     output_path = output_base_path.parent / f"{output_base_path.stem}_{color_name}.stl"
-                    mesh = self._generate_topographical_stl(z_bottom_color, z_top_color, color_effective_mask)
+                    mesh = self._generate_quantized_stl(z_bottom_color, z_top_color, color_effective_mask)
 
                     if len(mesh.vertices) > 0:
                         mesh.export(str(output_path))
@@ -904,7 +904,7 @@ class STLGenerator:
 
             z_bottom_combined = np.zeros_like(pixel_height)
             combined_mask = alpha_pixels & (pixel_height > min_thickness)
-            mesh = self._generate_topographical_stl(z_bottom_combined, pixel_height, combined_mask)
+            mesh = self._generate_quantized_stl(z_bottom_combined, pixel_height, combined_mask)
 
             if len(mesh.vertices) > 0:
                 mesh.export(str(output_path))
@@ -1285,8 +1285,7 @@ class STLGenerator:
         if len(vertices_list) > 0:
             combined_vertices = np.vstack(vertices_list)
             combined_faces = np.vstack(faces_list)
-            combined_mesh = trimesh.Trimesh(vertices=combined_vertices, faces=combined_faces, process=True)
-            combined_mesh.fix_normals()
+            combined_mesh = trimesh.Trimesh(vertices=combined_vertices, faces=combined_faces, process=False)
             combined_mesh.export(str(output_path))
             generated_files.append((output_path, clear_filament['name'], middle_layer_start, middle_layer_end))
             logger.info(f"  Generated combined clear STL")
@@ -1529,6 +1528,93 @@ class STLGenerator:
 
         return mesh
 
+    def _generate_quantized_stl(self, z_bottom, z_top, pixel_mask):
+        """Generate STL with height quantization + incremental slab greedy meshing.
+
+        Rounds heights to nearest layer_height multiple, then decomposes the height
+        range into incremental horizontal slabs. Each slab covers all pixels whose
+        column spans that Z range. Within each slab every pixel has the same height,
+        so greedy meshing produces non-overlapping geometry that slicers handle well.
+
+        Same interface as _generate_topographical_stl.
+
+        Args:
+            z_bottom: 2D array of bottom z-heights (mm) for each pixel
+            z_top: 2D array of top z-heights (mm) for each pixel
+            pixel_mask: 2D boolean array of which pixels to include
+
+        Returns:
+            trimesh.Trimesh object
+        """
+        if not pixel_mask.any():
+            return trimesh.Trimesh()
+
+        lh = self.layer_height
+
+        # Quantize heights to nearest layer_height multiple
+        q_z_top = np.round(z_top / lh) * lh
+        q_z_bottom = np.round(z_bottom / lh) * lh
+
+        # Filter: only pixels where quantized top > quantized bottom
+        effective_mask = pixel_mask & (q_z_top > q_z_bottom + 1e-6)
+        if not effective_mask.any():
+            return trimesh.Trimesh()
+
+        # Collect all unique Z levels from both bottom and top arrays
+        active_zb = q_z_bottom[effective_mask]
+        active_zt = q_z_top[effective_mask]
+        all_z_values = np.unique(np.concatenate([active_zb, active_zt]))
+        # Convert to integer layer indices to avoid float comparison issues
+        z_layers = np.round(all_z_values / lh).astype(np.int64)
+        z_layers = np.unique(z_layers)
+
+        # Also convert per-pixel values to integer layers for fast comparison
+        q_zb_layers = np.round(q_z_bottom / lh).astype(np.int64)
+        q_zt_layers = np.round(q_z_top / lh).astype(np.int64)
+
+        all_verts = []
+        all_faces = []
+        vertex_offset = 0
+        total_rects = 0
+
+        # Process each consecutive pair of Z levels as a slab
+        for s in range(len(z_layers) - 1):
+            slab_bottom_layer = z_layers[s]
+            slab_top_layer = z_layers[s + 1]
+
+            # Slab mask: pixels whose column fully spans this slab
+            # i.e. quantized bottom <= slab bottom AND quantized top >= slab top
+            slab_mask = effective_mask & (q_zb_layers <= slab_bottom_layer) & (q_zt_layers >= slab_top_layer)
+
+            if not slab_mask.any():
+                continue
+
+            rects = self._greedy_mesh_rects(slab_mask)
+            if rects:
+                zb_val = slab_bottom_layer * lh
+                zt_val = slab_top_layer * lh
+                verts, faces = self._build_box_mesh(rects, zb_val, zt_val, self.pixel_size)
+                if len(verts) > 0:
+                    all_verts.append(verts)
+                    all_faces.append(faces + vertex_offset)
+                    vertex_offset += len(verts)
+                    total_rects += len(rects)
+
+        if not all_verts:
+            return trimesh.Trimesh()
+
+        combined_verts = np.vstack(all_verts)
+        combined_faces = np.vstack(all_faces)
+        mesh = trimesh.Trimesh(vertices=combined_verts, faces=combined_faces, process=False)
+
+        total_pixels = effective_mask.sum()
+        num_slabs = len(z_layers) - 1
+        logger.info(f"  Quantized mesh: {total_pixels:,} pixels, {num_slabs} slabs, "
+                     f"{total_rects} rects -> {len(combined_faces):,} faces "
+                     f"(vs ~{total_pixels * 6:,} topographical)")
+
+        return mesh
+
     def _generate_flat_layer_stl(self, pixel_mask, layer_start, layer_end):
         """Generate flat STL for given pixel mask at specific layer range
 
@@ -1553,8 +1639,7 @@ class STLGenerator:
         if len(verts) == 0:
             return trimesh.Trimesh()
 
-        mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=True)
-        mesh.fix_normals()
+        mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
 
         original_pixels = pixel_mask.sum()
         logger.info(f"    Flat layer: {original_pixels:,} pixels -> {len(rects)} rects, {len(faces)} faces")
@@ -1698,8 +1783,7 @@ class STLGenerator:
             if all_verts:
                 combined_verts = np.vstack(all_verts)
                 combined_faces = np.vstack(all_faces)
-                mesh = trimesh.Trimesh(vertices=combined_verts, faces=combined_faces, process=True)
-                mesh.fix_normals()
+                mesh = trimesh.Trimesh(vertices=combined_verts, faces=combined_faces, process=False)
                 mesh.export(str(output_path))
 
                 if layer_start_actual is None:
@@ -2020,7 +2104,7 @@ class STLGenerator:
                     logger.info(f"    z: {z_bottom_flat:.2f} - {z_top_max:.2f}mm")
 
                 output_path = output_base_path.parent / f"{output_base_path.stem}_{color_name}.stl"
-                mesh = self._generate_topographical_stl(z_bottom_color, z_top_color, color_effective_mask)
+                mesh = self._generate_quantized_stl(z_bottom_color, z_top_color, color_effective_mask)
 
                 if len(mesh.vertices) > 0:
                     mesh.export(str(output_path))
@@ -2185,7 +2269,7 @@ class STLGenerator:
                     z_top_max = np.max(z_top_color[color_effective_mask])
                     logger.info(f"    z: {z_bottom_flat:.2f} - {z_top_max:.2f}mm")
 
-                    mesh = self._generate_topographical_stl(z_bottom_color, z_top_color, color_effective_mask)
+                    mesh = self._generate_quantized_stl(z_bottom_color, z_top_color, color_effective_mask)
 
                     if len(mesh.vertices) > 0:
                         all_mesh_outputs.append((mesh, output_path, filament['name']))
@@ -2223,7 +2307,7 @@ class STLGenerator:
         vertex_offset = len(cap_mesh.vertices)
 
         if negative_mask.any():
-            negative_mesh = self._generate_topographical_stl(
+            negative_mesh = self._generate_quantized_stl(
                 z_bottom_negative, z_top_negative, negative_mask)
 
             if len(negative_mesh.vertices) > 0:
@@ -2235,8 +2319,7 @@ class STLGenerator:
 
         combined_vertices = np.vstack(vertices_list)
         combined_faces = np.vstack(faces_list)
-        combined_mesh = trimesh.Trimesh(vertices=combined_vertices, faces=combined_faces, process=True)
-        combined_mesh.fix_normals()
+        combined_mesh = trimesh.Trimesh(vertices=combined_vertices, faces=combined_faces, process=False)
 
         all_mesh_outputs.append((combined_mesh, cap_output_path, transparent_filament['name']))
         logger.info(f"  Combined transparent STL: {len(combined_mesh.vertices)} vertices, "
