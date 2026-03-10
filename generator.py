@@ -752,6 +752,9 @@ class STLGenerator:
         """
         logger.info(f"Generating {self.num_colors}-color model: {self.model_height}mm tall, {self.num_layers} layers")
 
+        if self.use_face_down and self.use_cap_layers:
+            return self._generate_face_down_with_cap_layers(output_base_path)
+
         if self.use_face_down:
             return self._generate_face_down(output_base_path)
 
@@ -946,8 +949,8 @@ class STLGenerator:
         sorted_filaments['luminosity'] = sorted_filaments['lab'].apply(
             lambda x: float(np.asarray(x).flat[0]))
 
-        if self.use_cap_layers:
-            # Cap layers: keep base (index 0) and clear (index -1) in place,
+        if self.use_cap_layers and not self.use_face_down:
+            # Cap layers only: keep base (index 0) and clear (index -1) in place,
             # sort only middle colors by luminosity for optimal coverage mapping
             middle = sorted_filaments.iloc[1:-1].sort_values('luminosity').reset_index(drop=True)
             sorted_filaments = pd.concat([
@@ -968,35 +971,73 @@ class STLGenerator:
             # Contrast enhancement (uses self.alpha_mask internally)
             enhanced = self._apply_contrast_enhancement(ds_grayscale.copy())
 
-            # TD-proportional layer allocation (same logic as generate_all)
-            filament_tds = np.array([f['transmission_distance'] for _, f in sorted_filaments.iterrows()])
-            td_weights = np.log1p(np.maximum(filament_tds, 1.0))
-            td_weights = td_weights / td_weights.sum()
-
-            min_layers = 1
-            available_layers = self.num_layers - min_layers * self.num_colors
-            if available_layers < 0:
-                available_layers = 0
-                min_layers = max(1, self.num_layers // self.num_colors)
-
-            layer_counts = np.round(td_weights * available_layers).astype(int) + min_layers
-            layer_counts[-1] = self.num_layers - layer_counts[:-1].sum()
-            layer_boundaries = np.concatenate([[0], np.cumsum(layer_counts)]).astype(int)
-            z_boundaries = layer_boundaries * self.layer_height
-
-            # Compute heightmap
             alpha_pixels = ds_alpha >= 0.5
             global_brightness_max = np.max(enhanced[alpha_pixels]) if np.any(alpha_pixels) else 1.0
-            min_height = 2 * self.layer_height
 
-            if self.use_face_down:
+            if self.use_face_down and self.use_cap_layers:
+                # Face-down + cap layers: standard heightmap, dark-to-light order
+                # Image colors exclude the transparent filament
+                image_filaments = sorted_filaments.iloc[:-1].reset_index(drop=True)
+                transparent_filament = sorted_filaments.iloc[-1]
+                num_image_colors = len(image_filaments)
+
+                cap_layers_count = 2
+                cap_height = cap_layers_count * self.layer_height
+                image_total_layers = self.num_layers - cap_layers_count
+                model_height_minus_cap = self.model_height - cap_height
+
+                image_tds = np.array([f['transmission_distance'] for _, f in image_filaments.iterrows()])
+                td_weights = np.log1p(np.maximum(image_tds, 1.0))
+                td_weights = td_weights / td_weights.sum()
+
+                min_layers_alloc = 1
+                available_layers = image_total_layers - min_layers_alloc * num_image_colors
+                if available_layers < 0:
+                    available_layers = 0
+                    min_layers_alloc = max(1, image_total_layers // num_image_colors)
+
+                layer_counts = np.round(td_weights * available_layers).astype(int) + min_layers_alloc
+                layer_counts[-1] = image_total_layers - layer_counts[:-1].sum()
+
+                # Dark-to-light from z=0 upward (standard order, no reversal)
+                image_layer_boundaries = np.concatenate([[0], np.cumsum(layer_counts)]).astype(int)
+                z_boundaries = image_layer_boundaries * self.layer_height
+
+                # Standard heightmap: bright=tall, dark=short
+                # Range: [min_height, model_height - cap_height]
+                min_height = 2 * self.layer_height
                 normalized = enhanced / max(global_brightness_max, 1e-6)
-                pixel_height = min_height + (1.0 - normalized) * (self.model_height - min_height)
+                pixel_height = min_height + normalized * (model_height_minus_cap - min_height)
+                pixel_height = np.clip(pixel_height, min_height, model_height_minus_cap)
+                pixel_height = np.where(alpha_pixels, pixel_height, 0)
             else:
-                pixel_height = min_height + enhanced / max(global_brightness_max, 1e-6) * (self.model_height - min_height)
+                # TD-proportional layer allocation (same logic as generate_all)
+                filament_tds = np.array([f['transmission_distance'] for _, f in sorted_filaments.iterrows()])
+                td_weights = np.log1p(np.maximum(filament_tds, 1.0))
+                td_weights = td_weights / td_weights.sum()
 
-            pixel_height = np.clip(pixel_height, min_height, self.model_height)
-            pixel_height = np.where(alpha_pixels, pixel_height, 0)
+                min_layers = 1
+                available_layers = self.num_layers - min_layers * self.num_colors
+                if available_layers < 0:
+                    available_layers = 0
+                    min_layers = max(1, self.num_layers // self.num_colors)
+
+                layer_counts = np.round(td_weights * available_layers).astype(int) + min_layers
+                layer_counts[-1] = self.num_layers - layer_counts[:-1].sum()
+
+                layer_boundaries = np.concatenate([[0], np.cumsum(layer_counts)]).astype(int)
+                z_boundaries = layer_boundaries * self.layer_height
+
+                min_height = 2 * self.layer_height
+
+                if self.use_face_down:
+                    normalized = enhanced / max(global_brightness_max, 1e-6)
+                    pixel_height = min_height + (1.0 - normalized) * (self.model_height - min_height)
+                else:
+                    pixel_height = min_height + enhanced / max(global_brightness_max, 1e-6) * (self.model_height - min_height)
+
+                pixel_height = np.clip(pixel_height, min_height, self.model_height)
+                pixel_height = np.where(alpha_pixels, pixel_height, 0)
 
             scene = trimesh.Scene()
             min_thickness = self.layer_height * 0.5
@@ -1005,7 +1046,7 @@ class STLGenerator:
             z_bottom_all = np.zeros_like(pixel_height)
 
             if self.use_cap_layers:
-                # Flat top for cap-layer mode
+                # Flat top for cap-layer modes (both standalone and face-down+cap)
                 z_top = np.full_like(pixel_height, self.model_height)
             else:
                 # Topographical heightmap for standard and face-down modes
@@ -1015,7 +1056,11 @@ class STLGenerator:
             mesh = self._generate_topographical_stl(z_bottom_all, z_top, combined_mask)
 
             if len(mesh.vertices) > 0:
-                if self.use_cap_layers:
+                if self.use_face_down and self.use_cap_layers:
+                    preview_rgb = self._render_face_down_cap_preview(
+                        pixel_height, z_boundaries, image_filaments,
+                        transparent_filament, cap_height)
+                elif self.use_cap_layers:
                     preview_rgb = self._render_cap_layer_preview(
                         enhanced, sorted_filaments)
                 else:
@@ -1783,6 +1828,71 @@ class STLGenerator:
 
         return np.clip(light, 0, 1)
 
+    def _render_face_down_cap_preview(self, pixel_height, z_boundaries,
+                                       image_filaments, transparent_filament, cap_height):
+        """Render Beer-Lambert preview for face-down + cap layers mode
+
+        Uses standard heightmap (bright=tall, dark=short). After physical flip,
+        light enters from back (darkest color at highest z-band), passes through
+        color bands from dark-to-light, through negative fill, and exits through
+        the transparent cap (viewing surface).
+
+        Args:
+            pixel_height: 2D array of per-pixel heights (mm), standard heightmap
+            z_boundaries: 1D array of image color band boundaries (mm), dark-to-light
+            image_filaments: DataFrame of image filaments (dark-to-light order)
+            transparent_filament: Series for the transparent filament
+            cap_height: Height of transparent cap (mm)
+
+        Returns:
+            HxWx3 RGB preview image (0-1 range)
+        """
+        H, W = pixel_height.shape
+        num_image_colors = len(image_filaments)
+        model_height_minus_cap = self.model_height - cap_height
+
+        image_rgbs = np.array([f['rgb'] for _, f in image_filaments.iterrows()])
+        image_tds = np.array([f['transmission_distance'] for _, f in image_filaments.iterrows()])
+        trans_rgb = transparent_filament['rgb']
+        trans_td = max(transparent_filament['transmission_distance'], 0.1)
+
+        # White backlight from behind (after flip: enters from darkest side)
+        light = np.ones((H, W, 3))
+
+        # After physical flip, light path is:
+        # 1. Darkest color bands (highest z in generation space, back after flip)
+        # 2. Through lighter color bands toward viewing surface
+        # 3. Through transparent negative fill
+        # 4. Through transparent cap (viewing surface)
+
+        # Process from darkest (highest z) to lightest (lowest z)
+        for i in range(num_image_colors - 1, -1, -1):
+            z_lo = z_boundaries[i]
+            z_hi = z_boundaries[i + 1]
+
+            # Per-pixel thickness in this color band
+            thickness = np.clip(pixel_height, z_lo, z_hi) - z_lo
+            td = max(image_tds[i], 0.1)
+            rgb = image_rgbs[i]
+
+            transmission = np.exp(-thickness / td)
+            for c in range(3):
+                light[:, :, c] = light[:, :, c] * transmission + rgb[c] * (1.0 - transmission)
+
+        # Transparent negative fill (from pixel_height to model_height - cap_height)
+        neg_thickness = model_height_minus_cap - pixel_height
+        neg_thickness = np.clip(neg_thickness, 0, model_height_minus_cap)
+        transmission = np.exp(-neg_thickness / trans_td)
+        for c in range(3):
+            light[:, :, c] = light[:, :, c] * transmission + trans_rgb[c] * (1.0 - transmission)
+
+        # Transparent cap (uniform thickness, viewing surface)
+        transmission = np.exp(-cap_height / trans_td)
+        for c in range(3):
+            light[:, :, c] = light[:, :, c] * transmission + trans_rgb[c] * (1.0 - transmission)
+
+        return np.clip(light, 0, 1)
+
     def _generate_face_down(self, output_base_path):
         """Generate face-down mode using topographical approach with inverted heightmap
 
@@ -1792,9 +1902,10 @@ class STLGenerator:
         3. Global heightmap (inverted: dark=tall, light=short)
         4. Topographical STL per color band
 
-        Filaments sorted dark-to-light (same as standard mode).
-        z=0 (bed) = darkest, z=max = lightest.
-        User flips model in slicer; viewed from top, dark pixels have more material → more absorption.
+        Filaments ordered light-to-dark from z=0 upward.
+        z=0 (bed/viewing surface after flip) = lightest, z=max = darkest.
+        Light pixels (short) pass through only high-TD material near z=0 → high transmission.
+        Dark pixels (tall) accumulate absorption through all bands including darkest at z=max.
 
         Returns:
             List of (path, name, layer_start, layer_end) tuples
@@ -1924,4 +2035,228 @@ class STLGenerator:
                 logger.warning(f"  No pixels for {color_name} - skipping")
 
         logger.info(f"Face-down generation complete: {len(generated_files)} STL files")
+        return generated_files
+
+    def _generate_face_down_with_cap_layers(self, output_base_path):
+        """Generate face-down mode with cap layers for a completely flat model
+
+        Strategy: standard generation + negative fill + transparent cap on TOP,
+        then Z-flip all meshes so the cap ends up at z=0 (bed surface).
+
+        Before flip (generation space):
+        - z=0: darkest color (standard heightmap: bright=tall, dark=short)
+        - z=model_height-cap_height: top of image colors / bottom of cap
+        - z=model_height: top of transparent cap
+
+        After Z-flip (what goes into slicer):
+        - z=0: transparent cap (smooth bed surface)
+        - z=cap_height: start of image colors (flipped)
+        - z=model_height: darkest color (back of print)
+
+        After user physically flips the print:
+        - Light enters from back (darkest), through colors, exits through cap
+        - Standard topographical heightmap provides image detail
+
+        Returns:
+            List of (path, name, layer_start, layer_end) tuples
+        """
+        from scipy import ndimage
+
+        logger.info("=" * 60)
+        logger.info("FACE-DOWN + CAP LAYERS: Standard generation + Z-flip")
+        logger.info("=" * 60)
+
+        generated_files = []
+
+        # Sort dark-to-light by LAB luminosity (same as standard)
+        sorted_filaments = self.selected_filaments.copy()
+        sorted_filaments['luminosity'] = sorted_filaments['lab'].apply(
+            lambda x: float(np.asarray(x).flat[0]))
+        sorted_filaments = sorted_filaments.sort_values('luminosity').reset_index(drop=True)
+
+        # Last filament (lightest/most transparent) = cap + negative fill
+        # Remaining filaments = image colors
+        transparent_filament = sorted_filaments.iloc[-1]
+        image_filaments = sorted_filaments.iloc[:-1].reset_index(drop=True)
+        num_image_colors = len(image_filaments)
+
+        logger.info(f"Transparent (cap + negative): {transparent_filament['name']} "
+                     f"(TD={transparent_filament['transmission_distance']:.1f})")
+        logger.info(f"Image colors: {num_image_colors}")
+
+        # Layer allocation
+        cap_layers_count = 2
+        cap_height = cap_layers_count * self.layer_height
+        image_total_layers = self.num_layers - cap_layers_count
+
+        # TD-proportional allocation for image colors only
+        image_tds = np.array([f['transmission_distance'] for _, f in image_filaments.iterrows()])
+        td_weights = np.log1p(np.maximum(image_tds, 1.0))
+        td_weights = td_weights / td_weights.sum()
+
+        min_layers = 1
+        available_layers = image_total_layers - min_layers * num_image_colors
+        if available_layers < 0:
+            available_layers = 0
+            min_layers = max(1, image_total_layers // num_image_colors)
+
+        layer_counts = np.round(td_weights * available_layers).astype(int) + min_layers
+        layer_counts[-1] = image_total_layers - layer_counts[:-1].sum()
+
+        # Dark-to-light from z=0 upward (standard order, no reversal)
+        image_layer_boundaries = np.concatenate([[0], np.cumsum(layer_counts)]).astype(int)
+        z_boundaries = image_layer_boundaries * self.layer_height
+
+        model_height_minus_cap = self.model_height - cap_height
+
+        for idx in range(num_image_colors):
+            name = image_filaments.iloc[idx]['name']
+            td = image_tds[idx]
+            lc = layer_counts[idx]
+            height = lc * self.layer_height
+            logger.info(f"  {name}: TD={td:.1f}mm → {lc} layers ({height:.2f}mm)")
+
+        # Standard heightmap: bright=tall, dark=short
+        # Range is [min_height, model_height - cap_height] (leave room for cap at top)
+        enhanced_grayscale = self._apply_contrast_enhancement(self.image_grayscale.copy())
+        alpha_pixels = self.alpha_mask >= 0.5
+        global_brightness_max = np.max(enhanced_grayscale[alpha_pixels]) if np.any(alpha_pixels) else 1.0
+
+        min_height = 2 * self.layer_height  # bed adhesion minimum
+        normalized = enhanced_grayscale / max(global_brightness_max, 1e-6)
+        pixel_height = min_height + normalized * (model_height_minus_cap - min_height)
+        pixel_height = np.clip(pixel_height, min_height, model_height_minus_cap)
+        pixel_height = np.where(alpha_pixels, pixel_height, 0)
+
+        # Store for preview
+        self.face_down_pixel_height = pixel_height
+        self.face_down_z_boundaries = z_boundaries
+        self.face_down_image_filaments = image_filaments
+        self.face_down_transparent_filament = transparent_filament
+        self.face_down_cap_height = cap_height
+
+        min_thickness = self.layer_height * 0.5
+        all_pixels_mask = alpha_pixels
+
+        # Collect all meshes for Z-flip at the end
+        all_mesh_outputs = []  # [(mesh, output_path, filament_name)]
+
+        # 1. IMAGE COLOR STLs (topographical, standard heightmap, dark-to-light)
+        for i in range(num_image_colors):
+            filament = image_filaments.iloc[i]
+            color_name_i = filament['name'].replace(' ', '_').replace('/', '_')
+            output_path = output_base_path.parent / f"{output_base_path.stem}_{color_name_i}.stl"
+
+            z_bottom_flat = float(z_boundaries[i])
+            z_top_boundary = float(z_boundaries[i + 1])
+
+            # Pixels that reach into this color's z-band
+            pixel_mask = (pixel_height > z_bottom_flat + min_thickness) & alpha_pixels
+            pixel_count = np.sum(pixel_mask)
+
+            # Clean up small disconnected regions
+            labeled, num_regions = ndimage.label(pixel_mask)
+            min_region_size = 8
+
+            if num_regions > 1 and i > 0:
+                region_sizes = np.bincount(labeled.ravel())
+                small_regions = region_sizes < min_region_size
+                small_regions[0] = False
+                pixel_mask[small_regions[labeled]] = False
+
+                pixel_count_filtered = np.sum(pixel_mask)
+                removed_pixels = pixel_count - pixel_count_filtered
+                if removed_pixels > 0:
+                    logger.info(f"  Filtered {removed_pixels} pixels in "
+                                 f"{np.sum(small_regions) - 1} small regions")
+                pixel_count = pixel_count_filtered
+
+            logger.info(f"  {color_name_i}: layers {image_layer_boundaries[i]}-{image_layer_boundaries[i+1]} "
+                         f"({layer_counts[i]} layers, {pixel_count} px)")
+
+            if pixel_count > 0:
+                z_top_color = np.clip(pixel_height, z_bottom_flat, z_top_boundary)
+                z_bottom_color = np.full_like(pixel_height, z_bottom_flat)
+
+                thickness = z_top_color - z_bottom_flat
+                color_effective_mask = pixel_mask & (thickness >= min_thickness)
+
+                if color_effective_mask.any():
+                    z_top_max = np.max(z_top_color[color_effective_mask])
+                    logger.info(f"    z: {z_bottom_flat:.2f} - {z_top_max:.2f}mm")
+
+                    mesh = self._generate_topographical_stl(z_bottom_color, z_top_color, color_effective_mask)
+
+                    if len(mesh.vertices) > 0:
+                        all_mesh_outputs.append((mesh, output_path, filament['name']))
+                        logger.info(f"  Generated: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
+                    else:
+                        logger.warning(f"  Empty mesh for {color_name_i} - skipping")
+            else:
+                logger.warning(f"  No pixels for {color_name_i} - skipping")
+
+        # 2. TRANSPARENT NEGATIVE FILL (topographical — fills from pixel_height to model_height - cap_height)
+        z_bottom_negative = pixel_height.copy()
+        z_top_negative = np.full_like(pixel_height, model_height_minus_cap)
+        negative_mask = alpha_pixels & (pixel_height < model_height_minus_cap - min_thickness)
+
+        negative_pixel_count = np.sum(negative_mask)
+        logger.info(f"Generating transparent negative fill: {negative_pixel_count} pixels "
+                     f"(z=pixel_height to {model_height_minus_cap:.2f}mm)")
+
+        # 3. FLAT TRANSPARENT CAP at top (z=model_height-cap_height to z=model_height)
+        cap_z_bottom = model_height_minus_cap
+        cap_z_top = self.model_height
+        logger.info(f"Generating transparent cap: z={cap_z_bottom:.2f} to {cap_z_top:.2f}mm")
+
+        cap_mesh = self._generate_flat_layer_stl(
+            all_pixels_mask,
+            int(round(cap_z_bottom / self.layer_height)),
+            int(round(cap_z_top / self.layer_height)))
+
+        # Combine cap + negative fill into single transparent STL
+        color_name = transparent_filament['name'].replace(' ', '_').replace('/', '_')
+        cap_output_path = output_base_path.parent / f"{output_base_path.stem}_{color_name}.stl"
+
+        vertices_list = [cap_mesh.vertices]
+        faces_list = [cap_mesh.faces]
+        vertex_offset = len(cap_mesh.vertices)
+
+        if negative_mask.any():
+            negative_mesh = self._generate_topographical_stl(
+                z_bottom_negative, z_top_negative, negative_mask)
+
+            if len(negative_mesh.vertices) > 0:
+                vertices_list.append(negative_mesh.vertices)
+                faces_list.append(negative_mesh.faces + vertex_offset)
+                vertex_offset += len(negative_mesh.vertices)
+                logger.info(f"  Negative fill: {len(negative_mesh.vertices)} vertices, "
+                             f"{len(negative_mesh.faces)} faces")
+
+        combined_vertices = np.vstack(vertices_list)
+        combined_faces = np.vstack(faces_list)
+        combined_mesh = trimesh.Trimesh(vertices=combined_vertices, faces=combined_faces, process=True)
+        combined_mesh.fix_normals()
+
+        all_mesh_outputs.append((combined_mesh, cap_output_path, transparent_filament['name']))
+        logger.info(f"  Combined transparent STL: {len(combined_mesh.vertices)} vertices, "
+                     f"{len(combined_mesh.faces)} faces")
+
+        # 4. Z-FLIP ALL MESHES: vertices[:, 2] = model_height - vertices[:, 2]
+        # This puts the cap at z=0 (bed) and darkest color at z=model_height (back)
+        logger.info(f"Z-flipping all meshes (model_height={self.model_height:.2f}mm)")
+
+        for mesh, output_path, filament_name in all_mesh_outputs:
+            mesh.vertices[:, 2] = self.model_height - mesh.vertices[:, 2]
+            mesh.fix_normals()
+            mesh.export(str(output_path))
+
+            min_z = np.min(mesh.vertices[:, 2])
+            max_z = np.max(mesh.vertices[:, 2])
+            layer_start_actual = int(np.floor(min_z / self.layer_height))
+            layer_end_actual = int(np.ceil(max_z / self.layer_height))
+            generated_files.append((output_path, filament_name, layer_start_actual, layer_end_actual))
+            logger.info(f"  {filament_name}: z={min_z:.2f}-{max_z:.2f}mm (flipped)")
+
+        logger.info(f"Face-down cap layers complete: {len(generated_files)} STL files")
         return generated_files

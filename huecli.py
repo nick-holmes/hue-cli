@@ -95,6 +95,11 @@ class FilamentLibrary:
         """
         logger.info(f"Selecting {count} unique filaments from library (randomize: {randomize}, cap_layers: {use_cap_layers}, face_down: {use_face_down})")
 
+        if use_cap_layers and use_face_down:
+            # Face-down + cap layers: only reserve transparent, all others for image
+            result = self._select_with_face_down_cap(target_colors_lab, count, layer_height, min_color_difference, randomize)
+            return result
+
         if use_cap_layers:
             # Cap layers mode: select dark base + clear top + colors
             result = self._select_with_cap_layers(target_colors_lab, count, layer_height, min_color_difference, randomize)
@@ -163,6 +168,112 @@ class FilamentLibrary:
 
         result = self.df.iloc[selected_indices].reset_index(drop=True)
         return result
+
+    def _select_with_face_down_cap(self, target_colors_lab, count, layer_height, min_color_difference, randomize):
+        """Select filaments for face-down + cap layers mode
+
+        Only reserves 1 slot for transparent (cap + negative fill).
+        All remaining slots are for image-carrying colors.
+
+        Returns filaments in order: [color1, color2, ..., transparent]
+        """
+        logger.info("Face-down + cap layers: selecting transparent + image colors")
+
+        if count < 2:
+            raise ValueError("Face-down cap layers requires at least 2 colors (1 image + transparent)")
+
+        selected_indices = []
+
+        # 1. Select PURE TRANSPARENT filament (cap + negative fill)
+        clear_candidates = []
+        for idx, row in self.df.iterrows():
+            luminosity = row['lab'][0]
+            a_value = abs(row['lab'][1])
+            b_value = abs(row['lab'][2])
+            td = row['transmission_distance']
+
+            if luminosity > 85 and td > 5.0 and (a_value + b_value) < 10.0:
+                color_penalty = (a_value + b_value) * 2.0
+                score = luminosity + td * 5.0 - color_penalty
+                clear_candidates.append((score, idx))
+
+        if not clear_candidates:
+            logger.warning("No pure transparent filaments found, trying less strict...")
+            for idx, row in self.df.iterrows():
+                luminosity = row['lab'][0]
+                td = row['transmission_distance']
+                if luminosity > 85 and td > 5.0:
+                    score = luminosity + td * 5.0
+                    clear_candidates.append((score, idx))
+
+        if not clear_candidates:
+            logger.warning("No clear filaments found, using most transparent available")
+            best_td_idx = self.df['transmission_distance'].idxmax()
+            selected_indices.append(best_td_idx)
+        else:
+            clear_candidates.sort(reverse=True)
+            selected_indices.append(clear_candidates[0][1])
+
+        clear_filament = self.df.iloc[selected_indices[0]]
+        logger.info(f"Selected transparent: {clear_filament['name']} "
+                     f"(L={clear_filament['lab'][0]:.1f}, TD={clear_filament['transmission_distance']}mm)")
+
+        # 2. Select IMAGE filaments (count - 1 remaining slots)
+        num_image_colors = count - 1
+        logger.info(f"Selecting {num_image_colors} image filaments to match image")
+
+        selected_labs = [self.df.iloc[idx]['lab'] for idx in selected_indices]
+
+        target_colors_sorted = sorted(enumerate(target_colors_lab), key=lambda x: x[1][0])
+
+        for color_idx, target_lab in target_colors_sorted[:num_image_colors]:
+            distances = []
+
+            for idx, row in self.df.iterrows():
+                if idx in selected_indices:
+                    continue
+
+                filament_lab = row['lab']
+                too_similar = False
+                for selected_lab in selected_labs:
+                    delta_e_to_selected = color.deltaE_ciede2000(
+                        np.array([[filament_lab]]),
+                        np.array([[selected_lab]])
+                    )[0][0]
+                    if delta_e_to_selected < min_color_difference:
+                        too_similar = True
+                        break
+
+                if too_similar:
+                    continue
+
+                delta_e = color.deltaE_ciede2000(
+                    np.array([[target_lab]]),
+                    np.array([[filament_lab]])
+                )[0][0]
+
+                if randomize:
+                    import random
+                    delta_e += random.uniform(-5.0, 5.0)
+
+                distances.append((delta_e, idx))
+
+            if distances:
+                distances.sort()
+                best_idx = distances[0][1]
+                selected_indices.append(best_idx)
+                selected_labs.append(self.df.iloc[best_idx]['lab'])
+                logger.info(f"  Image color {len(selected_indices)-1}: "
+                             f"{self.df.iloc[best_idx]['name']} ({self.df.iloc[best_idx]['color_hex']})")
+
+        if len(selected_indices) < count:
+            logger.warning(f"Only selected {len(selected_indices)} filaments out of {count} requested")
+
+        # Reorder: [image colors..., transparent] — transparent goes last
+        result_indices = selected_indices[1:]  # image colors
+        result_indices.append(selected_indices[0])  # transparent at end
+
+        return self.df.iloc[result_indices].reset_index(drop=True)
 
     def _select_with_cap_layers(self, target_colors_lab, count, layer_height, min_color_difference, randomize):
         """Select filaments for cap layers mode: dark base + clear top + colors
@@ -1433,10 +1544,18 @@ def main():
         # Show Beer-Lambert preview for face-down mode
         if use_face_down and hasattr(stl_gen, 'face_down_pixel_height'):
             logger.info("Rendering face-down Beer-Lambert preview...")
-            preview_rgb = stl_gen._render_face_down_preview(
-                stl_gen.face_down_pixel_height, stl_gen.face_down_z_boundaries,
-                stl_gen.face_down_filaments
-            )
+            if hasattr(stl_gen, 'face_down_cap_height'):
+                # Face-down + cap layers: use combined preview renderer
+                preview_rgb = stl_gen._render_face_down_cap_preview(
+                    stl_gen.face_down_pixel_height, stl_gen.face_down_z_boundaries,
+                    stl_gen.face_down_image_filaments, stl_gen.face_down_transparent_filament,
+                    stl_gen.face_down_cap_height
+                )
+            else:
+                preview_rgb = stl_gen._render_face_down_preview(
+                    stl_gen.face_down_pixel_height, stl_gen.face_down_z_boundaries,
+                    stl_gen.face_down_filaments
+                )
             preview_path = output_path.with_name(output_path.stem + '_preview.png')
 
             import matplotlib.pyplot as plt
@@ -1481,7 +1600,17 @@ def main():
             # Write filament-change schedule if available
             f.write("\nPrinting Instructions:\n")
             f.write("-" * 60 + "\n")
-            if use_face_down:
+            if use_face_down and use_cap_layers:
+                f.write("FACE-DOWN + CAP LAYERS MODE\n")
+                f.write("1. Load all STL files into slicer at once\n")
+                f.write("2. Right-click each part and assign the corresponding filament\n")
+                f.write("3. The transparent cap prints first (on the bed, 100% solid)\n")
+                f.write("4. Image colors and negative fill print on top of the cap\n")
+                f.write("5. The model is completely flat — no topographical surface\n")
+                f.write("6. After printing, flip the model over for display\n")
+                f.write("7. The bed-side surface (smooth transparent cap) becomes the viewing side\n")
+                f.write("8. Backlight for best effect\n")
+            elif use_face_down:
                 f.write("FACE-DOWN MODE\n")
                 f.write("1. Load all STL files into slicer at once\n")
                 f.write("2. Right-click each part and assign the corresponding filament\n")
