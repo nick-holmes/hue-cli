@@ -28,7 +28,8 @@ class STLGenerator:
     def __init__(self, image_grayscale, width_mm, layer_height, model_height,
                  selected_filaments, alpha_mask=None, use_cap_layers=False, image_rgb=None,
                  contrast_strength=2.0, use_face_down=False, use_exploded=False,
-                 use_exploded_multi=False):
+                 use_exploded_multi=False, use_exploded_cmyk=False, sandwich_layers=1,
+                 use_fill=False):
         """
         Args:
             image_grayscale: 2D array of brightness values (0=dark, 1=bright)
@@ -55,6 +56,9 @@ class STLGenerator:
         self.use_face_down = use_face_down
         self.use_exploded = use_exploded
         self.use_exploded_multi = use_exploded_multi
+        self.use_exploded_cmyk = use_exploded_cmyk
+        self.sandwich_layers = sandwich_layers
+        self.use_fill = use_fill
         self.contrast_strength = contrast_strength
 
         self.num_layers = int(model_height / layer_height)
@@ -757,6 +761,9 @@ class STLGenerator:
         """
         logger.info(f"Generating {self.num_colors}-color model: {self.model_height}mm tall, {self.num_layers} layers")
 
+        if self.use_exploded_cmyk:
+            return self._generate_exploded_cmyk(output_base_path)
+
         if self.use_exploded_multi:
             return self._generate_exploded_multi(output_base_path)
 
@@ -979,9 +986,14 @@ class STLGenerator:
         logger.info(f"  {len(combos)} valid combinations (from {len(all_combos)} total)")
 
         # Compute transparent layer count and convert to thicknesses
+        # Each sandwich has sandwich_layers color layers in the middle
+        color_thickness = self.layer_height * self.sandwich_layers
         trans_layers = max_layers_per_pixel - combos.sum(axis=1)
-        color_thicknesses = combos * self.layer_height
-        trans_thicknesses = (trans_layers * self.layer_height).reshape(-1, 1)
+        color_thicknesses = combos * color_thickness
+        # With fill: unused sandwiches are fully transparent (same thickness as color)
+        # Without fill: unused sandwiches only have bottom transparent layer
+        trans_per_sandwich = color_thickness if self.use_fill else self.layer_height
+        trans_thicknesses = (trans_layers * trans_per_sandwich).reshape(-1, 1)
         thickness_combos = np.column_stack([color_thicknesses, trans_thicknesses])
 
         # Simulate Beer-Lambert for each combination
@@ -1031,7 +1043,11 @@ class STLGenerator:
 
         return layer_counts
 
-    def _generate_exploded(self, output_base_path):
+    def _generate_exploded_cmyk(self, output_base_path):
+        """Generate exploded CMYK mode: 4 primaries with max 2 sandwiches each."""
+        return self._generate_exploded(output_base_path, max_sandwiches_per_color=2)
+
+    def _generate_exploded(self, output_base_path, max_sandwiches_per_color=3):
         """Generate exploded mode: per-pixel Beer-Lambert optimized sandwiches.
 
         Each color is capped at 3 sandwiches max, allowing more distinct colors
@@ -1060,10 +1076,7 @@ class STLGenerator:
         total_sandwiches = int(self.model_height / self.layer_height)
         logger.info(f"Exploded mode: {total_sandwiches} total sandwiches, {num_color_filaments} colors")
 
-        # Cap each color at 3 sandwiches max — allows more colors while
-        # still providing intensity control (0/1/2/3 layers per pixel per color)
-        MAX_SANDWICHES_PER_COLOR = 3
-        per_color_caps = [min(MAX_SANDWICHES_PER_COLOR, total_sandwiches) for _ in range(num_color_filaments)]
+        per_color_caps = [min(max_sandwiches_per_color, total_sandwiches) for _ in range(num_color_filaments)]
 
         # Reduce caps if combinatorial space is too large
         combo_size = 1
@@ -1084,9 +1097,16 @@ class STLGenerator:
 
         all_pixels_mask = self.alpha_mask >= 0.5
 
+        # Sandwich layer structure:
+        # Bottom transparent: layer 0 to 1
+        # Color middle: layer 1 to 1+sandwich_layers
+        # Top transparent: layer 1+sandwich_layers to 2+sandwich_layers
+        sl = self.sandwich_layers
+        layers_per_sandwich = sl + 2
+
         # Pre-generate shared full-plate meshes (same for every sandwich)
         mesh_bottom = self._generate_flat_layer_stl(all_pixels_mask, 0, 1)
-        mesh_top = self._generate_flat_layer_stl(all_pixels_mask, 2, 3)
+        mesh_top = self._generate_flat_layer_stl(all_pixels_mask, 1 + sl, layers_per_sandwich) if self.use_fill else None
 
         for c in range(num_color_filaments):
             filament = color_filaments.iloc[c]
@@ -1102,17 +1122,18 @@ class STLGenerator:
                 if pixel_count == 0:
                     continue
 
-                logger.info(f"  {color_name} sandwich {k}/{max_k}: {pixel_count} pixels")
+                logger.info(f"  {color_name} sandwich {k}/{max_k}: {pixel_count} pixels "
+                             f"({layers_per_sandwich} layers/sandwich, {sl} color, fill={self.use_fill})")
 
-                # Color STL: middle layer (layer 1 to 2)
+                # Color STL: middle layers (layer 1 to 1+sandwich_layers)
                 suffix = f"_{k}" if max_k > 1 else ""
                 color_stl_path = output_base_path.parent / f"{output_base_path.stem}_{color_name}{suffix}_color.stl"
-                color_mesh = self._generate_flat_layer_stl(color_mask, 1, 2)
+                color_mesh = self._generate_flat_layer_stl(color_mask, 1, 1 + sl)
                 if len(color_mesh.vertices) > 0:
                     color_mesh.export(str(color_stl_path))
-                    generated_files.append((color_stl_path, f"{filament['name']} (color {k})", 1, 2))
+                    generated_files.append((color_stl_path, f"{filament['name']} (color {k})", 1, 1 + sl))
 
-                # Transparent STL: bottom + inverse middle + top
+                # Transparent STL: bottom + optional inverse middle + optional top
                 trans_stl_path = output_base_path.parent / f"{output_base_path.stem}_{color_name}{suffix}_transparent.stl"
 
                 vertices_list = []
@@ -1125,25 +1146,26 @@ class STLGenerator:
                     faces_list.append(mesh_bottom.faces + vertex_offset)
                     vertex_offset += len(mesh_bottom.vertices)
 
-                # Part 2: Inverse middle fill
-                if inverse_mask.any():
-                    mesh_middle = self._generate_flat_layer_stl(inverse_mask, 1, 2)
-                    if len(mesh_middle.vertices) > 0:
-                        vertices_list.append(mesh_middle.vertices)
-                        faces_list.append(mesh_middle.faces + vertex_offset)
-                        vertex_offset += len(mesh_middle.vertices)
+                if self.use_fill:
+                    # Part 2: Inverse middle fill
+                    if inverse_mask.any():
+                        mesh_middle = self._generate_flat_layer_stl(inverse_mask, 1, 1 + sl)
+                        if len(mesh_middle.vertices) > 0:
+                            vertices_list.append(mesh_middle.vertices)
+                            faces_list.append(mesh_middle.faces + vertex_offset)
+                            vertex_offset += len(mesh_middle.vertices)
 
-                # Part 3: Full top
-                if len(mesh_top.vertices) > 0:
-                    vertices_list.append(mesh_top.vertices)
-                    faces_list.append(mesh_top.faces + vertex_offset)
+                    # Part 3: Full top
+                    if len(mesh_top.vertices) > 0:
+                        vertices_list.append(mesh_top.vertices)
+                        faces_list.append(mesh_top.faces + vertex_offset)
 
                 if vertices_list:
                     combined_vertices = np.vstack(vertices_list)
                     combined_faces = np.vstack(faces_list)
                     combined_mesh = trimesh.Trimesh(vertices=combined_vertices, faces=combined_faces, process=False)
                     combined_mesh.export(str(trans_stl_path))
-                    generated_files.append((trans_stl_path, f"{transparent_filament['name']} (for {filament['name']} {k})", 0, 3))
+                    generated_files.append((trans_stl_path, f"{transparent_filament['name']} (for {filament['name']} {k})", 0, layers_per_sandwich))
 
         logger.info(f"Exploded mode: generated {len(generated_files)} STL files")
         return generated_files
@@ -1266,9 +1288,13 @@ class STLGenerator:
 
         all_pixels_mask = self.alpha_mask >= 0.5
 
+        # Sandwich layer structure (same as _generate_exploded)
+        sl = self.sandwich_layers
+        layers_per_sandwich = sl + 2
+
         # Pre-generate shared full-plate meshes (same for every sandwich)
         mesh_bottom = self._generate_flat_layer_stl(all_pixels_mask, 0, 1)
-        mesh_top = self._generate_flat_layer_stl(all_pixels_mask, 2, 3)
+        mesh_top = self._generate_flat_layer_stl(all_pixels_mask, 1 + sl, layers_per_sandwich) if self.use_fill else None
 
         for s_idx, group in enumerate(sandwich_groups):
             sandwich_num = s_idx + 1
@@ -1288,16 +1314,16 @@ class STLGenerator:
 
                 color_stl_path = (output_base_path.parent /
                     f"{output_base_path.stem}_S{sandwich_num:02d}_{color_name}_color.stl")
-                color_mesh = self._generate_flat_layer_stl(mask, 1, 2)
+                color_mesh = self._generate_flat_layer_stl(mask, 1, 1 + sl)
                 if len(color_mesh.vertices) > 0:
                     color_mesh.export(str(color_stl_path))
                     generated_files.append((
                         color_stl_path,
                         f"{filament['name']} (sandwich {sandwich_num})",
-                        1, 2
+                        1, 1 + sl
                     ))
 
-            # Generate transparent STL: bottom + inverse middle + top
+            # Generate transparent STL: bottom + optional inverse middle + optional top
             inverse_mask = ~combined_color_mask & all_pixels_mask
 
             trans_stl_path = (output_base_path.parent /
@@ -1312,16 +1338,17 @@ class STLGenerator:
                 faces_list.append(mesh_bottom.faces + vertex_offset)
                 vertex_offset += len(mesh_bottom.vertices)
 
-            if inverse_mask.any():
-                mesh_middle = self._generate_flat_layer_stl(inverse_mask, 1, 2)
-                if len(mesh_middle.vertices) > 0:
-                    vertices_list.append(mesh_middle.vertices)
-                    faces_list.append(mesh_middle.faces + vertex_offset)
-                    vertex_offset += len(mesh_middle.vertices)
+            if self.use_fill:
+                if inverse_mask.any():
+                    mesh_middle = self._generate_flat_layer_stl(inverse_mask, 1, 1 + sl)
+                    if len(mesh_middle.vertices) > 0:
+                        vertices_list.append(mesh_middle.vertices)
+                        faces_list.append(mesh_middle.faces + vertex_offset)
+                        vertex_offset += len(mesh_middle.vertices)
 
-            if len(mesh_top.vertices) > 0:
-                vertices_list.append(mesh_top.vertices)
-                faces_list.append(mesh_top.faces + vertex_offset)
+                if len(mesh_top.vertices) > 0:
+                    vertices_list.append(mesh_top.vertices)
+                    faces_list.append(mesh_top.faces + vertex_offset)
 
             if vertices_list:
                 combined_vertices = np.vstack(vertices_list)
@@ -1334,7 +1361,7 @@ class STLGenerator:
                 generated_files.append((
                     trans_stl_path,
                     f"Transparent (sandwich {sandwich_num}: {names_str})",
-                    0, 3
+                    0, layers_per_sandwich
                 ))
 
         logger.info(f"Exploded-multi: generated {len(generated_files)} STL files "
@@ -1351,7 +1378,7 @@ class STLGenerator:
         Returns:
             trimesh.Scene with one colored mesh per filament
         """
-        if self.use_exploded or self.use_exploded_multi:
+        if self.use_exploded or self.use_exploded_multi or self.use_exploded_cmyk:
             return self._generate_exploded_preview_scene()
 
         from math import sqrt
@@ -1545,8 +1572,8 @@ class STLGenerator:
 
         H, W = self.image_grayscale.shape
 
-        # Downsample for exploded preview (~80K pixels — greedy meshing keeps face count low)
-        ds = max(1, round(sqrt(H * W / 80000)))
+        # Downsample for exploded preview (~250K pixels — greedy meshing keeps face count low)
+        ds = max(1, round(sqrt(H * W / 250000)))
         ds_alpha = self.alpha_mask[::ds, ::ds]
         ds_H, ds_W = ds_alpha.shape
         ds_pixel_size = self.width_mm / ds_W
@@ -1563,7 +1590,9 @@ class STLGenerator:
         total_sandwiches = int(self.model_height / self.layer_height)
 
         # Compute caps (same logic as generation methods)
-        if self.use_exploded_multi:
+        if self.use_exploded_cmyk:
+            max_cap = 2
+        elif self.use_exploded_multi:
             max_cap = 5
         else:
             max_cap = 3
@@ -1644,15 +1673,16 @@ class STLGenerator:
             trans_alpha = 15  # ~6% opacity — just enough to see sandwich outline
 
             # Build filament RGB + Beer-Lambert alpha lookup
-            # Alpha = opacity for one layer_height of material, with min floor for visibility
+            # Alpha = opacity for sandwich_layers of material, with min floor for visibility
             MIN_ALPHA = 40  # ~15% — ensures even high-TD filaments are visible
+            color_thickness = self.layer_height * self.sandwich_layers
             filament_rgb_uint8 = {}
             filament_alpha = {}
             for c in range(num_color_filaments):
                 f = color_filaments.iloc[c]
                 filament_rgb_uint8[c] = (np.array(f['rgb']) * 255).astype(np.uint8)
                 td = max(f['transmission_distance'], 0.1)
-                opacity = 1.0 - np.exp(-self.layer_height / td)
+                opacity = 1.0 - np.exp(-color_thickness / td)
                 filament_alpha[c] = max(int(opacity * 255), MIN_ALPHA)
 
             all_pixels_mask = ds_alpha >= 0.5

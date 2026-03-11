@@ -425,6 +425,87 @@ class FilamentLibrary:
         result_indices = color_indices + [transparent_idx]
         return self.df.iloc[result_indices].reset_index(drop=True)
 
+    def select_for_exploded_cmyk(self, layer_height=0.08, model_height=2.0, sandwich_layers=3):
+        """Select filaments for exploded CMYK mode: C/M/Y/K primaries + transparent.
+
+        Uses fixed CMYK target colors instead of K-means. Finds the best filament
+        match for each ideal primary, with TD penalty for overly transparent filaments.
+
+        Args:
+            sandwich_layers: Color layers per sandwich (default 3 for CMYK)
+
+        Returns:
+            DataFrame: [cyan, magenta, yellow, black, transparent] (transparent last)
+        """
+        logger.info("Exploded CMYK: selecting C/M/Y/K filaments + transparent")
+
+        # Max material thickness per color in CMYK mode
+        # (2 sandwiches × sandwich_layers color layers × layer_height)
+        max_sandwiches_per_color = 2
+        max_color_thickness = max_sandwiches_per_color * sandwich_layers * layer_height
+
+        # 1. Auto-select transparent filament
+        transparent_idx = self._select_transparent_filament()
+        transparent_filament = self.df.iloc[transparent_idx]
+        logger.info(f"Selected transparent: {transparent_filament['name']} "
+                     f"(L={transparent_filament['lab'][0]:.1f}, TD={transparent_filament['transmission_distance']}mm)")
+
+        # 2. Define ideal CMYK targets in LAB
+        cmyk_targets = {
+            'Cyan':    color.rgb2lab([[[0.0, 1.0, 1.0]]])[0][0],
+            'Magenta': color.rgb2lab([[[1.0, 0.0, 1.0]]])[0][0],
+            'Yellow':  color.rgb2lab([[[1.0, 1.0, 0.0]]])[0][0],
+            'Black':   color.rgb2lab([[[0.0, 0.0, 0.0]]])[0][0],
+        }
+
+        # 3. Select best filament for each CMYK channel
+        selected_indices = []
+        exclude = {transparent_idx}
+
+        for channel_name, target_lab in cmyk_targets.items():
+            distances = []
+
+            for idx, row in self.df.iterrows():
+                if idx in exclude:
+                    continue
+
+                filament_lab = row['lab']
+                delta_e = color.deltaE_ciede2000(
+                    np.array([[target_lab]]),
+                    np.array([[filament_lab]])
+                )[0][0]
+
+                # Light TD penalty: prefer filaments that can show color in thin layers,
+                # but prioritize color accuracy (CMYK needs the right primaries)
+                td = row['transmission_distance']
+                opacity_at_max = 1.0 - np.exp(-max_color_thickness / max(td, 0.1))
+                td_penalty = max(0, (1.0 - opacity_at_max) * 10.0)
+
+                score = delta_e + td_penalty
+                distances.append((score, idx))
+
+            if distances:
+                distances.sort()
+                best_idx = distances[0][1]
+                best_row = self.df.iloc[best_idx]
+                selected_indices.append(best_idx)
+                exclude.add(best_idx)
+                opacity = 1.0 - np.exp(-max_color_thickness / max(best_row['transmission_distance'], 0.1))
+                delta_e = color.deltaE_ciede2000(
+                    np.array([[target_lab]]),
+                    np.array([[best_row['lab']]])
+                )[0][0]
+                logger.info(f"  {channel_name}: {best_row['name']} "
+                             f"({best_row['color_hex']}, TD={best_row['transmission_distance']:.1f}, "
+                             f"deltaE={delta_e:.1f}, max opacity={opacity:.0%})")
+
+        if len(selected_indices) < 4:
+            logger.warning(f"Only found {len(selected_indices)} CMYK filaments (expected 4)")
+
+        # Order: [C, M, Y, K, transparent]
+        result_indices = selected_indices + [transparent_idx]
+        return self.df.iloc[result_indices].reset_index(drop=True)
+
     def _select_with_cap_layers(self, target_colors_lab, count, layer_height, min_color_difference, randomize):
         """Select filaments for cap layers mode: dark base + clear top + colors
 
@@ -1121,7 +1202,7 @@ def _enhance_contrast(brightness, alpha_mask, strength=2.0):
 
 
 def generate_preview(grayscale, selected_filaments, layer_height, model_height, use_cap_layers, alpha_mask,
-                     image_rgb=None, use_exploded=False, exploded_max_cap=3):
+                     image_rgb=None, use_exploded=False, exploded_max_cap=3, sandwich_layers=1, use_fill=False):
     """Generate preview image showing simulated color stacking appearance."""
     height_px, width_px = grayscale.shape
     preview = np.ones((height_px, width_px, 3))
@@ -1169,10 +1250,15 @@ def generate_preview(grayscale, selected_filaments, layer_height, model_height, 
         combos = all_combos[valid]
 
         # Thicknesses including transparent fill
+        # Each sandwich has sandwich_layers color layers in the middle
+        color_thickness = layer_height * sandwich_layers
         trans_layers = total_sandwiches - combos.sum(axis=1)
+        # With fill: unused sandwiches are fully transparent (same thickness as color)
+        # Without fill: unused sandwiches only have bottom transparent layer
+        trans_per_sandwich = color_thickness if use_fill else layer_height
         thickness_combos = np.column_stack([
-            combos * layer_height,
-            (trans_layers * layer_height).reshape(-1, 1)
+            combos * color_thickness,
+            (trans_layers * trans_per_sandwich).reshape(-1, 1)
         ])
 
         # Beer-Lambert simulation
@@ -1331,7 +1417,7 @@ def show_3d_preview(stl_gen):
     b64 = base64.b64encode(glb_data).decode("utf-8")
     logger.info(f"GLB size: {len(glb_data)/1024/1024:.1f} MB")
 
-    use_transparency = stl_gen.use_exploded or stl_gen.use_exploded_multi
+    use_transparency = stl_gen.use_exploded or stl_gen.use_exploded_multi or stl_gen.use_exploded_cmyk
     html = _build_viewer_html(b64, use_transparency=use_transparency)
 
     with tempfile.NamedTemporaryFile('w', suffix='.html', delete=False) as f:
@@ -1564,14 +1650,14 @@ def main():
                         help='Output filename (default: <input_stem>.stl)')
     parser.add_argument('-d', '--min-delta-e', type=float, default=None,
                         help='Min color difference delta-E between filaments (default: 5.0)')
-    parser.add_argument('--cap-layers', type=str, default=None, metavar='BOOL',
-                        help='Use cap layers (black base + auto colors + clear top) [yes/no]')
-    parser.add_argument('--face-down', type=str, default=None, metavar='BOOL',
-                        help='Face-down mode: flat voxel grid printed face-down, flipped for display [yes/no]')
-    parser.add_argument('--exploded', type=str, default=None, metavar='BOOL',
-                        help='Exploded mode: each color as standalone transparent sandwich [yes/no]')
-    parser.add_argument('--exploded-multi', type=str, default=None, metavar='BOOL',
-                        help='Exploded-multi mode: up to 3 colors per sandwich for higher fidelity [yes/no]')
+    parser.add_argument('--mode', type=str, default=None,
+                        choices=['standard', 'cap-layers', 'face-down', 'face-down-cap',
+                                 'exploded', 'exploded-multi', 'exploded-cmyk'],
+                        help='Generation mode (default: standard)')
+    parser.add_argument('--sandwich-layers', type=int, default=None,
+                        help='Color layers per sandwich in exploded modes (default: 1, CMYK default: 3)')
+    parser.add_argument('--fill', type=str, default=None, metavar='BOOL',
+                        help='Fill sandwiches with transparent (inverse middle + top layer) [yes/no] (default: no)')
 
     args = parser.parse_args()
 
@@ -1650,43 +1736,53 @@ def main():
             float
         )
 
-        use_cap_layers = (args.cap_layers.lower() in ('y', 'yes', 'true', '1')) if args.cap_layers is not None else prompt_with_default(
-            "Use cap layers (black base + auto colors + clear top)",
-            False,
-            bool
-        )
+        if args.mode is not None:
+            mode = args.mode
+        else:
+            print("\nAvailable modes:")
+            print("  1. standard        - Multi-color stacked topographical STLs")
+            print("  2. cap-layers      - Black base + auto colors + clear top")
+            print("  3. face-down       - Flat voxel grid, flip after printing")
+            print("  4. face-down-cap   - Face-down with cap layers")
+            print("  5. exploded        - Each color as standalone transparent sandwich")
+            print("  6. exploded-multi  - Up to 3 colors per sandwich, higher fidelity")
+            print("  7. exploded-cmyk   - 4 CMYK primaries, max 8 sandwiches")
+            mode_choice = input("Select mode [1]: ").strip() or "1"
+            mode_map = {
+                '1': 'standard', '2': 'cap-layers', '3': 'face-down',
+                '4': 'face-down-cap', '5': 'exploded', '6': 'exploded-multi',
+                '7': 'exploded-cmyk',
+            }
+            mode = mode_map.get(mode_choice, mode_choice)  # Accept number or name
 
-        use_face_down = (args.face_down.lower() in ('y', 'yes', 'true', '1')) if args.face_down is not None else prompt_with_default(
-            "Use face-down mode (flat voxel grid, flip after printing)",
-            False,
-            bool
-        )
-
-        use_exploded = (args.exploded.lower() in ('y', 'yes', 'true', '1')) if args.exploded is not None else prompt_with_default(
-            "Use exploded mode (each color as standalone transparent sandwich)",
-            False,
-            bool
-        )
-
-        use_exploded_multi = (args.exploded_multi.lower() in ('y', 'yes', 'true', '1')) if args.exploded_multi is not None else False
-        exploded_any = use_exploded or use_exploded_multi
-
-        if use_exploded and use_exploded_multi:
-            logger.error("Cannot use both --exploded and --exploded-multi. Choose one.")
-            return 1
-
-        if exploded_any and (use_cap_layers or use_face_down):
-            logger.error("Exploded modes cannot be combined with cap-layers or face-down mode")
-            return 1
+        # Derive boolean flags from mode
+        use_cap_layers = mode in ('cap-layers', 'face-down-cap')
+        use_face_down = mode in ('face-down', 'face-down-cap')
+        use_exploded = mode == 'exploded'
+        use_exploded_multi = mode == 'exploded-multi'
+        use_exploded_cmyk = mode == 'exploded-cmyk'
+        exploded_any = use_exploded or use_exploded_multi or use_exploded_cmyk
 
         # Resolve color_count now that mode flags are known
-        if color_count is None and not exploded_any:
+        if use_exploded_cmyk:
+            color_count = 4  # CMYK always uses exactly 4 colors
+        elif color_count is None and not exploded_any:
             color_count = prompt_with_default("Number of colors/filaments", 4, int)
 
         if not exploded_any and use_cap_layers and color_count < 3:
             logger.warning("Cap layers requires at least 3 colors. Setting to 3.")
             color_count = 3
 
+        # Resolve sandwich_layers (color layers per sandwich in exploded modes)
+        if args.sandwich_layers is not None:
+            sandwich_layers = args.sandwich_layers
+        elif use_exploded_cmyk:
+            sandwich_layers = 3  # CMYK needs thicker color layers for high-TD filaments
+        else:
+            sandwich_layers = 1  # Standard exploded default
+
+        # Resolve fill (transparent fill in exploded sandwiches)
+        use_fill = (args.fill.lower() in ('y', 'yes', 'true', '1')) if args.fill is not None else False
 
         print("\n" + "=" * 60)
 
@@ -1701,7 +1797,7 @@ def main():
         img_processor = ImageProcessor(args.image, width, color_count or 4)
         img_processor.load_and_prepare(nozzle_diameter=nozzle_diameter, face_down=use_face_down)
 
-        if exploded_any and color_count is None:
+        if exploded_any and not use_exploded_cmyk and color_count is None:
             # Iterative color count optimization: try K=3..max_k, score each by
             # Beer-Lambert mean delta-E, pick lowest K within 2.0 of best score.
             from generator import STLGenerator as _STLGen
@@ -1777,7 +1873,9 @@ def main():
                 valid = all_combos.sum(axis=1) <= total_sandwiches
                 combos = all_combos[valid]
                 trans_l = total_sandwiches - combos.sum(axis=1)
-                thickness = np.column_stack([combos * layer_height, (trans_l * layer_height).reshape(-1, 1)])
+                color_thickness = layer_height * sandwich_layers
+                trans_per_sandwich = color_thickness if use_fill else layer_height
+                thickness = np.column_stack([combos * color_thickness, (trans_l * trans_per_sandwich).reshape(-1, 1)])
                 sim_rgb = try_gen._vectorized_beer_lambert(all_rgbs, all_tds, thickness)
                 sim_lab = color.rgb2lab(sim_rgb.reshape(-1, 1, 3)).reshape(-1, 3)
                 tree = cKDTree(sim_lab)
@@ -1809,7 +1907,13 @@ def main():
         dominant_colors_lab, kmeans, sorted_indices = img_processor.quantize_colors()
 
         # 4. Select best filaments (with transmission-aware color simulation)
-        if exploded_any:
+        if use_exploded_cmyk:
+            selected_filaments = filament_lib.select_for_exploded_cmyk(
+                layer_height=layer_height,
+                model_height=model_height,
+                sandwich_layers=sandwich_layers,
+            )
+        elif exploded_any:
             selected_filaments = filament_lib.select_for_exploded(
                 dominant_colors_lab,
                 min_color_difference=min_color_difference,
@@ -1859,7 +1963,9 @@ def main():
             img_processor.alpha_mask,
             image_rgb=img_processor.image if exploded_any else None,
             use_exploded=exploded_any,
-            exploded_max_cap=5 if use_exploded_multi else 3,
+            exploded_max_cap=2 if use_exploded_cmyk else (5 if use_exploded_multi else 3),
+            sandwich_layers=sandwich_layers,
+            use_fill=use_fill,
         )
         while not preview_approved:
 
@@ -1915,7 +2021,13 @@ def main():
                 # Reduce color delta to allow more similar colors
                 min_color_difference = min_color_difference * 0.7
                 logger.info(f"Reducing color delta to {min_color_difference:.1f} and re-selecting filaments...")
-                if exploded_any:
+                if use_exploded_cmyk:
+                    selected_filaments = filament_lib.select_for_exploded_cmyk(
+                        layer_height=layer_height,
+                        model_height=model_height,
+                        sandwich_layers=sandwich_layers,
+                    )
+                elif exploded_any:
                     selected_filaments = filament_lib.select_for_exploded(
                         dominant_colors_lab,
                         min_color_difference=min_color_difference,
@@ -1943,7 +2055,9 @@ def main():
                     img_processor.alpha_mask,
                     image_rgb=img_processor.image if exploded_any else None,
                     use_exploded=exploded_any,
-                    exploded_max_cap=5 if use_exploded_multi else 3,
+                    exploded_max_cap=2 if use_exploded_cmyk else (5 if use_exploded_multi else 3),
+                    sandwich_layers=sandwich_layers,
+                    use_fill=use_fill,
                 )
             elif choice == "3":
                 # 3D preview in browser
@@ -1959,6 +2073,9 @@ def main():
                     use_face_down=use_face_down,
                     use_exploded=use_exploded,
                     use_exploded_multi=use_exploded_multi,
+                    use_exploded_cmyk=use_exploded_cmyk,
+                    sandwich_layers=sandwich_layers,
+                    use_fill=use_fill,
                 )
                 show_3d_preview(preview_stl_gen)
                 # Loop continues to show 2D preview + menu again
@@ -1991,6 +2108,9 @@ def main():
             use_face_down=use_face_down,
             use_exploded=use_exploded,
             use_exploded_multi=use_exploded_multi,
+            use_exploded_cmyk=use_exploded_cmyk,
+            sandwich_layers=sandwich_layers,
+            use_fill=use_fill,
         )
 
         generated_files = stl_gen.generate_all(output_path, single_stl=False)
@@ -2055,7 +2175,19 @@ def main():
             # Write filament-change schedule if available
             f.write("\nPrinting Instructions:\n")
             f.write("-" * 60 + "\n")
-            if use_exploded_multi:
+            if use_exploded_cmyk:
+                f.write("EXPLODED CMYK MODE\n")
+                f.write("Uses 4 subtractive primaries (Cyan, Magenta, Yellow, Black) + transparent.\n")
+                f.write(f"Each colour has up to 2 intensity levels = max 8 sandwiches.\n")
+                f.write(f"Each sandwich has {sandwich_layers} colour layer(s) + 2 transparent = {sandwich_layers + 2} layers.\n\n")
+                f.write("For each sandwich:\n")
+                f.write("1. Load both STLs (_color.stl and _transparent.stl) into slicer\n")
+                f.write("2. Assign the colour filament to the _color.stl part\n")
+                f.write("3. Assign transparent filament to the _transparent.stl part\n")
+                f.write(f"4. Print as a single {sandwich_layers + 2}-layer print\n\n")
+                f.write("After printing all sandwiches:\n")
+                f.write("5. Stack all sandwiches in order and backlight for effect\n")
+            elif use_exploded_multi:
                 f.write("EXPLODED-MULTI MODE\n")
                 f.write("Each sandwich is 3 layers tall with up to 3 colors in the middle layer.\n")
                 f.write("Requires a multi-material printer (or filament swaps) per sandwich.\n\n")
