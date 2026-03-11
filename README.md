@@ -49,13 +49,50 @@ python3 huecli.py image.png \
 | `-d, --min-delta-e` | Min colour difference (delta-E) | `5.0` |
 | `--cap-layers` | Cap layers: black base + auto colours + clear top (yes/no) | `no` |
 | `--face-down` | Face-down mode: inverted heightmap, flip in slicer (yes/no) | `no` |
+| `--exploded` | Exploded mode: standalone transparent sandwiches per colour (yes/no) | `no` |
 
 Any flag left out will be prompted interactively. A preview window shows the expected result before generating STLs.
+
+## Modes
+
+### Standard (default)
+
+Multi-colour stacked topographical STLs. Requires a multi-material printer. Load all STLs into your slicer and assign each part to its filament.
+
+### Cap Layers (`--cap-layers yes`)
+
+Adds a dark base and clear top layer for enhanced contrast. Best for images with fine detail.
+
+### Face-Down (`--face-down yes`)
+
+Flat voxel grid printed face-down. Flip the print after removal for a smooth viewing surface.
+
+### Exploded (`--exploded yes`)
+
+Each colour becomes a standalone 3-layer sandwich: transparent bottom, colour middle, transparent top. This removes the multi-material printer requirement — each sandwich can be printed individually on any single-material printer, then stacked by hand.
+
+- **No colour limit**: Automatically determines the optimal number of colours from the image using iterative K-means clustering (stops when a new colour adds less than `--min-delta-e` difference). You can also override with `-c`.
+- **Binary pixel assignment**: Each pixel is assigned to exactly one colour (the best match).
+- **Auto transparent selection**: Picks the most transparent filament from your library automatically.
+- **2 STLs per colour**: `_color.stl` (colour pixels at middle layer) and `_transparent.stl` (carrier: full bottom + inverse middle fill + full top).
+
+```bash
+# Exploded mode with auto colour count
+python3 huecli.py image.png -f filaments.csv -l 0.08 -m 2.0 -n 0.4 -s 120x160 -d 10.0 -o output.stl --exploded yes
+```
+
+**Printing each sandwich:**
+1. Load both STLs (`_color.stl` and `_transparent.stl`) into your slicer
+2. Assign the colour filament to the `_color` part, transparent to the `_transparent` part
+3. Print as a single 3-layer print (3 x layer_height tall)
+4. Repeat for each colour, then stack all sandwiches and backlight
+
+Cannot be combined with `--cap-layers` or `--face-down`.
 
 ## Output
 
 All files are saved to `output/`:
-- One STL per colour (e.g. `image_Black.stl`, `image_Orange.stl`)
+- One STL per colour (e.g. `image_Black.stl`, `image_Orange.stl`), or in exploded mode, two STLs per colour (`_color.stl` + `_transparent.stl`)
 - A `.txt` file with printing instructions
 
 Load all STLs into your slicer, right-click each part to assign the corresponding filament.

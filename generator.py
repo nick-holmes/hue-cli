@@ -27,7 +27,7 @@ class STLGenerator:
 
     def __init__(self, image_grayscale, width_mm, layer_height, model_height,
                  selected_filaments, alpha_mask=None, use_cap_layers=False, image_rgb=None,
-                 contrast_strength=2.0, use_face_down=False):
+                 contrast_strength=2.0, use_face_down=False, use_exploded=False):
         """
         Args:
             image_grayscale: 2D array of brightness values (0=dark, 1=bright)
@@ -40,6 +40,7 @@ class STLGenerator:
             image_rgb: Full RGB image for color matching (HxWx3 array, 0-1 range)
             contrast_strength: S-curve contrast boost (1.0=none, 2.0=moderate, 3.0=strong)
             use_face_down: If True, generate flat voxel grid for face-down printing
+            use_exploded: If True, generate standalone sandwiches per color
         """
         self.image_grayscale = image_grayscale
         self.image_rgb = image_rgb
@@ -50,6 +51,7 @@ class STLGenerator:
         self.alpha_mask = alpha_mask if alpha_mask is not None else np.ones_like(image_grayscale)
         self.use_cap_layers = use_cap_layers
         self.use_face_down = use_face_down
+        self.use_exploded = use_exploded
         self.contrast_strength = contrast_strength
 
         self.num_layers = int(model_height / layer_height)
@@ -752,6 +754,9 @@ class STLGenerator:
         """
         logger.info(f"Generating {self.num_colors}-color model: {self.model_height}mm tall, {self.num_layers} layers")
 
+        if self.use_exploded:
+            return self._generate_exploded(output_base_path)
+
         if self.use_face_down and self.use_cap_layers:
             return self._generate_face_down_with_cap_layers(output_base_path)
 
@@ -918,6 +923,223 @@ class STLGenerator:
 
             self.filament_schedule = filament_schedule
 
+        return generated_files
+
+    def _compute_exploded_layer_counts(self, color_filaments, transparent_filament,
+                                       max_layers_per_pixel, per_color_caps):
+        """Compute optimal integer layer counts per pixel per color for exploded mode.
+
+        Uses Beer-Lambert simulation over all valid integer layer-count combinations,
+        builds a KDTree in LAB space, and finds the nearest match for each pixel.
+
+        Args:
+            color_filaments: DataFrame of color filaments (excludes transparent)
+            transparent_filament: Series for the transparent filament
+            max_layers_per_pixel: int, total layer budget per pixel
+            per_color_caps: list of int, max sandwiches allocated to each color
+
+        Returns:
+            layer_counts: ndarray (H, W, num_color_filaments) int32
+        """
+        from itertools import product
+        from scipy.spatial import cKDTree
+
+        num_colors = len(color_filaments)
+        H, W = self.image_grayscale.shape
+
+        # Filament properties: colors + transparent
+        filament_rgbs = np.array([f['rgb'] for _, f in color_filaments.iterrows()])
+        filament_tds = np.array([f['transmission_distance'] for _, f in color_filaments.iterrows()])
+        trans_rgb = np.array(transparent_filament['rgb'])
+        trans_td = transparent_filament['transmission_distance']
+
+        all_rgbs = np.vstack([filament_rgbs, trans_rgb.reshape(1, 3)])
+        all_tds = np.append(filament_tds, trans_td)
+
+        caps_str = ', '.join(f"{color_filaments.iloc[i]['name']}={per_color_caps[i]}"
+                             for i in range(num_colors))
+        logger.info(f"Exploded optimization: {num_colors} colors, {max_layers_per_pixel} total sandwiches")
+        logger.info(f"  Allocation: {caps_str}")
+
+        # Generate all valid layer count combinations respecting per-color caps
+        ranges = [range(0, cap + 1) for cap in per_color_caps]
+        all_combos = np.array(list(product(*ranges)))
+
+        # Filter: total layers <= budget
+        total_layers = all_combos.sum(axis=1)
+        valid = total_layers <= max_layers_per_pixel
+        combos = all_combos[valid]
+
+        logger.info(f"  {len(combos)} valid combinations (from {len(all_combos)} total)")
+
+        # Compute transparent layer count and convert to thicknesses
+        trans_layers = max_layers_per_pixel - combos.sum(axis=1)
+        color_thicknesses = combos * self.layer_height
+        trans_thicknesses = (trans_layers * self.layer_height).reshape(-1, 1)
+        thickness_combos = np.column_stack([color_thicknesses, trans_thicknesses])
+
+        # Simulate Beer-Lambert for each combination
+        combo_colors_rgb = self._vectorized_beer_lambert(all_rgbs, all_tds, thickness_combos)
+        combo_colors_lab = color.rgb2lab(combo_colors_rgb.reshape(-1, 1, 3)).reshape(-1, 3)
+
+        # Build KDTree for fast matching
+        tree = cKDTree(combo_colors_lab)
+
+        # Target pixel colors in LAB
+        if self.image_rgb is not None:
+            target_lab = color.rgb2lab(self.image_rgb).reshape(-1, 3)
+        else:
+            gray_rgb = np.stack([self.image_grayscale] * 3, axis=-1)
+            target_lab = color.rgb2lab(gray_rgb).reshape(-1, 3)
+
+        # K=1 nearest neighbor (need integer results, not interpolated)
+        distances, indices = tree.query(target_lab, k=1)
+
+        # Log matching quality
+        valid_mask = (self.alpha_mask >= 0.5).ravel()
+        valid_distances = distances[valid_mask]
+        logger.info(f"  Beer-Lambert matching: mean deltaE={np.mean(valid_distances):.2f}, "
+                     f"median={np.median(valid_distances):.2f}, "
+                     f"95th={np.percentile(valid_distances, 95):.2f}")
+
+        # Map back to layer counts
+        pixel_combos = combos[indices]
+        layer_counts = pixel_combos.reshape(H, W, num_colors).astype(np.int32)
+
+        # Zero out transparent pixels
+        alpha_mask_3d = (self.alpha_mask >= 0.5)[:, :, np.newaxis]
+        layer_counts = np.where(alpha_mask_3d, layer_counts, 0)
+
+        # Log per-color statistics
+        total_sandwiches = 0
+        for c in range(num_colors):
+            name = color_filaments.iloc[c]['name']
+            active = layer_counts[:, :, c][self.alpha_mask >= 0.5]
+            max_k = int(layer_counts[:, :, c].max())
+            mean_k = float(active.mean()) if len(active) > 0 else 0
+            total_sandwiches += max_k
+            logger.info(f"  {name}: {max_k} sandwiches (allocated {per_color_caps[c]}), "
+                         f"mean {mean_k:.1f} layers/pixel")
+
+        logger.info(f"  Total sandwiches: {total_sandwiches} ({total_sandwiches * 2} STL files)")
+
+        return layer_counts
+
+    def _generate_exploded(self, output_base_path):
+        """Generate exploded mode: per-pixel Beer-Lambert optimized sandwiches.
+
+        Each color is capped at 3 sandwiches max, allowing more distinct colors
+        while still providing intensity control (0/1/2/3 layers per pixel per color).
+        Total sandwiches used <= model_height / layer_height.
+
+        Each sandwich is 3 layers tall (transparent/color/transparent).
+        For each color, generates one sandwich per demand level:
+          - Sandwich k has mask = pixels needing >= k layers of that color
+          - Produces 2 STLs: color pixels + transparent carrier
+
+        Final stacked height = total_sandwiches * 3 * layer_height.
+        """
+        generated_files = []
+
+        # Separate color vs transparent filaments (transparent is last)
+        num_color_filaments = self.num_colors - 1
+        if num_color_filaments <= 0:
+            logger.warning("Exploded mode requires at least 1 color + transparent")
+            return generated_files
+
+        color_filaments = self.selected_filaments.iloc[:num_color_filaments]
+        transparent_filament = self.selected_filaments.iloc[-1]
+
+        # Fixed total sandwich count
+        total_sandwiches = int(self.model_height / self.layer_height)
+        logger.info(f"Exploded mode: {total_sandwiches} total sandwiches, {num_color_filaments} colors")
+
+        # Cap each color at 3 sandwiches max — allows more colors while
+        # still providing intensity control (0/1/2/3 layers per pixel per color)
+        MAX_SANDWICHES_PER_COLOR = 3
+        per_color_caps = [min(MAX_SANDWICHES_PER_COLOR, total_sandwiches) for _ in range(num_color_filaments)]
+
+        # Reduce caps if combinatorial space is too large
+        combo_size = 1
+        for cap in per_color_caps:
+            combo_size *= (cap + 1)
+        while combo_size > 500_000:
+            # Reduce the largest cap by 1
+            max_idx = per_color_caps.index(max(per_color_caps))
+            per_color_caps[max_idx] -= 1
+            combo_size = 1
+            for cap in per_color_caps:
+                combo_size *= (cap + 1)
+
+        # Compute optimal layer counts per pixel per color
+        layer_counts = self._compute_exploded_layer_counts(
+            color_filaments, transparent_filament, total_sandwiches, per_color_caps
+        )
+
+        all_pixels_mask = self.alpha_mask >= 0.5
+
+        # Pre-generate shared full-plate meshes (same for every sandwich)
+        mesh_bottom = self._generate_flat_layer_stl(all_pixels_mask, 0, 1)
+        mesh_top = self._generate_flat_layer_stl(all_pixels_mask, 2, 3)
+
+        for c in range(num_color_filaments):
+            filament = color_filaments.iloc[c]
+            color_name = filament['name'].replace(' ', '_').replace('/', '_')
+            max_k = int(layer_counts[:, :, c].max())
+
+            for k in range(1, max_k + 1):
+                # Pixels needing >= k layers of this color
+                color_mask = (layer_counts[:, :, c] >= k) & all_pixels_mask
+                inverse_mask = ~color_mask & all_pixels_mask
+
+                pixel_count = int(color_mask.sum())
+                if pixel_count == 0:
+                    continue
+
+                logger.info(f"  {color_name} sandwich {k}/{max_k}: {pixel_count} pixels")
+
+                # Color STL: middle layer (layer 1 to 2)
+                suffix = f"_{k}" if max_k > 1 else ""
+                color_stl_path = output_base_path.parent / f"{output_base_path.stem}_{color_name}{suffix}_color.stl"
+                color_mesh = self._generate_flat_layer_stl(color_mask, 1, 2)
+                if len(color_mesh.vertices) > 0:
+                    color_mesh.export(str(color_stl_path))
+                    generated_files.append((color_stl_path, f"{filament['name']} (color {k})", 1, 2))
+
+                # Transparent STL: bottom + inverse middle + top
+                trans_stl_path = output_base_path.parent / f"{output_base_path.stem}_{color_name}{suffix}_transparent.stl"
+
+                vertices_list = []
+                faces_list = []
+                vertex_offset = 0
+
+                # Part 1: Full bottom
+                if len(mesh_bottom.vertices) > 0:
+                    vertices_list.append(mesh_bottom.vertices)
+                    faces_list.append(mesh_bottom.faces + vertex_offset)
+                    vertex_offset += len(mesh_bottom.vertices)
+
+                # Part 2: Inverse middle fill
+                if inverse_mask.any():
+                    mesh_middle = self._generate_flat_layer_stl(inverse_mask, 1, 2)
+                    if len(mesh_middle.vertices) > 0:
+                        vertices_list.append(mesh_middle.vertices)
+                        faces_list.append(mesh_middle.faces + vertex_offset)
+                        vertex_offset += len(mesh_middle.vertices)
+
+                # Part 3: Full top
+                if len(mesh_top.vertices) > 0:
+                    vertices_list.append(mesh_top.vertices)
+                    faces_list.append(mesh_top.faces + vertex_offset)
+
+                if vertices_list:
+                    combined_vertices = np.vstack(vertices_list)
+                    combined_faces = np.vstack(faces_list)
+                    combined_mesh = trimesh.Trimesh(vertices=combined_vertices, faces=combined_faces, process=False)
+                    combined_mesh.export(str(trans_stl_path))
+                    generated_files.append((trans_stl_path, f"{transparent_filament['name']} (for {filament['name']} {k})", 0, 3))
+
+        logger.info(f"Exploded mode: generated {len(generated_files)} STL files")
         return generated_files
 
     def generate_preview_scene(self):

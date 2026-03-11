@@ -275,6 +275,156 @@ class FilamentLibrary:
 
         return self.df.iloc[result_indices].reset_index(drop=True)
 
+    def _select_transparent_filament(self, exclude_indices=None):
+        """Select the best transparent filament from the library.
+
+        Looks for colorless, high-TD filaments (L>85, TD>5.0, low a/b tint).
+        Falls back progressively to less strict criteria.
+
+        Args:
+            exclude_indices: Set of DataFrame indices to skip
+
+        Returns:
+            DataFrame index of the selected transparent filament
+        """
+        exclude = exclude_indices or set()
+
+        # Strict: very light, very transparent, minimal color tint
+        clear_candidates = []
+        for idx, row in self.df.iterrows():
+            if idx in exclude:
+                continue
+            luminosity = row['lab'][0]
+            a_value = abs(row['lab'][1])
+            b_value = abs(row['lab'][2])
+            td = row['transmission_distance']
+
+            if luminosity > 85 and td > 5.0 and (a_value + b_value) < 10.0:
+                color_penalty = (a_value + b_value) * 2.0
+                score = luminosity + td * 5.0 - color_penalty
+                clear_candidates.append((score, idx))
+
+        if not clear_candidates:
+            logger.warning("No pure transparent filaments found (L > 85, TD > 5mm, low a/b), trying less strict...")
+            for idx, row in self.df.iterrows():
+                if idx in exclude:
+                    continue
+                luminosity = row['lab'][0]
+                td = row['transmission_distance']
+                if luminosity > 85 and td > 5.0:
+                    score = luminosity + td * 5.0
+                    clear_candidates.append((score, idx))
+
+        if not clear_candidates:
+            logger.warning("No clear filaments found at all, using most transparent available")
+            best_td_idx = None
+            best_td = 0
+            for idx, row in self.df.iterrows():
+                if idx not in exclude:
+                    if row['transmission_distance'] > best_td:
+                        best_td = row['transmission_distance']
+                        best_td_idx = idx
+            if best_td_idx is not None:
+                return best_td_idx
+            # Absolute fallback: first non-excluded
+            for idx in self.df.index:
+                if idx not in exclude:
+                    return idx
+        else:
+            clear_candidates.sort(reverse=True)
+            return clear_candidates[0][1]
+
+    def select_for_exploded(self, target_colors_lab, min_color_difference=5.0, layer_height=0.08, model_height=2.0):
+        """Select filaments for exploded mode: one per target color + transparent.
+
+        Penalizes high-TD filaments since each sandwich layer is only layer_height
+        thick — very transparent filaments can't produce visible color in thin layers.
+
+        Args:
+            target_colors_lab: Array of target LAB colors from K-means
+            min_color_difference: Minimum delta-E between selected filaments
+            layer_height: Layer height in mm (for TD penalty calculation)
+            model_height: Model height in mm (for max thickness calculation)
+
+        Returns:
+            DataFrame: [color1, color2, ..., transparent] (transparent last)
+        """
+        logger.info(f"Exploded mode: selecting {len(target_colors_lab)} color filaments + transparent")
+
+        # Max material thickness any color can achieve in exploded mode
+        # (all sandwich slots assigned to one color)
+        total_sandwiches = int(model_height / layer_height)
+        max_color_thickness = total_sandwiches * layer_height
+
+        # 1. Auto-select transparent filament
+        transparent_idx = self._select_transparent_filament()
+        transparent_filament = self.df.iloc[transparent_idx]
+        logger.info(f"Selected transparent: {transparent_filament['name']} "
+                     f"(L={transparent_filament['lab'][0]:.1f}, TD={transparent_filament['transmission_distance']}mm)")
+
+        # 2. Select color filaments via delta-E matching with TD penalty
+        selected_labs = [self.df.iloc[transparent_idx]['lab']]
+        color_indices = []
+
+        target_colors_sorted = sorted(enumerate(target_colors_lab), key=lambda x: x[1][0])
+
+        for color_idx, target_lab in target_colors_sorted:
+            distances = []
+
+            for idx, row in self.df.iterrows():
+                if idx == transparent_idx or idx in color_indices:
+                    continue
+
+                filament_lab = row['lab']
+                too_similar = False
+                for selected_lab in selected_labs:
+                    delta_e_to_selected = color.deltaE_ciede2000(
+                        np.array([[filament_lab]]),
+                        np.array([[selected_lab]])
+                    )[0][0]
+                    if delta_e_to_selected < min_color_difference:
+                        too_similar = True
+                        break
+
+                if too_similar:
+                    continue
+
+                delta_e = color.deltaE_ciede2000(
+                    np.array([[target_lab]]),
+                    np.array([[filament_lab]])
+                )[0][0]
+
+                # TD penalty: high-TD filaments are nearly invisible in thin layers.
+                # Beer-Lambert opacity = 1 - exp(-thickness / TD)
+                # At max thickness, what fraction of color can this filament show?
+                td = row['transmission_distance']
+                opacity_at_max = 1.0 - np.exp(-max_color_thickness / max(td, 0.1))
+                # Filaments that can only show <50% opacity at max thickness get penalized
+                # heavily — they'll waste sandwich slots producing near-identical layers.
+                # Scale: opacity=1.0 → penalty=0, opacity=0.1 → penalty=+40
+                td_penalty = max(0, (1.0 - opacity_at_max) * 50.0)
+
+                score = delta_e + td_penalty
+                distances.append((score, idx))
+
+            if distances:
+                distances.sort()
+                best_idx = distances[0][1]
+                best_row = self.df.iloc[best_idx]
+                color_indices.append(best_idx)
+                selected_labs.append(best_row['lab'])
+                opacity = 1.0 - np.exp(-max_color_thickness / max(best_row['transmission_distance'], 0.1))
+                logger.info(f"  Color {len(color_indices)}: {best_row['name']} "
+                             f"({best_row['color_hex']}, TD={best_row['transmission_distance']:.1f}, "
+                             f"max opacity={opacity:.0%})")
+
+        if not color_indices:
+            logger.warning("No color filaments selected for exploded mode")
+
+        # Order: [colors..., transparent]
+        result_indices = color_indices + [transparent_idx]
+        return self.df.iloc[result_indices].reset_index(drop=True)
+
     def _select_with_cap_layers(self, target_colors_lab, count, layer_height, min_color_difference, randomize):
         """Select filaments for cap layers mode: dark base + clear top + colors
 
@@ -289,7 +439,6 @@ class FilamentLibrary:
         selected_indices = []
 
         # 1. Select DARK base layer (darkest, most opaque filament for text)
-        # Look for very dark colors (L < 30) with good opacity
         dark_candidates = []
         for idx, row in self.df.iterrows():
             luminosity = row['lab'][0]
@@ -298,63 +447,18 @@ class FilamentLibrary:
 
         if not dark_candidates:
             logger.warning("No very dark filaments found (L < 30), using darkest available")
-            # Just use darkest
             darkest_idx = self.df['lab'].apply(lambda x: x[0]).idxmin()
             selected_indices.append(darkest_idx)
         else:
-            # Sort by darkness and pick darkest
             dark_candidates.sort()
             selected_indices.append(dark_candidates[0][1])
 
         dark_filament = self.df.iloc[selected_indices[0]]
         logger.info(f"Selected dark base: {dark_filament['name']} (L={dark_filament['lab'][0]:.1f}, TD={dark_filament['transmission_distance']}mm)")
 
-        # 2. Select PURE TRANSPARENT layer (colorless, highest TD)
-        # Look for truly colorless transparent filaments (low a,b values in LAB)
-        clear_candidates = []
-        for idx, row in self.df.iterrows():
-            if idx in selected_indices:
-                continue
-            luminosity = row['lab'][0]
-            a_value = abs(row['lab'][1])  # Color: red-green axis
-            b_value = abs(row['lab'][2])  # Color: blue-yellow axis
-            td = row['transmission_distance']
-
-            # PURE transparent: very light, very transparent, AND minimal color tint
-            if luminosity > 85 and td > 5.0 and (a_value + b_value) < 10.0:
-                # Score: prefer higher TD, higher L, lower color (a,b close to 0)
-                color_penalty = (a_value + b_value) * 2.0
-                score = luminosity + td * 5.0 - color_penalty
-                clear_candidates.append((score, idx))
-
-        if not clear_candidates:
-            logger.warning("No pure transparent filaments found (L > 85, TD > 5mm, low a/b), trying less strict...")
-            # Try with relaxed color constraint
-            for idx, row in self.df.iterrows():
-                if idx in selected_indices:
-                    continue
-                luminosity = row['lab'][0]
-                td = row['transmission_distance']
-                if luminosity > 85 and td > 5.0:
-                    score = luminosity + td * 5.0
-                    clear_candidates.append((score, idx))
-
-        if not clear_candidates:
-            logger.warning("No clear filaments found at all, using most transparent available")
-            # Find most transparent filament
-            best_td_idx = None
-            best_td = 0
-            for idx, row in self.df.iterrows():
-                if idx not in selected_indices:
-                    if row['transmission_distance'] > best_td:
-                        best_td = row['transmission_distance']
-                        best_td_idx = idx
-            if best_td_idx is not None:
-                selected_indices.append(best_td_idx)
-        else:
-            # Sort by score (descending) and pick best
-            clear_candidates.sort(reverse=True)
-            selected_indices.append(clear_candidates[0][1])
+        # 2. Select PURE TRANSPARENT layer
+        transparent_idx = self._select_transparent_filament(exclude_indices=set(selected_indices))
+        selected_indices.append(transparent_idx)
 
         clear_filament = self.df.iloc[selected_indices[-1]]
         logger.info(f"Selected PURE transparent: {clear_filament['name']} (L={clear_filament['lab'][0]:.1f}, TD={clear_filament['transmission_distance']}mm, a={clear_filament['lab'][1]:.1f}, b={clear_filament['lab'][2]:.1f})")
@@ -613,6 +717,63 @@ class ImageProcessor:
         logger.info(f"Extracted colors (L values): {dominant_colors_lab[:, 0]}")
 
         return dominant_colors_lab, kmeans, sorted_indices
+
+    def auto_determine_color_count(self, min_delta_e=10.0, max_colors=12):
+        """Determine optimal number of colors by iterating K-means until new clusters add little.
+
+        Starts at K=2, increments K. For each K+1 result, finds the "new" cluster center
+        (highest minimum delta-E to any K center). If that min delta-E < threshold, stop.
+
+        Args:
+            min_delta_e: Minimum delta-E a new color must contribute to be worthwhile
+            max_colors: Maximum number of colors to try
+
+        Returns:
+            Optimal color count (int)
+        """
+        pixels_lab = self.image_lab.reshape(-1, 3)
+        alpha_flat = self.alpha_mask.reshape(-1)
+        pixels_lab = pixels_lab[alpha_flat >= 0.5]
+
+        logger.info(f"Auto-determining color count (min delta-E={min_delta_e}, max={max_colors})...")
+
+        prev_centers = None
+        optimal_k = 2
+
+        for k in range(2, max_colors + 1):
+            kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+            kmeans.fit(pixels_lab)
+            centers = kmeans.cluster_centers_
+
+            if prev_centers is not None:
+                # Find the "new" center: the one with highest min-distance to previous centers
+                best_new_delta_e = 0
+                for center in centers:
+                    # Min delta-E from this center to any previous center
+                    min_de = min(
+                        color.deltaE_ciede2000(
+                            np.array([[center]]),
+                            np.array([[pc]])
+                        )[0][0]
+                        for pc in prev_centers
+                    )
+                    best_new_delta_e = max(best_new_delta_e, min_de)
+
+                logger.info(f"  K={k}: new cluster delta-E={best_new_delta_e:.1f}")
+
+                if best_new_delta_e < min_delta_e:
+                    logger.info(f"  Stopping at K={k-1} (new color delta-E {best_new_delta_e:.1f} < {min_delta_e})")
+                    break
+
+                optimal_k = k
+            else:
+                optimal_k = k
+                logger.info(f"  K={k}: initial clustering")
+
+            prev_centers = centers
+
+        logger.info(f"Optimal color count: {optimal_k}")
+        return optimal_k
 
 
 class TransmissionColorSimulator:
@@ -959,13 +1120,88 @@ def _enhance_contrast(brightness, alpha_mask, strength=2.0):
     return enhanced
 
 
-def generate_preview(grayscale, selected_filaments, layer_height, model_height, use_cap_layers, alpha_mask):
+def generate_preview(grayscale, selected_filaments, layer_height, model_height, use_cap_layers, alpha_mask,
+                     image_rgb=None, use_exploded=False):
     """Generate preview image showing simulated color stacking appearance."""
     height_px, width_px = grayscale.shape
     preview = np.ones((height_px, width_px, 3))
 
     num_colors = len(selected_filaments)
     num_layers = int(model_height / layer_height)
+
+    if use_exploded and image_rgb is not None:
+        # Exploded mode preview: Beer-Lambert simulation of optimal layer assignments
+        # Mirrors _generate_exploded's TD-proportional allocation + optimization
+        from itertools import product as iter_product
+
+        num_color_filaments = num_colors - 1
+        if num_color_filaments <= 0:
+            return preview
+
+        total_sandwiches = num_layers
+
+        # Filament properties (colors + transparent)
+        color_rgbs = np.array([selected_filaments.iloc[i]['rgb'] for i in range(num_color_filaments)])
+        color_tds = np.array([selected_filaments.iloc[i]['transmission_distance'] for i in range(num_color_filaments)])
+        trans_rgb = np.array(selected_filaments.iloc[-1]['rgb'])
+        trans_td = selected_filaments.iloc[-1]['transmission_distance']
+
+        all_rgbs = np.vstack([color_rgbs, trans_rgb.reshape(1, 3)])
+        all_tds = np.append(color_tds, trans_td)
+
+        # Cap each color at 3 sandwiches max (same as _generate_exploded)
+        MAX_SANDWICHES_PER_COLOR = 3
+        per_color_caps = [min(MAX_SANDWICHES_PER_COLOR, total_sandwiches) for _ in range(num_color_filaments)]
+
+        # Reduce caps if combo space too large
+        combo_size = 1
+        for cap in per_color_caps:
+            combo_size *= (cap + 1)
+        while combo_size > 500_000:
+            max_idx = per_color_caps.index(max(per_color_caps))
+            per_color_caps[max_idx] -= 1
+            combo_size = 1
+            for cap in per_color_caps:
+                combo_size *= (cap + 1)
+
+        # Generate valid combos with per-color caps
+        ranges = [range(0, cap + 1) for cap in per_color_caps]
+        all_combos = np.array(list(iter_product(*ranges)))
+        valid = all_combos.sum(axis=1) <= total_sandwiches
+        combos = all_combos[valid]
+
+        # Thicknesses including transparent fill
+        trans_layers = total_sandwiches - combos.sum(axis=1)
+        thickness_combos = np.column_stack([
+            combos * layer_height,
+            (trans_layers * layer_height).reshape(-1, 1)
+        ])
+
+        # Beer-Lambert simulation
+        n_combos = len(thickness_combos)
+        light = np.ones((n_combos, 3))
+        for k in range(len(all_tds)):
+            thickness = thickness_combos[:, k]
+            td = max(all_tds[k], 0.1)
+            rgb = all_rgbs[k]
+            transmission = np.exp(-thickness / td)[:, None]
+            light = light * transmission + rgb[None, :] * (1.0 - transmission)
+            light = np.clip(light, 0, 1)
+
+        # Convert to LAB and build KDTree
+        from scipy.spatial import cKDTree
+        combo_lab = color.rgb2lab(light.reshape(-1, 1, 3)).reshape(-1, 3)
+        tree = cKDTree(combo_lab)
+
+        # Match each pixel
+        target_lab = color.rgb2lab(image_rgb).reshape(-1, 3)
+        _, indices = tree.query(target_lab, k=1)
+
+        # Preview shows the simulated Beer-Lambert color
+        preview = light[indices].reshape(height_px, width_px, 3)
+        preview[alpha_mask < 0.5] = [1, 1, 1]
+
+        return preview
 
     if use_cap_layers:
         # Cap layers mode: Beer-Lambert simulation matching STL generation
@@ -1265,6 +1501,8 @@ def main():
                         help='Use cap layers (black base + auto colors + clear top) [yes/no]')
     parser.add_argument('--face-down', type=str, default=None, metavar='BOOL',
                         help='Face-down mode: flat voxel grid printed face-down, flipped for display [yes/no]')
+    parser.add_argument('--exploded', type=str, default=None, metavar='BOOL',
+                        help='Exploded mode: each color as standalone transparent sandwich [yes/no]')
 
     args = parser.parse_args()
 
@@ -1288,11 +1526,7 @@ def main():
             logger.error(f"Filaments CSV not found: {filaments_csv}")
             return 1
 
-        color_count = args.colors if args.colors is not None else prompt_with_default(
-            "Number of colors/filaments",
-            4,
-            int
-        )
+        color_count = args.colors if args.colors is not None else None  # Resolved after mode flags
 
         nozzle_diameter = args.nozzle if args.nozzle is not None else prompt_with_default(
             "Nozzle diameter (mm)",
@@ -1359,7 +1593,21 @@ def main():
             bool
         )
 
-        if use_cap_layers and color_count < 3:
+        use_exploded = (args.exploded.lower() in ('y', 'yes', 'true', '1')) if args.exploded is not None else prompt_with_default(
+            "Use exploded mode (each color as standalone transparent sandwich)",
+            False,
+            bool
+        )
+
+        if use_exploded and (use_cap_layers or use_face_down):
+            logger.error("Exploded mode cannot be combined with cap-layers or face-down mode")
+            return 1
+
+        # Resolve color_count now that mode flags are known
+        if color_count is None and not use_exploded:
+            color_count = prompt_with_default("Number of colors/filaments", 4, int)
+
+        if not use_exploded and use_cap_layers and color_count < 3:
             logger.warning("Cap layers requires at least 3 colors. Setting to 3.")
             color_count = 3
 
@@ -1373,21 +1621,136 @@ def main():
         filament_lib = FilamentLibrary(filaments_csv)
 
         # 2. Load and prepare image
-        img_processor = ImageProcessor(args.image, width, color_count)
+        # For exploded mode, use placeholder color_count; auto-determine after loading
+        img_processor = ImageProcessor(args.image, width, color_count or 4)
         img_processor.load_and_prepare(nozzle_diameter=nozzle_diameter, face_down=use_face_down)
+
+        if use_exploded and color_count is None:
+            # Iterative color count optimization: try K=3..max_k, score each by
+            # Beer-Lambert mean delta-E, pick lowest K within 2.0 of best score.
+            # Each color capped at 3 sandwiches, so max useful K = total_sandwiches // 1
+            # (since each color needs at least 1 sandwich to contribute).
+            from generator import STLGenerator as _STLGen
+
+            grayscale_tmp = (0.2126 * img_processor.image[:, :, 0] +
+                             0.7152 * img_processor.image[:, :, 1] +
+                             0.0722 * img_processor.image[:, :, 2])
+            if grayscale_tmp.max() > grayscale_tmp.min():
+                grayscale_tmp = (grayscale_tmp - grayscale_tmp.min()) / (grayscale_tmp.max() - grayscale_tmp.min())
+
+            total_sandwiches = int(model_height / layer_height)
+            MAX_S_PER_COLOR = 3
+            max_try_k = min(total_sandwiches, 12)  # cap search at 12 colors
+            logger.info(f"Auto-determining optimal color count (K=3..{max_try_k})...")
+            k_scores = []
+
+            for try_k in range(3, max_try_k + 1):
+                img_processor.color_count = try_k
+                try:
+                    dom_colors, _, _ = img_processor.quantize_colors()
+                except Exception:
+                    continue
+
+                try_filaments = filament_lib.select_for_exploded(
+                    dom_colors,
+                    min_color_difference=min_color_difference,
+                    layer_height=layer_height,
+                    model_height=model_height,
+                )
+
+                # Score via Beer-Lambert optimization (no STL generation)
+                try_gen = _STLGen(
+                    grayscale_tmp, width, layer_height, model_height,
+                    try_filaments, alpha_mask=img_processor.alpha_mask,
+                    image_rgb=img_processor.image, use_exploded=True,
+                )
+
+                num_color_fils = len(try_filaments) - 1
+                color_fils = try_filaments.iloc[:num_color_fils]
+                trans_fil = try_filaments.iloc[-1]
+
+                # Flat cap of MAX_S_PER_COLOR per color (same as _generate_exploded)
+                caps = [min(MAX_S_PER_COLOR, total_sandwiches) for _ in range(num_color_fils)]
+
+                # Reduce caps if combinatorial space is too large
+                combo_size = 1
+                for c in caps:
+                    combo_size *= (c + 1)
+                while combo_size > 500_000:
+                    max_i = caps.index(max(caps))
+                    caps[max_i] -= 1
+                    combo_size = 1
+                    for c in caps:
+                        combo_size *= (c + 1)
+
+                layer_counts = try_gen._compute_exploded_layer_counts(
+                    color_fils, trans_fil, total_sandwiches, caps
+                )
+
+                # Compute mean delta-E score independently
+                from itertools import product as _prod
+                from scipy.spatial import cKDTree
+
+                fil_tds = np.array([f['transmission_distance'] for _, f in color_fils.iterrows()])
+                all_rgbs = np.vstack([
+                    np.array([f['rgb'] for _, f in color_fils.iterrows()]),
+                    np.array(trans_fil['rgb']).reshape(1, 3)
+                ])
+                all_tds = np.append(fil_tds, trans_fil['transmission_distance'])
+
+                ranges = [range(0, c + 1) for c in caps]
+                all_combos = np.array(list(_prod(*ranges)))
+                valid = all_combos.sum(axis=1) <= total_sandwiches
+                combos = all_combos[valid]
+                trans_l = total_sandwiches - combos.sum(axis=1)
+                thickness = np.column_stack([combos * layer_height, (trans_l * layer_height).reshape(-1, 1)])
+                sim_rgb = try_gen._vectorized_beer_lambert(all_rgbs, all_tds, thickness)
+                sim_lab = color.rgb2lab(sim_rgb.reshape(-1, 1, 3)).reshape(-1, 3)
+                tree = cKDTree(sim_lab)
+                target_lab = color.rgb2lab(img_processor.image).reshape(-1, 3)
+                dists, _ = tree.query(target_lab, k=1)
+                valid_mask = (img_processor.alpha_mask >= 0.5).ravel()
+                mean_de = float(np.mean(dists[valid_mask]))
+
+                fil_names = [f['name'] for _, f in color_fils.iterrows()]
+                k_scores.append((try_k, mean_de, fil_names))
+                logger.info(f"  K={try_k}: mean deltaE={mean_de:.2f} ({', '.join(fil_names)})")
+
+            # Pick lowest K within 2.0 delta-E of best score
+            if k_scores:
+                best_score = min(s for _, s, _ in k_scores)
+                for try_k, score, names in k_scores:
+                    if score <= best_score + 2.0:
+                        color_count = try_k
+                        logger.info(f"Selected K={color_count} (deltaE={score:.2f}, best={best_score:.2f})")
+                        break
+            else:
+                color_count = 6
+
+            img_processor.color_count = color_count
+        elif use_exploded:
+            img_processor.color_count = color_count
 
         # 3. Quantize colors
         dominant_colors_lab, kmeans, sorted_indices = img_processor.quantize_colors()
 
         # 4. Select best filaments (with transmission-aware color simulation)
-        # Cap layers: black base + auto colors + clear top
-        selected_filaments = filament_lib.select_best_filaments(
-            dominant_colors_lab, color_count,
-            layer_height=layer_height,
-            min_color_difference=min_color_difference,
-            use_cap_layers=use_cap_layers,
-            use_face_down=use_face_down
-        )
+        if use_exploded:
+            selected_filaments = filament_lib.select_for_exploded(
+                dominant_colors_lab,
+                min_color_difference=min_color_difference,
+                layer_height=layer_height,
+                model_height=model_height,
+            )
+        else:
+            # Cap layers: black base + auto colors + clear top
+            selected_filaments = filament_lib.select_best_filaments(
+                dominant_colors_lab, color_count,
+                layer_height=layer_height,
+                min_color_difference=min_color_difference,
+                use_cap_layers=use_cap_layers,
+                use_face_down=use_face_down
+            )
 
         logger.info("Selected filaments:")
         for i, row in selected_filaments.iterrows():
@@ -1419,7 +1782,9 @@ def main():
             layer_height,
             model_height,
             use_cap_layers,
-            img_processor.alpha_mask
+            img_processor.alpha_mask,
+            image_rgb=img_processor.image if use_exploded else None,
+            use_exploded=use_exploded,
         )
         while not preview_approved:
 
@@ -1475,14 +1840,22 @@ def main():
                 # Reduce color delta to allow more similar colors
                 min_color_difference = min_color_difference * 0.7
                 logger.info(f"Reducing color delta to {min_color_difference:.1f} and re-selecting filaments...")
-                selected_filaments = filament_lib.select_best_filaments(
-                    dominant_colors_lab, color_count,
-                    layer_height=layer_height,
-                    min_color_difference=min_color_difference,
-                    use_cap_layers=use_cap_layers,
-                    use_face_down=use_face_down,
-                    randomize=False
-                )
+                if use_exploded:
+                    selected_filaments = filament_lib.select_for_exploded(
+                        dominant_colors_lab,
+                        min_color_difference=min_color_difference,
+                        layer_height=layer_height,
+                        model_height=model_height,
+                    )
+                else:
+                    selected_filaments = filament_lib.select_best_filaments(
+                        dominant_colors_lab, color_count,
+                        layer_height=layer_height,
+                        min_color_difference=min_color_difference,
+                        use_cap_layers=use_cap_layers,
+                        use_face_down=use_face_down,
+                        randomize=False
+                    )
                 logger.info("New filaments selected (dark to light):")
                 for i, row in selected_filaments.iterrows():
                     logger.info(f"  {i+1}. {row['name']} ({row['color_hex']}) - L={row['lab'][0]:.1f}")
@@ -1492,7 +1865,9 @@ def main():
                     layer_height,
                     model_height,
                     use_cap_layers,
-                    img_processor.alpha_mask
+                    img_processor.alpha_mask,
+                    image_rgb=img_processor.image if use_exploded else None,
+                    use_exploded=use_exploded,
                 )
             elif choice == "3":
                 # 3D preview in browser
@@ -1536,6 +1911,7 @@ def main():
             use_cap_layers=use_cap_layers,
             image_rgb=img_processor.image,
             use_face_down=use_face_down,
+            use_exploded=use_exploded,
         )
 
         generated_files = stl_gen.generate_all(output_path, single_stl=False)
@@ -1600,7 +1976,18 @@ def main():
             # Write filament-change schedule if available
             f.write("\nPrinting Instructions:\n")
             f.write("-" * 60 + "\n")
-            if use_face_down and use_cap_layers:
+            if use_exploded:
+                f.write("EXPLODED MODE\n")
+                f.write("Each color is a standalone 3-layer sandwich (transparent/color/transparent).\n")
+                f.write("Print each sandwich separately on any single-material printer.\n\n")
+                f.write("For each color:\n")
+                f.write("1. Load both STLs (_color.stl and _transparent.stl) into slicer\n")
+                f.write("2. Assign the color filament to the _color.stl part\n")
+                f.write("3. Assign transparent filament to the _transparent.stl part\n")
+                f.write("4. Print as a single 3-layer print\n\n")
+                f.write("After printing all sandwiches:\n")
+                f.write("5. Stack all sandwiches in order and backlight for effect\n")
+            elif use_face_down and use_cap_layers:
                 f.write("FACE-DOWN + CAP LAYERS MODE\n")
                 f.write("1. Load all STL files into slicer at once\n")
                 f.write("2. Right-click each part and assign the corresponding filament\n")
