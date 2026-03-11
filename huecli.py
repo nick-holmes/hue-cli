@@ -1121,7 +1121,7 @@ def _enhance_contrast(brightness, alpha_mask, strength=2.0):
 
 
 def generate_preview(grayscale, selected_filaments, layer_height, model_height, use_cap_layers, alpha_mask,
-                     image_rgb=None, use_exploded=False):
+                     image_rgb=None, use_exploded=False, exploded_max_cap=3):
     """Generate preview image showing simulated color stacking appearance."""
     height_px, width_px = grayscale.shape
     preview = np.ones((height_px, width_px, 3))
@@ -1131,7 +1131,6 @@ def generate_preview(grayscale, selected_filaments, layer_height, model_height, 
 
     if use_exploded and image_rgb is not None:
         # Exploded mode preview: Beer-Lambert simulation of optimal layer assignments
-        # Mirrors _generate_exploded's TD-proportional allocation + optimization
         from itertools import product as iter_product
 
         num_color_filaments = num_colors - 1
@@ -1149,9 +1148,8 @@ def generate_preview(grayscale, selected_filaments, layer_height, model_height, 
         all_rgbs = np.vstack([color_rgbs, trans_rgb.reshape(1, 3)])
         all_tds = np.append(color_tds, trans_td)
 
-        # Cap each color at 3 sandwiches max (same as _generate_exploded)
-        MAX_SANDWICHES_PER_COLOR = 3
-        per_color_caps = [min(MAX_SANDWICHES_PER_COLOR, total_sandwiches) for _ in range(num_color_filaments)]
+        # Cap each color (matches _generate_exploded / _generate_exploded_multi)
+        per_color_caps = [min(exploded_max_cap, total_sandwiches) for _ in range(num_color_filaments)]
 
         # Reduce caps if combo space too large
         combo_size = 1
@@ -1333,7 +1331,8 @@ def show_3d_preview(stl_gen):
     b64 = base64.b64encode(glb_data).decode("utf-8")
     logger.info(f"GLB size: {len(glb_data)/1024/1024:.1f} MB")
 
-    html = _build_viewer_html(b64)
+    use_transparency = stl_gen.use_exploded or stl_gen.use_exploded_multi
+    html = _build_viewer_html(b64, use_transparency=use_transparency)
 
     with tempfile.NamedTemporaryFile('w', suffix='.html', delete=False) as f:
         f.write(html)
@@ -1343,7 +1342,7 @@ def show_3d_preview(stl_gen):
     webbrowser.open('file://' + tmp_path)
 
 
-def _build_viewer_html(b64_glb):
+def _build_viewer_html(b64_glb, use_transparency=False):
     """Build a self-contained HTML page with an embedded Three.js GLB viewer.
 
     Uses CDN-loaded Three.js with GLTFLoader.parse() to decode the base64
@@ -1351,6 +1350,7 @@ def _build_viewer_html(b64_glb):
 
     Args:
         b64_glb: base64-encoded GLB binary string
+        use_transparency: if True, enable transparent materials with vertex alpha
 
     Returns:
         Complete HTML string
@@ -1372,11 +1372,24 @@ def _build_viewer_html(b64_glb):
     position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
     color: #f44; font: 16px system-ui; text-align: center; display: none;
   }}
+  #controls {{
+    position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
+    display: {'flex' if use_transparency else 'none'}; align-items: center; gap: 12px;
+    background: rgba(0,0,0,0.6); padding: 8px 16px; border-radius: 8px;
+  }}
+  #controls label {{ color: #ccc; font: 13px system-ui; white-space: nowrap; }}
+  #gap-slider {{ width: 200px; cursor: pointer; }}
+  #gap-value {{ color: #fff; font: 13px monospace; min-width: 40px; }}
 </style>
 </head>
 <body>
 <div id="info">Drag to rotate &middot; Scroll to zoom &middot; Right-drag to pan</div>
 <div id="error"></div>
+<div id="controls">
+  <label for="gap-slider">Gap:</label>
+  <input type="range" id="gap-slider" min="0" max="5" value="2" step="0.1">
+  <span id="gap-value">2.0mm</span>
+</div>
 
 <script type="importmap">
 {{
@@ -1423,18 +1436,46 @@ controls.dampingFactor = 0.12;
 
 // Parse GLB
 const loader = new GLTFLoader();
+const useTransparency = {'true' if use_transparency else 'false'};
+
+// Track sandwich meshes for gap slider repositioning
+const sandwichMeshes = [];  // {{mesh, sandwichIndex}}
+
 loader.parse(buf.buffer, '', (gltf) => {{
-  // Use unlit material so vertex colors display as emitted light (backlit lithophane)
   gltf.scene.traverse((child) => {{
     if (child.isMesh) {{
+      const colorAttr = child.geometry.attributes.color;
+      const hasAlpha = useTransparency && colorAttr && colorAttr.itemSize === 4;
+
+      let opacity = 1.0;
+      if (hasAlpha) {{
+        opacity = colorAttr.getW(0);
+        if (opacity > 1.0) opacity = opacity / 255.0;
+      }}
+
       child.material = new THREE.MeshBasicMaterial({{
         vertexColors: true,
+        transparent: hasAlpha,
+        opacity: opacity,
+        depthWrite: !hasAlpha,
+        side: hasAlpha ? THREE.DoubleSide : THREE.FrontSide,
       }});
+
+      // Parse sandwich index from mesh name (e.g. "S01_Black_L1" → 0)
+      if (useTransparency) {{
+        const m = child.name.match(/^S(\\d+)/);
+        if (m) {{
+          sandwichMeshes.push({{ mesh: child, idx: parseInt(m[1], 10) - 1 }});
+        }}
+      }}
     }}
   }});
   scene.add(gltf.scene);
 
-  // Auto-fit camera to model bounds
+  // Apply initial gap from slider
+  updateGap();
+
+  // Auto-fit camera to model bounds (after gap applied)
   const box    = new THREE.Box3().setFromObject(gltf.scene);
   const center = box.getCenter(new THREE.Vector3());
   const size   = box.getSize(new THREE.Vector3());
@@ -1455,6 +1496,32 @@ loader.parse(buf.buffer, '', (gltf) => {{
   el.textContent = 'Failed to load 3D model — see console for details.';
   el.style.display = 'block';
 }});
+
+// Gap slider: reposition sandwich meshes along Z
+function updateGap() {{
+  const slider = document.getElementById('gap-slider');
+  const label = document.getElementById('gap-value');
+  if (!slider) return;
+  const gap = parseFloat(slider.value);
+  label.textContent = gap.toFixed(1) + 'mm';
+  for (const {{ mesh, idx }} of sandwichMeshes) {{
+    mesh.position.z = idx * gap;
+  }}
+}}
+
+const slider = document.getElementById('gap-slider');
+if (slider) {{
+  slider.addEventListener('input', () => {{
+    updateGap();
+    // Re-center camera target on the midpoint of the stack
+    if (sandwichMeshes.length > 0) {{
+      const maxIdx = Math.max(...sandwichMeshes.map(s => s.idx));
+      const gap = parseFloat(slider.value);
+      const midZ = (maxIdx * gap) / 2;
+      controls.target.z = midZ;
+    }}
+  }});
+}}
 
 window.addEventListener('resize', () => {{
   camera.aspect = window.innerWidth / window.innerHeight;
@@ -1503,6 +1570,8 @@ def main():
                         help='Face-down mode: flat voxel grid printed face-down, flipped for display [yes/no]')
     parser.add_argument('--exploded', type=str, default=None, metavar='BOOL',
                         help='Exploded mode: each color as standalone transparent sandwich [yes/no]')
+    parser.add_argument('--exploded-multi', type=str, default=None, metavar='BOOL',
+                        help='Exploded-multi mode: up to 3 colors per sandwich for higher fidelity [yes/no]')
 
     args = parser.parse_args()
 
@@ -1599,15 +1668,22 @@ def main():
             bool
         )
 
-        if use_exploded and (use_cap_layers or use_face_down):
-            logger.error("Exploded mode cannot be combined with cap-layers or face-down mode")
+        use_exploded_multi = (args.exploded_multi.lower() in ('y', 'yes', 'true', '1')) if args.exploded_multi is not None else False
+        exploded_any = use_exploded or use_exploded_multi
+
+        if use_exploded and use_exploded_multi:
+            logger.error("Cannot use both --exploded and --exploded-multi. Choose one.")
+            return 1
+
+        if exploded_any and (use_cap_layers or use_face_down):
+            logger.error("Exploded modes cannot be combined with cap-layers or face-down mode")
             return 1
 
         # Resolve color_count now that mode flags are known
-        if color_count is None and not use_exploded:
+        if color_count is None and not exploded_any:
             color_count = prompt_with_default("Number of colors/filaments", 4, int)
 
-        if not use_exploded and use_cap_layers and color_count < 3:
+        if not exploded_any and use_cap_layers and color_count < 3:
             logger.warning("Cap layers requires at least 3 colors. Setting to 3.")
             color_count = 3
 
@@ -1625,11 +1701,9 @@ def main():
         img_processor = ImageProcessor(args.image, width, color_count or 4)
         img_processor.load_and_prepare(nozzle_diameter=nozzle_diameter, face_down=use_face_down)
 
-        if use_exploded and color_count is None:
+        if exploded_any and color_count is None:
             # Iterative color count optimization: try K=3..max_k, score each by
             # Beer-Lambert mean delta-E, pick lowest K within 2.0 of best score.
-            # Each color capped at 3 sandwiches, so max useful K = total_sandwiches // 1
-            # (since each color needs at least 1 sandwich to contribute).
             from generator import STLGenerator as _STLGen
 
             grayscale_tmp = (0.2126 * img_processor.image[:, :, 0] +
@@ -1639,9 +1713,10 @@ def main():
                 grayscale_tmp = (grayscale_tmp - grayscale_tmp.min()) / (grayscale_tmp.max() - grayscale_tmp.min())
 
             total_sandwiches = int(model_height / layer_height)
-            MAX_S_PER_COLOR = 3
+            MAX_S_PER_COLOR = 5 if use_exploded_multi else 3
             max_try_k = min(total_sandwiches, 12)  # cap search at 12 colors
-            logger.info(f"Auto-determining optimal color count (K=3..{max_try_k})...")
+            mode_name = "exploded-multi" if use_exploded_multi else "exploded"
+            logger.info(f"Auto-determining optimal color count for {mode_name} (K=3..{max_try_k}, cap={MAX_S_PER_COLOR})...")
             k_scores = []
 
             for try_k in range(3, max_try_k + 1):
@@ -1669,7 +1744,6 @@ def main():
                 color_fils = try_filaments.iloc[:num_color_fils]
                 trans_fil = try_filaments.iloc[-1]
 
-                # Flat cap of MAX_S_PER_COLOR per color (same as _generate_exploded)
                 caps = [min(MAX_S_PER_COLOR, total_sandwiches) for _ in range(num_color_fils)]
 
                 # Reduce caps if combinatorial space is too large
@@ -1687,7 +1761,7 @@ def main():
                     color_fils, trans_fil, total_sandwiches, caps
                 )
 
-                # Compute mean delta-E score independently
+                # Compute mean delta-E score
                 from itertools import product as _prod
                 from scipy.spatial import cKDTree
 
@@ -1728,14 +1802,14 @@ def main():
                 color_count = 6
 
             img_processor.color_count = color_count
-        elif use_exploded:
+        elif exploded_any:
             img_processor.color_count = color_count
 
         # 3. Quantize colors
         dominant_colors_lab, kmeans, sorted_indices = img_processor.quantize_colors()
 
         # 4. Select best filaments (with transmission-aware color simulation)
-        if use_exploded:
+        if exploded_any:
             selected_filaments = filament_lib.select_for_exploded(
                 dominant_colors_lab,
                 min_color_difference=min_color_difference,
@@ -1783,8 +1857,9 @@ def main():
             model_height,
             use_cap_layers,
             img_processor.alpha_mask,
-            image_rgb=img_processor.image if use_exploded else None,
-            use_exploded=use_exploded,
+            image_rgb=img_processor.image if exploded_any else None,
+            use_exploded=exploded_any,
+            exploded_max_cap=5 if use_exploded_multi else 3,
         )
         while not preview_approved:
 
@@ -1840,7 +1915,7 @@ def main():
                 # Reduce color delta to allow more similar colors
                 min_color_difference = min_color_difference * 0.7
                 logger.info(f"Reducing color delta to {min_color_difference:.1f} and re-selecting filaments...")
-                if use_exploded:
+                if exploded_any:
                     selected_filaments = filament_lib.select_for_exploded(
                         dominant_colors_lab,
                         min_color_difference=min_color_difference,
@@ -1866,8 +1941,9 @@ def main():
                     model_height,
                     use_cap_layers,
                     img_processor.alpha_mask,
-                    image_rgb=img_processor.image if use_exploded else None,
-                    use_exploded=use_exploded,
+                    image_rgb=img_processor.image if exploded_any else None,
+                    use_exploded=exploded_any,
+                    exploded_max_cap=5 if use_exploded_multi else 3,
                 )
             elif choice == "3":
                 # 3D preview in browser
@@ -1881,6 +1957,8 @@ def main():
                     use_cap_layers=use_cap_layers,
                     image_rgb=img_processor.image,
                     use_face_down=use_face_down,
+                    use_exploded=use_exploded,
+                    use_exploded_multi=use_exploded_multi,
                 )
                 show_3d_preview(preview_stl_gen)
                 # Loop continues to show 2D preview + menu again
@@ -1912,6 +1990,7 @@ def main():
             image_rgb=img_processor.image,
             use_face_down=use_face_down,
             use_exploded=use_exploded,
+            use_exploded_multi=use_exploded_multi,
         )
 
         generated_files = stl_gen.generate_all(output_path, single_stl=False)
@@ -1976,7 +2055,18 @@ def main():
             # Write filament-change schedule if available
             f.write("\nPrinting Instructions:\n")
             f.write("-" * 60 + "\n")
-            if use_exploded:
+            if use_exploded_multi:
+                f.write("EXPLODED-MULTI MODE\n")
+                f.write("Each sandwich is 3 layers tall with up to 3 colors in the middle layer.\n")
+                f.write("Requires a multi-material printer (or filament swaps) per sandwich.\n\n")
+                f.write("For each sandwich (S01, S02, ...):\n")
+                f.write("1. Load the _transparent.stl and all _color.stl files for that sandwich\n")
+                f.write("2. Assign each color filament to its _color.stl part\n")
+                f.write("3. Assign transparent filament to the _transparent.stl part\n")
+                f.write("4. Print as a single 3-layer print\n\n")
+                f.write("After printing all sandwiches:\n")
+                f.write("5. Stack all sandwiches in order and backlight for effect\n")
+            elif use_exploded:
                 f.write("EXPLODED MODE\n")
                 f.write("Each color is a standalone 3-layer sandwich (transparent/color/transparent).\n")
                 f.write("Print each sandwich separately on any single-material printer.\n\n")

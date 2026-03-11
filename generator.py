@@ -27,7 +27,8 @@ class STLGenerator:
 
     def __init__(self, image_grayscale, width_mm, layer_height, model_height,
                  selected_filaments, alpha_mask=None, use_cap_layers=False, image_rgb=None,
-                 contrast_strength=2.0, use_face_down=False, use_exploded=False):
+                 contrast_strength=2.0, use_face_down=False, use_exploded=False,
+                 use_exploded_multi=False):
         """
         Args:
             image_grayscale: 2D array of brightness values (0=dark, 1=bright)
@@ -40,7 +41,8 @@ class STLGenerator:
             image_rgb: Full RGB image for color matching (HxWx3 array, 0-1 range)
             contrast_strength: S-curve contrast boost (1.0=none, 2.0=moderate, 3.0=strong)
             use_face_down: If True, generate flat voxel grid for face-down printing
-            use_exploded: If True, generate standalone sandwiches per color
+            use_exploded: If True, generate standalone single-color sandwiches
+            use_exploded_multi: If True, generate multi-color sandwiches (up to 3 colors each)
         """
         self.image_grayscale = image_grayscale
         self.image_rgb = image_rgb
@@ -52,6 +54,7 @@ class STLGenerator:
         self.use_cap_layers = use_cap_layers
         self.use_face_down = use_face_down
         self.use_exploded = use_exploded
+        self.use_exploded_multi = use_exploded_multi
         self.contrast_strength = contrast_strength
 
         self.num_layers = int(model_height / layer_height)
@@ -754,6 +757,9 @@ class STLGenerator:
         """
         logger.info(f"Generating {self.num_colors}-color model: {self.model_height}mm tall, {self.num_layers} layers")
 
+        if self.use_exploded_multi:
+            return self._generate_exploded_multi(output_base_path)
+
         if self.use_exploded:
             return self._generate_exploded(output_base_path)
 
@@ -1142,6 +1148,199 @@ class STLGenerator:
         logger.info(f"Exploded mode: generated {len(generated_files)} STL files")
         return generated_files
 
+    def _pack_sandwich_groups(self, layer_counts):
+        """Pack (color, level) pairs into physical sandwiches with up to 3 colors each.
+
+        Uses greedy bin-packing: sorts pairs by mask size (largest first),
+        assigns each to the first sandwich where its mask doesn't overlap
+        with existing masks and the sandwich has < 3 colors.
+
+        Args:
+            layer_counts: ndarray (H, W, num_colors) int32
+
+        Returns:
+            List of sandwich groups. Each group is a list of (color_idx, level, mask) tuples.
+        """
+        num_colors = layer_counts.shape[2]
+        valid_mask = self.alpha_mask >= 0.5
+
+        # Extract all (color, level) pairs with their masks
+        pairs = []
+        for c in range(num_colors):
+            max_k = int(layer_counts[:, :, c].max())
+            for k in range(1, max_k + 1):
+                mask = (layer_counts[:, :, c] >= k) & valid_mask
+                pixel_count = int(mask.sum())
+                if pixel_count > 0:
+                    pairs.append((c, k, mask, pixel_count))
+
+        # Sort by pixel count descending (largest masks first for better packing)
+        pairs.sort(key=lambda x: -x[3])
+
+        # Greedy bin-packing
+        sandwiches = []  # Each sandwich: list of (color_idx, level, mask)
+        sandwich_combined_masks = []  # Combined mask per sandwich
+
+        for c, k, mask, pixel_count in pairs:
+            placed = False
+            for s_idx, sandwich in enumerate(sandwiches):
+                if len(sandwich) >= 3:
+                    continue
+                # Check overlap: no pixel should be in both masks
+                combined = sandwich_combined_masks[s_idx]
+                if not np.any(mask & combined):
+                    sandwich.append((c, k, mask))
+                    sandwich_combined_masks[s_idx] = combined | mask
+                    placed = True
+                    break
+
+            if not placed:
+                sandwiches.append([(c, k, mask)])
+                sandwich_combined_masks.append(mask.copy())
+
+        return sandwiches
+
+    def _generate_exploded_multi(self, output_base_path):
+        """Generate exploded-multi mode: multi-color sandwiches with up to 3 colors each.
+
+        Same pixel-level Beer-Lambert optimization as exploded mode but with higher
+        per-color caps (5 vs 3). After optimization, color-level pairs are packed into
+        physical sandwiches via greedy bin-packing (up to 3 non-overlapping color masks
+        per sandwich).
+
+        Each physical sandwich is 3 layers tall (transparent/multi-color middle/transparent).
+        Outputs up to 4 STLs per sandwich: 1 transparent + up to 3 color STLs.
+        """
+        generated_files = []
+
+        num_color_filaments = self.num_colors - 1
+        if num_color_filaments <= 0:
+            logger.warning("Exploded-multi mode requires at least 1 color + transparent")
+            return generated_files
+
+        color_filaments = self.selected_filaments.iloc[:num_color_filaments]
+        transparent_filament = self.selected_filaments.iloc[-1]
+
+        total_sandwiches = int(self.model_height / self.layer_height)
+        logger.info(f"Exploded-multi mode: {total_sandwiches} sandwich budget, {num_color_filaments} colors")
+
+        # Higher cap per color since multi-color packing is more efficient.
+        # Iteratively reduce caps if packing exceeds the sandwich budget.
+        MAX_SANDWICHES_PER_COLOR = 5
+
+        for attempt in range(MAX_SANDWICHES_PER_COLOR):
+            current_cap = MAX_SANDWICHES_PER_COLOR - attempt
+            per_color_caps = [min(current_cap, total_sandwiches) for _ in range(num_color_filaments)]
+
+            # Reduce caps if combinatorial space is too large
+            combo_size = 1
+            for cap in per_color_caps:
+                combo_size *= (cap + 1)
+            while combo_size > 500_000:
+                max_idx = per_color_caps.index(max(per_color_caps))
+                per_color_caps[max_idx] -= 1
+                combo_size = 1
+                for cap in per_color_caps:
+                    combo_size *= (cap + 1)
+
+            # Compute optimal layer counts per pixel per color
+            layer_counts = self._compute_exploded_layer_counts(
+                color_filaments, transparent_filament, total_sandwiches, per_color_caps
+            )
+
+            # Pack into physical sandwiches (up to 3 colors each)
+            sandwich_groups = self._pack_sandwich_groups(layer_counts)
+            num_physical = len(sandwich_groups)
+
+            if num_physical <= total_sandwiches:
+                logger.info(f"Exploded-multi: packed into {num_physical} physical sandwiches "
+                             f"(budget: {total_sandwiches}, cap: {current_cap})")
+                break
+            else:
+                logger.info(f"Exploded-multi: cap={current_cap} produced {num_physical} sandwiches "
+                             f"(budget: {total_sandwiches}), reducing cap...")
+        else:
+            # Even cap=1 exceeded budget — use what we have
+            logger.info(f"Exploded-multi: packed into {num_physical} physical sandwiches "
+                         f"(budget: {total_sandwiches}, cap: 1)")
+
+        all_pixels_mask = self.alpha_mask >= 0.5
+
+        # Pre-generate shared full-plate meshes (same for every sandwich)
+        mesh_bottom = self._generate_flat_layer_stl(all_pixels_mask, 0, 1)
+        mesh_top = self._generate_flat_layer_stl(all_pixels_mask, 2, 3)
+
+        for s_idx, group in enumerate(sandwich_groups):
+            sandwich_num = s_idx + 1
+            color_names_in_sandwich = []
+            combined_color_mask = np.zeros_like(all_pixels_mask)
+
+            # Generate color STLs for this sandwich
+            for color_idx, level, mask in group:
+                filament = color_filaments.iloc[color_idx]
+                color_name = filament['name'].replace(' ', '_').replace('/', '_')
+                color_names_in_sandwich.append(filament['name'])
+                combined_color_mask |= mask
+
+                pixel_count = int(mask.sum())
+                logger.info(f"  Sandwich {sandwich_num}/{num_physical}: "
+                             f"{filament['name']} level {level} ({pixel_count} pixels)")
+
+                color_stl_path = (output_base_path.parent /
+                    f"{output_base_path.stem}_S{sandwich_num:02d}_{color_name}_color.stl")
+                color_mesh = self._generate_flat_layer_stl(mask, 1, 2)
+                if len(color_mesh.vertices) > 0:
+                    color_mesh.export(str(color_stl_path))
+                    generated_files.append((
+                        color_stl_path,
+                        f"{filament['name']} (sandwich {sandwich_num})",
+                        1, 2
+                    ))
+
+            # Generate transparent STL: bottom + inverse middle + top
+            inverse_mask = ~combined_color_mask & all_pixels_mask
+
+            trans_stl_path = (output_base_path.parent /
+                f"{output_base_path.stem}_S{sandwich_num:02d}_transparent.stl")
+
+            vertices_list = []
+            faces_list = []
+            vertex_offset = 0
+
+            if len(mesh_bottom.vertices) > 0:
+                vertices_list.append(mesh_bottom.vertices)
+                faces_list.append(mesh_bottom.faces + vertex_offset)
+                vertex_offset += len(mesh_bottom.vertices)
+
+            if inverse_mask.any():
+                mesh_middle = self._generate_flat_layer_stl(inverse_mask, 1, 2)
+                if len(mesh_middle.vertices) > 0:
+                    vertices_list.append(mesh_middle.vertices)
+                    faces_list.append(mesh_middle.faces + vertex_offset)
+                    vertex_offset += len(mesh_middle.vertices)
+
+            if len(mesh_top.vertices) > 0:
+                vertices_list.append(mesh_top.vertices)
+                faces_list.append(mesh_top.faces + vertex_offset)
+
+            if vertices_list:
+                combined_vertices = np.vstack(vertices_list)
+                combined_faces = np.vstack(faces_list)
+                combined_mesh = trimesh.Trimesh(
+                    vertices=combined_vertices, faces=combined_faces, process=False
+                )
+                combined_mesh.export(str(trans_stl_path))
+                names_str = ', '.join(color_names_in_sandwich)
+                generated_files.append((
+                    trans_stl_path,
+                    f"Transparent (sandwich {sandwich_num}: {names_str})",
+                    0, 3
+                ))
+
+        logger.info(f"Exploded-multi: generated {len(generated_files)} STL files "
+                     f"across {num_physical} sandwiches")
+        return generated_files
+
     def generate_preview_scene(self):
         """Generate a trimesh.Scene with colored meshes for interactive 3D preview
 
@@ -1152,6 +1351,9 @@ class STLGenerator:
         Returns:
             trimesh.Scene with one colored mesh per filament
         """
+        if self.use_exploded or self.use_exploded_multi:
+            return self._generate_exploded_preview_scene()
+
         from math import sqrt
 
         H, W = self.image_grayscale.shape
@@ -1327,6 +1529,191 @@ class STLGenerator:
         finally:
             self.pixel_size = orig_pixel_size
             self.alpha_mask = orig_alpha
+
+    def _generate_exploded_preview_scene(self):
+        """Generate 3D preview for exploded/exploded-multi modes.
+
+        Shows each sandwich as a flat slab at its stacking position with a visible
+        gap between sandwiches. Color pixels are shown in their filament RGB,
+        transparent pixels in near-white. Runs the full Beer-Lambert optimization
+        at downsampled resolution.
+
+        Returns:
+            trimesh.Scene with one colored mesh per sandwich
+        """
+        from math import sqrt
+
+        H, W = self.image_grayscale.shape
+
+        # Downsample for exploded preview (~80K pixels — greedy meshing keeps face count low)
+        ds = max(1, round(sqrt(H * W / 80000)))
+        ds_alpha = self.alpha_mask[::ds, ::ds]
+        ds_H, ds_W = ds_alpha.shape
+        ds_pixel_size = self.width_mm / ds_W
+        ds_image_rgb = self.image_rgb[::ds, ::ds] if self.image_rgb is not None else None
+
+        logger.info(f"3D exploded preview: {H}x{W} -> {ds_H}x{ds_W} (ds={ds})")
+
+        num_color_filaments = self.num_colors - 1
+        if num_color_filaments <= 0:
+            return trimesh.Scene()
+
+        color_filaments = self.selected_filaments.iloc[:num_color_filaments]
+        transparent_filament = self.selected_filaments.iloc[-1]
+        total_sandwiches = int(self.model_height / self.layer_height)
+
+        # Compute caps (same logic as generation methods)
+        if self.use_exploded_multi:
+            max_cap = 5
+        else:
+            max_cap = 3
+        per_color_caps = [min(max_cap, total_sandwiches) for _ in range(num_color_filaments)]
+
+        # Reduce combo space
+        combo_size = 1
+        for cap in per_color_caps:
+            combo_size *= (cap + 1)
+        while combo_size > 500_000:
+            max_idx = per_color_caps.index(max(per_color_caps))
+            per_color_caps[max_idx] -= 1
+            combo_size = 1
+            for cap in per_color_caps:
+                combo_size *= (cap + 1)
+
+        # Swap all resolution-dependent attributes for downsampled resolution
+        orig_pixel_size = self.pixel_size
+        orig_alpha = self.alpha_mask
+        orig_rgb = self.image_rgb
+        orig_grayscale = self.image_grayscale
+        ds_grayscale = self.image_grayscale[::ds, ::ds]
+        try:
+            self.pixel_size = ds_pixel_size
+            self.alpha_mask = ds_alpha
+            self.image_rgb = ds_image_rgb
+            self.image_grayscale = ds_grayscale
+
+            # Run Beer-Lambert optimization at downsampled resolution
+            # For exploded-multi, retry with lower caps if packing exceeds budget
+            if self.use_exploded_multi:
+                for attempt in range(max_cap):
+                    current_cap = max_cap - attempt
+                    per_color_caps = [min(current_cap, total_sandwiches) for _ in range(num_color_filaments)]
+                    cs = 1
+                    for cap in per_color_caps:
+                        cs *= (cap + 1)
+                    while cs > 500_000:
+                        mi = per_color_caps.index(max(per_color_caps))
+                        per_color_caps[mi] -= 1
+                        cs = 1
+                        for cap in per_color_caps:
+                            cs *= (cap + 1)
+
+                    layer_counts = self._compute_exploded_layer_counts(
+                        color_filaments, transparent_filament, total_sandwiches, per_color_caps
+                    )
+                    sandwich_groups = self._pack_sandwich_groups(layer_counts)
+                    if len(sandwich_groups) <= total_sandwiches:
+                        break
+            else:
+                layer_counts = self._compute_exploded_layer_counts(
+                    color_filaments, transparent_filament, total_sandwiches, per_color_caps
+                )
+
+            # For standard exploded, build sandwich groups directly
+            if not self.use_exploded_multi:
+                # For standard exploded, one sandwich per (color, level)
+                sandwich_groups = []
+                valid_mask = ds_alpha >= 0.5
+                for c in range(num_color_filaments):
+                    max_k = int(layer_counts[:, :, c].max())
+                    for k in range(1, max_k + 1):
+                        mask = (layer_counts[:, :, c] >= k) & valid_mask
+                        if mask.any():
+                            sandwich_groups.append([(c, k, mask)])
+
+            num_physical = len(sandwich_groups)
+            logger.info(f"3D exploded preview: {num_physical} sandwiches to render")
+
+            # Visual parameters — meshes are generated collapsed (gap=0).
+            # The HTML viewer slider controls the gap dynamically.
+            slab_thickness = 0.5  # mm per sandwich slab (exaggerated for visibility)
+            step = slab_thickness  # no gap — slider adds it
+
+            # Transparent fill: very faint so it doesn't obscure color layers
+            trans_rgb_uint8 = np.array([240, 240, 235], dtype=np.uint8)
+            trans_alpha = 15  # ~6% opacity — just enough to see sandwich outline
+
+            # Build filament RGB + Beer-Lambert alpha lookup
+            # Alpha = opacity for one layer_height of material, with min floor for visibility
+            MIN_ALPHA = 40  # ~15% — ensures even high-TD filaments are visible
+            filament_rgb_uint8 = {}
+            filament_alpha = {}
+            for c in range(num_color_filaments):
+                f = color_filaments.iloc[c]
+                filament_rgb_uint8[c] = (np.array(f['rgb']) * 255).astype(np.uint8)
+                td = max(f['transmission_distance'], 0.1)
+                opacity = 1.0 - np.exp(-self.layer_height / td)
+                filament_alpha[c] = max(int(opacity * 255), MIN_ALPHA)
+
+            all_pixels_mask = ds_alpha >= 0.5
+            scene = trimesh.Scene()
+
+            for s_idx, group in enumerate(sandwich_groups):
+                z_base = s_idx * step
+
+                # Generate separate meshes for each color region + transparent fill
+                combined_color_mask = np.zeros((ds_H, ds_W), dtype=bool)
+                color_names = []
+
+                for color_idx, level, mask in group:
+                    if not mask.any():
+                        continue
+                    combined_color_mask |= mask
+
+                    name = color_filaments.iloc[color_idx]['name']
+                    if name not in color_names:
+                        color_names.append(name)
+
+                    # Color mesh for this region
+                    rects = self._greedy_mesh_rects(mask)
+                    if rects:
+                        verts, faces = self._build_box_mesh(
+                            rects, z_base, z_base + slab_thickness, ds_pixel_size)
+                        if len(verts) > 0:
+                            mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+                            fc = np.zeros((len(mesh.faces), 4), dtype=np.uint8)
+                            fc[:, :3] = filament_rgb_uint8[color_idx]
+                            fc[:, 3] = filament_alpha[color_idx]
+                            mesh.visual.face_colors = fc
+                            scene.add_geometry(
+                                mesh,
+                                geom_name=f"S{s_idx+1:02d}_{name.replace(' ','_')}_L{level}"
+                            )
+
+                # Transparent fill (all valid pixels minus color pixels)
+                trans_mask = all_pixels_mask & ~combined_color_mask
+                if trans_mask.any():
+                    rects = self._greedy_mesh_rects(trans_mask)
+                    if rects:
+                        verts, faces = self._build_box_mesh(
+                            rects, z_base, z_base + slab_thickness, ds_pixel_size)
+                        if len(verts) > 0:
+                            mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+                            fc = np.zeros((len(mesh.faces), 4), dtype=np.uint8)
+                            fc[:, :3] = trans_rgb_uint8
+                            fc[:, 3] = trans_alpha
+                            mesh.visual.face_colors = fc
+                            geom_name = f"S{s_idx+1:02d}_transparent"
+                            scene.add_geometry(mesh, geom_name=geom_name)
+
+            logger.info(f"3D exploded preview: {len(scene.geometry)} meshes in scene")
+            return scene
+
+        finally:
+            self.pixel_size = orig_pixel_size
+            self.alpha_mask = orig_alpha
+            self.image_rgb = orig_rgb
+            self.image_grayscale = orig_grayscale
 
     def _generate_standard(self, output_base_path):
         """Generate standard topographical STLs.
