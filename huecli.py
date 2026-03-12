@@ -1658,6 +1658,8 @@ def main():
                         help='Color layers per sandwich in exploded modes (default: 1, CMYK default: 3)')
     parser.add_argument('--fill', type=str, default=None, metavar='BOOL',
                         help='Fill sandwiches with transparent (inverse middle + top layer) [yes/no] (default: no)')
+    parser.add_argument('--base-layers', type=int, default=None,
+                        help='Transparent base layers per sandwich in exploded modes (default: 3)')
 
     args = parser.parse_args()
 
@@ -1783,6 +1785,9 @@ def main():
 
         # Resolve fill (transparent fill in exploded sandwiches)
         use_fill = (args.fill.lower() in ('y', 'yes', 'true', '1')) if args.fill is not None else False
+
+        # Resolve base_layers (transparent base layers per sandwich)
+        base_layers = args.base_layers if args.base_layers is not None else 3
 
         print("\n" + "=" * 60)
 
@@ -2058,6 +2063,7 @@ def main():
                     exploded_max_cap=2 if use_exploded_cmyk else (5 if use_exploded_multi else 3),
                     sandwich_layers=sandwich_layers,
                     use_fill=use_fill,
+                    base_layers=base_layers,
                 )
             elif choice == "3":
                 # 3D preview in browser
@@ -2076,6 +2082,7 @@ def main():
                     use_exploded_cmyk=use_exploded_cmyk,
                     sandwich_layers=sandwich_layers,
                     use_fill=use_fill,
+                    base_layers=base_layers,
                 )
                 show_3d_preview(preview_stl_gen)
                 # Loop continues to show 2D preview + menu again
@@ -2111,6 +2118,7 @@ def main():
             use_exploded_cmyk=use_exploded_cmyk,
             sandwich_layers=sandwich_layers,
             use_fill=use_fill,
+            base_layers=base_layers,
         )
 
         generated_files = stl_gen.generate_all(output_path, single_stl=False)
@@ -2179,34 +2187,49 @@ def main():
                 f.write("EXPLODED CMYK MODE\n")
                 f.write("Uses 4 subtractive primaries (Cyan, Magenta, Yellow, Black) + transparent.\n")
                 f.write(f"Each colour has up to 2 intensity levels = max 8 sandwiches.\n")
-                f.write(f"Each sandwich has {sandwich_layers} colour layer(s) + 2 transparent = {sandwich_layers + 2} layers.\n\n")
+                f.write(f"Each sandwich has {base_layers} base layer(s) + {sandwich_layers} colour layer(s)")
+                if use_fill:
+                    f.write(f" + 1 top = {base_layers + sandwich_layers + 1} layers.\n\n")
+                else:
+                    f.write(f" = {base_layers + sandwich_layers} layers.\n\n")
                 f.write("For each sandwich:\n")
                 f.write("1. Load both STLs (_color.stl and _transparent.stl) into slicer\n")
                 f.write("2. Assign the colour filament to the _color.stl part\n")
                 f.write("3. Assign transparent filament to the _transparent.stl part\n")
-                f.write(f"4. Print as a single {sandwich_layers + 2}-layer print\n\n")
+                layers_total = base_layers + sandwich_layers + (1 if use_fill else 0)
+                f.write(f"4. Print as a single {layers_total}-layer print\n\n")
                 f.write("After printing all sandwiches:\n")
                 f.write("5. Stack all sandwiches in order and backlight for effect\n")
             elif use_exploded_multi:
+                layers_total = base_layers + sandwich_layers + (1 if use_fill else 0)
                 f.write("EXPLODED-MULTI MODE\n")
-                f.write("Each sandwich is 3 layers tall with up to 3 colors in the middle layer.\n")
+                f.write(f"Each sandwich has {base_layers} base + {sandwich_layers} colour layer(s) with up to 3 colors")
+                if use_fill:
+                    f.write(f" + 1 top = {layers_total} layers.\n")
+                else:
+                    f.write(f" = {layers_total} layers.\n")
                 f.write("Requires a multi-material printer (or filament swaps) per sandwich.\n\n")
                 f.write("For each sandwich (S01, S02, ...):\n")
                 f.write("1. Load the _transparent.stl and all _color.stl files for that sandwich\n")
                 f.write("2. Assign each color filament to its _color.stl part\n")
                 f.write("3. Assign transparent filament to the _transparent.stl part\n")
-                f.write("4. Print as a single 3-layer print\n\n")
+                f.write(f"4. Print as a single {layers_total}-layer print\n\n")
                 f.write("After printing all sandwiches:\n")
                 f.write("5. Stack all sandwiches in order and backlight for effect\n")
             elif use_exploded:
+                layers_total = base_layers + sandwich_layers + (1 if use_fill else 0)
                 f.write("EXPLODED MODE\n")
-                f.write("Each color is a standalone 3-layer sandwich (transparent/color/transparent).\n")
+                f.write(f"Each color is a standalone sandwich: {base_layers} base + {sandwich_layers} colour")
+                if use_fill:
+                    f.write(f" + 1 top = {layers_total} layers.\n")
+                else:
+                    f.write(f" = {layers_total} layers.\n")
                 f.write("Print each sandwich separately on any single-material printer.\n\n")
                 f.write("For each color:\n")
                 f.write("1. Load both STLs (_color.stl and _transparent.stl) into slicer\n")
                 f.write("2. Assign the color filament to the _color.stl part\n")
                 f.write("3. Assign transparent filament to the _transparent.stl part\n")
-                f.write("4. Print as a single 3-layer print\n\n")
+                f.write(f"4. Print as a single {layers_total}-layer print\n\n")
                 f.write("After printing all sandwiches:\n")
                 f.write("5. Stack all sandwiches in order and backlight for effect\n")
             elif use_face_down and use_cap_layers:

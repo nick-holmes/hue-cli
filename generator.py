@@ -29,7 +29,7 @@ class STLGenerator:
                  selected_filaments, alpha_mask=None, use_cap_layers=False, image_rgb=None,
                  contrast_strength=2.0, use_face_down=False, use_exploded=False,
                  use_exploded_multi=False, use_exploded_cmyk=False, sandwich_layers=1,
-                 use_fill=False):
+                 use_fill=False, base_layers=3):
         """
         Args:
             image_grayscale: 2D array of brightness values (0=dark, 1=bright)
@@ -59,6 +59,7 @@ class STLGenerator:
         self.use_exploded_cmyk = use_exploded_cmyk
         self.sandwich_layers = sandwich_layers
         self.use_fill = use_fill
+        self.base_layers = base_layers
         self.contrast_strength = contrast_strength
 
         self.num_layers = int(model_height / layer_height)
@@ -1098,15 +1099,16 @@ class STLGenerator:
         all_pixels_mask = self.alpha_mask >= 0.5
 
         # Sandwich layer structure:
-        # Bottom transparent: layer 0 to 1
-        # Color middle: layer 1 to 1+sandwich_layers
-        # Top transparent: layer 1+sandwich_layers to 2+sandwich_layers
+        # Bottom transparent: layer 0 to base_layers
+        # Color middle: layer base_layers to base_layers+sandwich_layers
+        # Top transparent (fill only): layer base_layers+sandwich_layers to base_layers+sandwich_layers+1
+        bl = self.base_layers
         sl = self.sandwich_layers
-        layers_per_sandwich = sl + 2
+        layers_per_sandwich = bl + sl + (1 if self.use_fill else 0)
 
         # Pre-generate shared full-plate meshes (same for every sandwich)
-        mesh_bottom = self._generate_flat_layer_stl(all_pixels_mask, 0, 1)
-        mesh_top = self._generate_flat_layer_stl(all_pixels_mask, 1 + sl, layers_per_sandwich) if self.use_fill else None
+        mesh_bottom = self._generate_flat_layer_stl(all_pixels_mask, 0, bl)
+        mesh_top = self._generate_flat_layer_stl(all_pixels_mask, bl + sl, bl + sl + 1) if self.use_fill else None
 
         for c in range(num_color_filaments):
             filament = color_filaments.iloc[c]
@@ -1125,13 +1127,13 @@ class STLGenerator:
                 logger.info(f"  {color_name} sandwich {k}/{max_k}: {pixel_count} pixels "
                              f"({layers_per_sandwich} layers/sandwich, {sl} color, fill={self.use_fill})")
 
-                # Color STL: middle layers (layer 1 to 1+sandwich_layers)
+                # Color STL: middle layers
                 suffix = f"_{k}" if max_k > 1 else ""
                 color_stl_path = output_base_path.parent / f"{output_base_path.stem}_{color_name}{suffix}_color.stl"
-                color_mesh = self._generate_flat_layer_stl(color_mask, 1, 1 + sl)
+                color_mesh = self._generate_flat_layer_stl(color_mask, bl, bl + sl)
                 if len(color_mesh.vertices) > 0:
                     color_mesh.export(str(color_stl_path))
-                    generated_files.append((color_stl_path, f"{filament['name']} (color {k})", 1, 1 + sl))
+                    generated_files.append((color_stl_path, f"{filament['name']} (color {k})", bl, bl + sl))
 
                 # Transparent STL: bottom + optional inverse middle + optional top
                 trans_stl_path = output_base_path.parent / f"{output_base_path.stem}_{color_name}{suffix}_transparent.stl"
@@ -1140,7 +1142,7 @@ class STLGenerator:
                 faces_list = []
                 vertex_offset = 0
 
-                # Part 1: Full bottom
+                # Part 1: Full bottom (base_layers thick)
                 if len(mesh_bottom.vertices) > 0:
                     vertices_list.append(mesh_bottom.vertices)
                     faces_list.append(mesh_bottom.faces + vertex_offset)
@@ -1149,7 +1151,7 @@ class STLGenerator:
                 if self.use_fill:
                     # Part 2: Inverse middle fill
                     if inverse_mask.any():
-                        mesh_middle = self._generate_flat_layer_stl(inverse_mask, 1, 1 + sl)
+                        mesh_middle = self._generate_flat_layer_stl(inverse_mask, bl, bl + sl)
                         if len(mesh_middle.vertices) > 0:
                             vertices_list.append(mesh_middle.vertices)
                             faces_list.append(mesh_middle.faces + vertex_offset)
@@ -1289,12 +1291,13 @@ class STLGenerator:
         all_pixels_mask = self.alpha_mask >= 0.5
 
         # Sandwich layer structure (same as _generate_exploded)
+        bl = self.base_layers
         sl = self.sandwich_layers
-        layers_per_sandwich = sl + 2
+        layers_per_sandwich = bl + sl + (1 if self.use_fill else 0)
 
         # Pre-generate shared full-plate meshes (same for every sandwich)
-        mesh_bottom = self._generate_flat_layer_stl(all_pixels_mask, 0, 1)
-        mesh_top = self._generate_flat_layer_stl(all_pixels_mask, 1 + sl, layers_per_sandwich) if self.use_fill else None
+        mesh_bottom = self._generate_flat_layer_stl(all_pixels_mask, 0, bl)
+        mesh_top = self._generate_flat_layer_stl(all_pixels_mask, bl + sl, bl + sl + 1) if self.use_fill else None
 
         for s_idx, group in enumerate(sandwich_groups):
             sandwich_num = s_idx + 1
@@ -1314,13 +1317,13 @@ class STLGenerator:
 
                 color_stl_path = (output_base_path.parent /
                     f"{output_base_path.stem}_S{sandwich_num:02d}_{color_name}_color.stl")
-                color_mesh = self._generate_flat_layer_stl(mask, 1, 1 + sl)
+                color_mesh = self._generate_flat_layer_stl(mask, bl, bl + sl)
                 if len(color_mesh.vertices) > 0:
                     color_mesh.export(str(color_stl_path))
                     generated_files.append((
                         color_stl_path,
                         f"{filament['name']} (sandwich {sandwich_num})",
-                        1, 1 + sl
+                        bl, bl + sl
                     ))
 
             # Generate transparent STL: bottom + optional inverse middle + optional top
@@ -1340,7 +1343,7 @@ class STLGenerator:
 
             if self.use_fill:
                 if inverse_mask.any():
-                    mesh_middle = self._generate_flat_layer_stl(inverse_mask, 1, 1 + sl)
+                    mesh_middle = self._generate_flat_layer_stl(inverse_mask, bl, bl + sl)
                     if len(mesh_middle.vertices) > 0:
                         vertices_list.append(mesh_middle.vertices)
                         faces_list.append(mesh_middle.faces + vertex_offset)

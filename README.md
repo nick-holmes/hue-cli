@@ -49,6 +49,7 @@ python3 huecli.py image.png \
 | `-d, --min-delta-e` | Min colour difference (delta-E) | `5.0` |
 | `--mode` | Generation mode (see below) | `standard` |
 | `--sandwich-layers` | Colour layers per sandwich in exploded modes | `1` (CMYK: `3`) |
+| `--base-layers` | Transparent base layers per sandwich in exploded modes | `3` |
 | `--fill` | Fill sandwiches with transparent (inverse middle + top layer) | `no` |
 
 **Modes:** `standard`, `cap-layers`, `face-down`, `face-down-cap`, `exploded`, `exploded-multi`, `exploded-cmyk`
@@ -102,7 +103,7 @@ python3 huecli.py image.png -f filaments.csv -c 8 -l 0.08 -m 2.0 -n 0.4 -s 120x1
 **Printing each sandwich:**
 1. Load both STLs (`_color.stl` and `_transparent.stl`) into your slicer
 2. Assign the colour filament to the `_color` part, transparent to the `_transparent` part
-3. Print as a single print (sandwich_layers + 2 layers tall with `--fill`, sandwich_layers + 1 without)
+3. Print as a single print (base_layers + sandwich_layers + 1 with `--fill`, base_layers + sandwich_layers without)
 4. Repeat for each sandwich, then stack all sandwiches and backlight
 
 ### Exploded-Multi (`--mode exploded-multi`)
@@ -141,7 +142,7 @@ Uses 4 fixed CMYK subtractive primaries (Cyan, Magenta, Yellow, Black) instead o
 python3 huecli.py image.png -f filaments.csv -n 0.4 -l 0.08 -m 2.0 -s 120x160 -o output.stl --mode exploded-cmyk
 ```
 
-**Printing:** Same as regular exploded — print each sandwich separately on any single-material printer, then stack all sandwiches and backlight. Each sandwich is 4 layers tall by default (1 transparent + 3 colour), or 5 with `--fill yes`.
+**Printing:** Same as regular exploded — print each sandwich separately on any single-material printer, then stack all sandwiches and backlight. Each sandwich is 6 layers tall by default (3 base + 3 colour), or 7 with `--fill yes`.
 
 ## Exploded Mode Options
 
@@ -150,6 +151,7 @@ These flags apply to all exploded modes (`exploded`, `exploded-multi`, `exploded
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--sandwich-layers N` | Colour layers in the middle of each sandwich. Higher values give more colour opacity per sandwich, useful for high-TD (translucent) filaments. | `1` (`exploded-cmyk`: `3`) |
+| `--base-layers N` | Transparent base layers at the bottom of each sandwich. More layers = more structural rigidity for freestanding prints. | `3` |
 | `--fill yes/no` | When `yes`, fills non-colour areas in the middle with transparent and adds a top transparent layer. When `no`, sandwiches are just bottom transparent + colour pixels. | `no` |
 
 ## Output
