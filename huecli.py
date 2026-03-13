@@ -14,7 +14,6 @@ from PIL import Image
 from sklearn.cluster import KMeans
 from skimage import color
 import trimesh
-import matplotlib.pyplot as plt
 
 from generator import STLGenerator
 
@@ -76,31 +75,25 @@ class FilamentLibrary:
             hex_color = hex_color[:6]  # Ignore alpha for now
         return tuple(int(hex_color[i:i+2], 16) / 255.0 for i in (0, 2, 4))
 
-    def select_best_filaments(self, target_colors_lab, count, layer_height=0.08, min_color_difference=15.0, randomize=False, use_cap_layers=False, use_face_down=False):
+    def select_best_filaments(self, target_colors_lab, count, layer_height=0.08, min_color_difference=15.0, randomize=False, use_flat_cap=False):
         """
         Select best matching filaments using direct delta-E color matching.
 
         Each filament's raw color is compared to target colors. The Beer-Lambert
         transmission physics are handled during generation, not selection.
 
-        When use_cap_layers=True, reserves 2 slots for dark base + clear top,
+        When use_flat_cap=True, reserves 1 slot for transparent cap,
         and uses remaining slots for color matching.
 
         Args:
             min_color_difference: Minimum delta-E between selected filaments to ensure diversity
             randomize: Add random perturbation to selection to get variation
-            use_cap_layers: Reserve slots for dark base layer and clear cap layer
+            use_flat_cap: Reserve a slot for transparent cap filament
         """
-        logger.info(f"Selecting {count} unique filaments from library (randomize: {randomize}, cap_layers: {use_cap_layers}, face_down: {use_face_down})")
+        logger.info(f"Selecting {count} unique filaments from library (randomize: {randomize}, flat_cap: {use_flat_cap})")
 
-        if use_cap_layers and use_face_down:
-            # Face-down + cap layers: only reserve transparent, all others for image
-            result = self._select_with_face_down_cap(target_colors_lab, count, layer_height, min_color_difference, randomize)
-            return result
-
-        if use_cap_layers:
-            # Cap layers mode: select dark base + clear top + colors
-            result = self._select_with_cap_layers(target_colors_lab, count, layer_height, min_color_difference, randomize)
+        if use_flat_cap:
+            result = self._select_with_flat_cap(target_colors_lab, count, layer_height, min_color_difference, randomize)
             return result
 
         # Standard selection below
@@ -167,18 +160,18 @@ class FilamentLibrary:
         result = self.df.iloc[selected_indices].reset_index(drop=True)
         return result
 
-    def _select_with_face_down_cap(self, target_colors_lab, count, layer_height, min_color_difference, randomize):
-        """Select filaments for face-down + cap layers mode
+    def _select_with_flat_cap(self, target_colors_lab, count, layer_height, min_color_difference, randomize):
+        """Select filaments for flat-cap mode
 
-        Only reserves 1 slot for transparent (cap + negative fill).
-        All remaining slots are for image-carrying colors.
+        Reserves 1 slot for transparent (cap + gap fill).
+        All remaining slots are for color filaments.
 
         Returns filaments in order: [color1, color2, ..., transparent]
         """
-        logger.info("Face-down + cap layers: selecting transparent + image colors")
+        logger.info("Flat-cap mode: selecting transparent + color filaments")
 
         if count < 2:
-            raise ValueError("Face-down cap layers requires at least 2 colors (1 image + transparent)")
+            raise ValueError("Flat-cap mode requires at least 2 colors (1 color + transparent)")
 
         selected_indices = []
 
@@ -504,109 +497,6 @@ class FilamentLibrary:
         result_indices = selected_indices + [transparent_idx]
         return self.df.iloc[result_indices].reset_index(drop=True)
 
-    def _select_with_cap_layers(self, target_colors_lab, count, layer_height, min_color_difference, randomize):
-        """Select filaments for cap layers mode: dark base + clear top + colors
-
-        Returns filaments in order: [dark_base, color1, color2, ..., clear_top]
-        """
-        logger.info("Cap layers mode: selecting dark base + clear top + colors")
-
-        if count < 3:
-            logger.error("Cap layers mode requires at least 3 colors (dark + 1 color + clear)")
-            raise ValueError("use_cap_layers requires --color-count >= 3")
-
-        selected_indices = []
-
-        # 1. Select DARK base layer (darkest, most opaque filament for text)
-        dark_candidates = []
-        for idx, row in self.df.iterrows():
-            luminosity = row['lab'][0]
-            if luminosity < 30:  # Very dark
-                dark_candidates.append((luminosity, idx))
-
-        if not dark_candidates:
-            logger.warning("No very dark filaments found (L < 30), using darkest available")
-            darkest_idx = self.df['lab'].apply(lambda x: x[0]).idxmin()
-            selected_indices.append(darkest_idx)
-        else:
-            dark_candidates.sort()
-            selected_indices.append(dark_candidates[0][1])
-
-        dark_filament = self.df.iloc[selected_indices[0]]
-        logger.info(f"Selected dark base: {dark_filament['name']} (L={dark_filament['lab'][0]:.1f}, TD={dark_filament['transmission_distance']}mm)")
-
-        # 2. Select PURE TRANSPARENT layer
-        transparent_idx = self._select_transparent_filament(exclude_indices=set(selected_indices))
-        selected_indices.append(transparent_idx)
-
-        clear_filament = self.df.iloc[selected_indices[-1]]
-        logger.info(f"Selected PURE transparent: {clear_filament['name']} (L={clear_filament['lab'][0]:.1f}, TD={clear_filament['transmission_distance']}mm, a={clear_filament['lab'][1]:.1f}, b={clear_filament['lab'][2]:.1f})")
-
-        # 3. Select COLOR filaments (count - 2 remaining slots)
-        num_colors = count - 2
-        logger.info(f"Selecting {num_colors} color filaments to match image")
-
-        # Track already selected LABs for diversity
-        selected_labs = [self.df.iloc[idx]['lab'] for idx in selected_indices]
-
-        # Sort target colors by luminosity
-        target_colors_sorted = sorted(enumerate(target_colors_lab), key=lambda x: x[1][0])
-
-        for color_idx, target_lab in target_colors_sorted[:num_colors]:
-            distances = []
-
-            for idx, row in self.df.iterrows():
-                if idx in selected_indices:
-                    continue
-
-                # Check diversity
-                filament_lab = row['lab']
-                too_similar = False
-                for selected_lab in selected_labs:
-                    delta_e_to_selected = color.deltaE_ciede2000(
-                        np.array([[filament_lab]]),
-                        np.array([[selected_lab]])
-                    )[0][0]
-                    if delta_e_to_selected < min_color_difference:
-                        too_similar = True
-                        break
-
-                if too_similar:
-                    continue
-
-                # Calculate delta-E to target color
-                delta_e = color.deltaE_ciede2000(
-                    np.array([[target_lab]]),
-                    np.array([[filament_lab]])
-                )[0][0]
-
-                # Add random perturbation if requested
-                if randomize:
-                    import random
-                    delta_e += random.uniform(-5.0, 5.0)
-
-                distances.append((delta_e, idx))
-
-            if distances:
-                distances.sort()
-                best_idx = distances[0][1]
-                selected_indices.append(best_idx)
-                selected_labs.append(self.df.iloc[best_idx]['lab'])
-                logger.info(f"  Color {len(selected_indices)-2}: {self.df.iloc[best_idx]['name']} ({self.df.iloc[best_idx]['color_hex']})")
-
-        if len(selected_indices) < count:
-            logger.warning(f"Only selected {len(selected_indices)} filaments out of {count} requested")
-
-        # Reorder: [dark, colors..., clear] but we want dark at index 0 and clear at the end
-        # Currently we have: [dark, clear, colors...]
-        # Need to move clear to end
-        result_indices = [selected_indices[0]]  # dark
-        result_indices.extend(selected_indices[2:])  # colors
-        result_indices.append(selected_indices[1])  # clear
-
-        return self.df.iloc[result_indices].reset_index(drop=True)
-
-
 class ImageProcessor:
     """Handles image loading and color quantization"""
 
@@ -618,7 +508,7 @@ class ImageProcessor:
         self.image_lab = None
         self.alpha_mask = None  # Mask for transparent/rounded corners
 
-    def load_and_prepare(self, nozzle_diameter=0.2, face_down=False):
+    def load_and_prepare(self, nozzle_diameter=0.2):
         """Load image and prepare for processing
 
         CRITICAL: Resolution is set to match nozzle diameter for maximum quality
@@ -671,12 +561,6 @@ class ImageProcessor:
             # Vertical flip: image Y-axis points down, 3D Y-axis points up
             self.image = np.flipud(self.image)
             self.alpha_mask = np.flipud(self.alpha_mask)
-
-            # Face-down mode: horizontal flip so text reads correctly when print is flipped over
-            if face_down:
-                self.image = np.fliplr(self.image)
-                self.alpha_mask = np.fliplr(self.alpha_mask)
-                logger.info("Applied horizontal flip for face-down printing")
 
             # DISABLED: Smoothing can reduce detail in high-res images
             # The continuous heightmap creates smooth slopes naturally
@@ -853,8 +737,9 @@ def show_3d_preview(stl_gen):
     b64 = base64.b64encode(glb_data).decode("utf-8")
     logger.info(f"GLB size: {len(glb_data)/1024/1024:.1f} MB")
 
-    use_transparency = stl_gen.use_exploded or stl_gen.use_exploded_multi or stl_gen.use_exploded_cmyk
-    html = _build_viewer_html(b64, use_transparency=use_transparency)
+    is_exploded = stl_gen.use_exploded or stl_gen.use_exploded_multi or stl_gen.use_exploded_cmyk
+    html = _build_viewer_html(b64, use_transparency=is_exploded, use_slider=True,
+                               default_gap=2.0 if is_exploded else 0.0)
 
     with tempfile.NamedTemporaryFile('w', suffix='.html', delete=False) as f:
         f.write(html)
@@ -864,7 +749,7 @@ def show_3d_preview(stl_gen):
     webbrowser.open('file://' + tmp_path)
 
 
-def _build_viewer_html(b64_glb, use_transparency=False):
+def _build_viewer_html(b64_glb, use_transparency=False, use_slider=False, default_gap=2.0):
     """Build a self-contained HTML page with an embedded Three.js GLB viewer.
 
     Uses CDN-loaded Three.js with GLTFLoader.parse() to decode the base64
@@ -873,10 +758,13 @@ def _build_viewer_html(b64_glb, use_transparency=False):
     Args:
         b64_glb: base64-encoded GLB binary string
         use_transparency: if True, enable transparent materials with vertex alpha
+        use_slider: if True, show layer gap slider and parse S## mesh names
+        default_gap: initial gap value for the slider (0.0 for standard/flat)
 
     Returns:
         Complete HTML string
     """
+    show_controls = use_transparency or use_slider
     return f'''<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -896,12 +784,42 @@ def _build_viewer_html(b64_glb, use_transparency=False):
   }}
   #controls {{
     position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
-    display: {'flex' if use_transparency else 'none'}; align-items: center; gap: 12px;
+    display: {'flex' if show_controls else 'none'}; align-items: center; gap: 12px;
     background: rgba(0,0,0,0.6); padding: 8px 16px; border-radius: 8px;
   }}
   #controls label {{ color: #ccc; font: 13px system-ui; white-space: nowrap; }}
   #gap-slider {{ width: 200px; cursor: pointer; }}
   #gap-value {{ color: #fff; font: 13px monospace; min-width: 40px; }}
+  #color-mode {{
+    display: flex; border-radius: 4px; overflow: hidden;
+    border: 1px solid rgba(255,255,255,0.3);
+  }}
+  #color-mode button {{
+    background: rgba(255,255,255,0.08); color: rgba(255,255,255,0.5);
+    border: none; padding: 4px 14px; cursor: pointer; font: 13px system-ui;
+    white-space: nowrap; transition: background 0.15s, color 0.15s;
+  }}
+  #color-mode button:hover {{ background: rgba(255,255,255,0.15); }}
+  #color-mode button.active {{
+    background: rgba(255,255,255,0.3); color: #fff;
+    cursor: default;
+  }}
+  #info-btn {{
+    width: 22px; height: 22px; border-radius: 50%; border: 1px solid rgba(255,255,255,0.3);
+    background: rgba(255,255,255,0.08); color: rgba(255,255,255,0.5);
+    font: italic 13px Georgia, serif; cursor: pointer; display: flex;
+    align-items: center; justify-content: center; flex-shrink: 0;
+    transition: background 0.15s, color 0.15s;
+  }}
+  #info-btn:hover {{ background: rgba(255,255,255,0.2); color: #fff; }}
+  #info-tooltip {{
+    display: none; position: absolute; bottom: 60px; right: 10px;
+    background: rgba(0,0,0,0.85); color: #ddd; font: 12px/1.5 system-ui;
+    padding: 10px 14px; border-radius: 8px; max-width: 300px;
+    border: 1px solid rgba(255,255,255,0.15);
+  }}
+  #info-tooltip strong {{ color: #fff; }}
+  #info-tooltip.visible {{ display: block; }}
 </style>
 </head>
 <body>
@@ -909,8 +827,17 @@ def _build_viewer_html(b64_glb, use_transparency=False):
 <div id="error"></div>
 <div id="controls">
   <label for="gap-slider">Gap:</label>
-  <input type="range" id="gap-slider" min="0" max="5" value="2" step="0.1">
-  <span id="gap-value">2.0mm</span>
+  <input type="range" id="gap-slider" min="0" max="5" value="{default_gap:.1f}" step="0.1">
+  <span id="gap-value">{default_gap:.1f}mm</span>
+  <div id="color-mode">
+    <button id="btn-realistic" class="active">Realistic</button>
+    <button id="btn-filaments">Filaments</button>
+  </div>
+  <button id="info-btn">i</button>
+</div>
+<div id="info-tooltip">
+  <strong>Realistic</strong> &mdash; Simulates light passing through stacked filament layers (Beer-Lambert), showing how the print will actually look when backlit.<br><br>
+  <strong>Filaments</strong> &mdash; Shows the raw filament colour for each layer, so you can see which filament is assigned where. Layers separate slightly for visibility.
 </div>
 
 <script type="importmap">
@@ -959,9 +886,12 @@ controls.dampingFactor = 0.12;
 // Parse GLB
 const loader = new GLTFLoader();
 const useTransparency = {'true' if use_transparency else 'false'};
+const useSlider = {'true' if use_slider else 'false'};
 
-// Track sandwich meshes for gap slider repositioning
-const sandwichMeshes = [];  // {{mesh, sandwichIndex}}
+// Track meshes for slider + color toggle
+const layerMeshes = [];  // {{mesh, idx, filamentColor, realisticColors}}
+let showFilamentColors = false;
+let gapBeforeFilamentMode = null;  // stored gap when entering filament mode
 
 loader.parse(buf.buffer, '', (gltf) => {{
   gltf.scene.traverse((child) => {{
@@ -975,19 +905,48 @@ loader.parse(buf.buffer, '', (gltf) => {{
         if (opacity > 1.0) opacity = opacity / 255.0;
       }}
 
+      // Parse layer index from mesh name for polygon offset
+      let layerIdx = 0;
+      const idxMatch = child.name.match(/^S(\\d+)/);
+      if (idxMatch) layerIdx = parseInt(idxMatch[1], 10);
+
       child.material = new THREE.MeshBasicMaterial({{
         vertexColors: true,
         transparent: hasAlpha,
         opacity: opacity,
         depthWrite: !hasAlpha,
         side: hasAlpha ? THREE.DoubleSide : THREE.FrontSide,
+        polygonOffset: true,
+        polygonOffsetFactor: -layerIdx,
+        polygonOffsetUnits: -layerIdx,
       }});
+      child.renderOrder = layerIdx;
 
-      // Parse sandwich index from mesh name (e.g. "S01_Black_L1" → 0)
-      if (useTransparency) {{
-        const m = child.name.match(/^S(\\d+)/);
+      // Parse mesh name: "S01_Name_Crrggbb" or "S01_Name_L1"
+      if (useSlider) {{
+        const m = idxMatch;
         if (m) {{
-          sandwichMeshes.push({{ mesh: child, idx: parseInt(m[1], 10) - 1 }});
+          const entry = {{ mesh: child, idx: parseInt(m[1], 10) - 1,
+                          filamentColor: null, realisticColors: null }};
+
+          // Extract filament hex color from name (e.g. "_Cff6f4f")
+          const cm = child.name.match(/_C([0-9a-f]{{6}})$/i);
+          if (cm && colorAttr) {{
+            const hex = cm[1];
+            const ri = parseInt(hex.slice(0,2), 16);
+            const gi = parseInt(hex.slice(2,4), 16);
+            const bi = parseInt(hex.slice(4,6), 16);
+            // Store both int (0-255) and float (0-1) for different array types
+            entry.filamentColor = [ri, gi, bi];
+            entry.filamentColorF = [ri / 255, gi / 255, bi / 255];
+
+            // Save realistic (Beer-Lambert) vertex colors
+            const arr = colorAttr.array;
+            entry.realisticColors = new Float32Array(arr.length);
+            entry.realisticColors.set(arr);
+          }}
+
+          layerMeshes.push(entry);
         }}
       }}
     }}
@@ -1019,15 +978,49 @@ loader.parse(buf.buffer, '', (gltf) => {{
   el.style.display = 'block';
 }});
 
-// Gap slider: reposition sandwich meshes along Z
+// Gap slider: reposition meshes along Z
 function updateGap() {{
   const slider = document.getElementById('gap-slider');
   const label = document.getElementById('gap-value');
   if (!slider) return;
   const gap = parseFloat(slider.value);
   label.textContent = gap.toFixed(1) + 'mm';
-  for (const {{ mesh, idx }} of sandwichMeshes) {{
-    mesh.position.z = idx * gap;
+  for (const entry of layerMeshes) {{
+    entry.mesh.position.z = entry.idx * gap;
+  }}
+}}
+
+// Color toggle: switch between realistic (Beer-Lambert) and solid filament colors
+function applyColorMode() {{
+  const btnR = document.getElementById('btn-realistic');
+  const btnF = document.getElementById('btn-filaments');
+  if (btnR && btnF) {{
+    btnR.classList.toggle('active', !showFilamentColors);
+    btnF.classList.toggle('active', showFilamentColors);
+  }}
+
+  for (const entry of layerMeshes) {{
+    if (!entry.filamentColor || !entry.realisticColors) continue;
+    const colorAttr = entry.mesh.geometry.attributes.color;
+    if (!colorAttr) continue;
+    const arr = colorAttr.array;
+    const itemSize = colorAttr.itemSize;
+    const count = colorAttr.count;
+
+    if (showFilamentColors) {{
+      // Use int (0-255) for Uint8/Uint16 arrays, float (0-1) for Float arrays
+      const useInt = arr instanceof Uint8Array || arr instanceof Uint16Array
+                     || arr instanceof Uint8ClampedArray;
+      const [r, g, b] = useInt ? entry.filamentColor : entry.filamentColorF;
+      for (let i = 0; i < count; i++) {{
+        arr[i * itemSize] = r;
+        arr[i * itemSize + 1] = g;
+        arr[i * itemSize + 2] = b;
+      }}
+    }} else {{
+      arr.set(entry.realisticColors);
+    }}
+    colorAttr.needsUpdate = true;
   }}
 }}
 
@@ -1036,13 +1029,51 @@ if (slider) {{
   slider.addEventListener('input', () => {{
     updateGap();
     // Re-center camera target on the midpoint of the stack
-    if (sandwichMeshes.length > 0) {{
-      const maxIdx = Math.max(...sandwichMeshes.map(s => s.idx));
+    if (layerMeshes.length > 0) {{
+      const maxIdx = Math.max(...layerMeshes.map(s => s.idx));
       const gap = parseFloat(slider.value);
       const midZ = (maxIdx * gap) / 2;
       controls.target.z = midZ;
     }}
   }});
+}}
+
+// Segmented control: Realistic / Filaments
+function setColorMode(filaments) {{
+  if (showFilamentColors === filaments) return;
+  const slider = document.getElementById('gap-slider');
+
+  if (filaments && slider) {{
+    // Entering filament mode: save current gap, apply minimum gap so layers are visible
+    gapBeforeFilamentMode = parseFloat(slider.value);
+    if (gapBeforeFilamentMode < 0.5) {{
+      slider.value = '0.5';
+      updateGap();
+    }}
+  }} else if (!filaments && slider && gapBeforeFilamentMode !== null) {{
+    // Leaving filament mode: restore previous gap
+    slider.value = String(gapBeforeFilamentMode);
+    gapBeforeFilamentMode = null;
+    updateGap();
+  }}
+
+  showFilamentColors = filaments;
+  applyColorMode();
+}}
+
+const btnR = document.getElementById('btn-realistic');
+const btnF = document.getElementById('btn-filaments');
+if (btnR) btnR.addEventListener('click', () => setColorMode(false));
+if (btnF) btnF.addEventListener('click', () => setColorMode(true));
+
+const infoBtn = document.getElementById('info-btn');
+const infoTip = document.getElementById('info-tooltip');
+if (infoBtn && infoTip) {{
+  infoBtn.addEventListener('click', (e) => {{
+    e.stopPropagation();
+    infoTip.classList.toggle('visible');
+  }});
+  document.addEventListener('click', () => infoTip.classList.remove('visible'));
 }}
 
 window.addEventListener('resize', () => {{
@@ -1087,7 +1118,7 @@ def main():
     parser.add_argument('-d', '--min-delta-e', type=float, default=None,
                         help='Min color difference delta-E between filaments (default: 5.0)')
     parser.add_argument('--mode', type=str, default=None,
-                        choices=['standard', 'cap-layers', 'face-down', 'face-down-cap',
+                        choices=['standard', 'flat', 'flat-cap',
                                  'exploded', 'exploded-multi', 'exploded-cmyk'],
                         help='Generation mode (default: standard)')
     parser.add_argument('--sandwich-layers', type=int, default=None,
@@ -1181,23 +1212,22 @@ def main():
         else:
             print("\nAvailable modes:")
             print("  1. standard        - Multi-color stacked topographical STLs")
-            print("  2. cap-layers      - Black base + auto colors + clear top")
-            print("  3. face-down       - Flat voxel grid, flip after printing")
-            print("  4. face-down-cap   - Face-down with cap layers")
-            print("  5. exploded        - Each color as standalone transparent sandwich")
-            print("  6. exploded-multi  - Up to 3 colors per sandwich, higher fidelity")
-            print("  7. exploded-cmyk   - 4 CMYK primaries, max 8 sandwiches")
+            print("  2. flat            - Flat color slabs, multi-color per pixel")
+            print("  3. flat-cap        - Flat + transparent cap layer")
+            print("  4. exploded        - Each color as standalone transparent sandwich")
+            print("  5. exploded-multi  - Up to 3 colors per sandwich, higher fidelity")
+            print("  6. exploded-cmyk   - 4 CMYK primaries, max 8 sandwiches")
             mode_choice = input("Select mode [1]: ").strip() or "1"
             mode_map = {
-                '1': 'standard', '2': 'cap-layers', '3': 'face-down',
-                '4': 'face-down-cap', '5': 'exploded', '6': 'exploded-multi',
-                '7': 'exploded-cmyk',
+                '1': 'standard', '2': 'flat', '3': 'flat-cap',
+                '4': 'exploded', '5': 'exploded-multi',
+                '6': 'exploded-cmyk',
             }
             mode = mode_map.get(mode_choice, mode_choice)  # Accept number or name
 
         # Derive boolean flags from mode
-        use_cap_layers = mode in ('cap-layers', 'face-down-cap')
-        use_face_down = mode in ('face-down', 'face-down-cap')
+        use_flat = mode == 'flat'
+        use_flat_cap = mode == 'flat-cap'
         use_exploded = mode == 'exploded'
         use_exploded_multi = mode == 'exploded-multi'
         use_exploded_cmyk = mode == 'exploded-cmyk'
@@ -1209,9 +1239,9 @@ def main():
         elif color_count is None and not exploded_any:
             color_count = prompt_with_default("Number of colors/filaments", 4, int)
 
-        if not exploded_any and use_cap_layers and color_count < 3:
-            logger.warning("Cap layers requires at least 3 colors. Setting to 3.")
-            color_count = 3
+        if not exploded_any and use_flat_cap and color_count < 2:
+            logger.warning("Flat-cap requires at least 2 colors. Setting to 2.")
+            color_count = 2
 
         # Resolve sandwich_layers (color layers per sandwich in exploded modes)
         if args.sandwich_layers is not None:
@@ -1224,9 +1254,11 @@ def main():
         # Resolve fill (transparent fill in exploded sandwiches)
         use_fill = (args.fill.lower() in ('y', 'yes', 'true', '1')) if args.fill is not None else False
 
-        # Resolve base_layers (transparent base layers per sandwich / cap layers in cap-layers mode)
+        # Resolve base_layers (transparent base layers per sandwich / cap layers in flat-cap mode)
         if args.base_layers is not None:
             base_layers = args.base_layers
+        elif use_flat_cap:
+            base_layers = 1
         elif exploded_any:
             base_layers = 3
         else:
@@ -1253,7 +1285,7 @@ def main():
         # 2. Load and prepare image
         # For exploded mode, use placeholder color_count; auto-determine after loading
         img_processor = ImageProcessor(args.image, width, color_count or 4)
-        img_processor.load_and_prepare(nozzle_diameter=nozzle_diameter, face_down=use_face_down)
+        img_processor.load_and_prepare(nozzle_diameter=nozzle_diameter)
 
         if exploded_any and not use_exploded_cmyk and color_count is None:
             # Iterative color count optimization: try K=3..max_k, score each by
@@ -1380,13 +1412,11 @@ def main():
                 model_height=model_height,
             )
         else:
-            # Cap layers: black base + auto colors + clear top
             selected_filaments = filament_lib.select_best_filaments(
                 dominant_colors_lab, color_count,
                 layer_height=layer_height,
                 min_color_difference=min_color_difference,
-                use_cap_layers=use_cap_layers,
-                use_face_down=use_face_down
+                use_flat_cap=use_flat_cap,
             )
 
         logger.info("Selected filaments:")
@@ -1415,9 +1445,9 @@ def main():
                 grayscale, width, layer_height, model_height,
                 selected_filaments,
                 alpha_mask=img_processor.alpha_mask,
-                use_cap_layers=use_cap_layers,
+                use_flat=use_flat,
                 image_rgb=img_processor.image,
-                use_face_down=use_face_down,
+                use_flat_cap=use_flat_cap,
                 use_exploded=use_exploded,
                 use_exploded_multi=use_exploded_multi,
                 use_exploded_cmyk=use_exploded_cmyk,
@@ -1463,8 +1493,7 @@ def main():
                         dominant_colors_lab, color_count,
                         layer_height=layer_height,
                         min_color_difference=min_color_difference,
-                        use_cap_layers=use_cap_layers,
-                        use_face_down=use_face_down,
+                        use_flat_cap=use_flat_cap,
                         randomize=False
                     )
                 logger.info("New filaments selected:")
@@ -1494,9 +1523,9 @@ def main():
             model_height,
             selected_filaments,
             alpha_mask=img_processor.alpha_mask,
-            use_cap_layers=use_cap_layers,
+            use_flat=use_flat,
             image_rgb=img_processor.image,
-            use_face_down=use_face_down,
+            use_flat_cap=use_flat_cap,
             use_exploded=use_exploded,
             use_exploded_multi=use_exploded_multi,
             use_exploded_cmyk=use_exploded_cmyk,
@@ -1508,45 +1537,6 @@ def main():
 
         generated_files = stl_gen.generate_all(output_path)
         logger.info(f"Generated {len(generated_files)} STL file(s)")
-
-        # Show Beer-Lambert preview for face-down mode
-        if use_face_down and hasattr(stl_gen, 'face_down_pixel_height'):
-            logger.info("Rendering face-down Beer-Lambert preview...")
-            if hasattr(stl_gen, 'face_down_cap_height'):
-                # Face-down + cap layers: use combined preview renderer
-                preview_rgb = stl_gen._render_face_down_cap_preview(
-                    stl_gen.face_down_pixel_height, stl_gen.face_down_z_boundaries,
-                    stl_gen.face_down_image_filaments, stl_gen.face_down_transparent_filament,
-                    stl_gen.face_down_cap_height
-                )
-            else:
-                preview_rgb = stl_gen._render_face_down_preview(
-                    stl_gen.face_down_pixel_height, stl_gen.face_down_z_boundaries,
-                    stl_gen.face_down_filaments
-                )
-            preview_path = output_path.with_name(output_path.stem + '_preview.png')
-
-            import matplotlib.pyplot as plt
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 7))
-
-            original_display = np.flipud(img_processor.image)
-            if use_face_down:
-                original_display = np.fliplr(original_display)
-            ax1.imshow(original_display)
-            ax1.set_title('Original Image', fontsize=14)
-            ax1.axis('off')
-
-            preview_display = np.flipud(preview_rgb)
-            if use_face_down:
-                preview_display = np.fliplr(preview_display)
-            ax2.imshow(preview_display)
-            ax2.set_title('Face-Down Preview (viewed from bed side)', fontsize=14)
-            ax2.axis('off')
-
-            plt.tight_layout()
-            plt.savefig(str(preview_path), dpi=150, bbox_inches='tight')
-            plt.close()
-            logger.info(f"Preview saved to {preview_path}")
 
         # 8. Generate description file
         desc_path = output_path.with_suffix('.txt')
@@ -1617,24 +1607,21 @@ def main():
                 f.write(f"4. Print as a single {layers_total}-layer print\n\n")
                 f.write("After printing all sandwiches:\n")
                 f.write("5. Stack all sandwiches in order and backlight for effect\n")
-            elif use_face_down and use_cap_layers:
-                f.write("FACE-DOWN + CAP LAYERS MODE\n")
+            elif use_flat_cap:
+                f.write("FLAT-CAP MODE\n")
+                f.write("Flat color slabs with multi-color per pixel + transparent cap.\n\n")
                 f.write("1. Load all STL files into slicer at once\n")
                 f.write("2. Right-click each part and assign the corresponding filament\n")
-                f.write("3. The transparent cap prints first (on the bed, 100% solid)\n")
-                f.write("4. Image colors and negative fill print on top of the cap\n")
-                f.write("5. The model is completely flat — no topographical surface\n")
-                f.write("6. After printing, flip the model over for display\n")
-                f.write("7. The bed-side surface (smooth transparent cap) becomes the viewing side\n")
-                f.write("8. Backlight for best effect\n")
-            elif use_face_down:
-                f.write("FACE-DOWN MODE\n")
+                f.write("3. Print flat (geometry is already optimized)\n")
+                f.write(f"4. Transparent cap is {base_layers} layer(s) on top\n")
+                f.write("5. Backlight for best effect\n")
+            elif use_flat:
+                f.write("FLAT MODE\n")
+                f.write("Flat color slabs with multi-color per pixel.\n\n")
                 f.write("1. Load all STL files into slicer at once\n")
                 f.write("2. Right-click each part and assign the corresponding filament\n")
-                f.write("3. Print flat on bed (clear/light filament goes first)\n")
-                f.write("4. After printing, flip the model over for display\n")
-                f.write("5. The bed-side surface (smooth) becomes the viewing side\n")
-                f.write("6. Backlight for best effect\n")
+                f.write("3. Print flat (geometry is already optimized)\n")
+                f.write("4. Backlight for best effect\n")
             else:
                 f.write("1. Load all STL files into slicer at once\n")
                 f.write("2. Right-click each part and assign the corresponding filament\n")

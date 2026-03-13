@@ -26,8 +26,8 @@ class STLGenerator:
     """
 
     def __init__(self, image_grayscale, width_mm, layer_height, model_height,
-                 selected_filaments, alpha_mask=None, use_cap_layers=False, image_rgb=None,
-                 contrast_strength=2.0, use_face_down=False, use_exploded=False,
+                 selected_filaments, alpha_mask=None, use_flat=False, image_rgb=None,
+                 contrast_strength=2.0, use_flat_cap=False, use_exploded=False,
                  use_exploded_multi=False, use_exploded_cmyk=False, sandwich_layers=1,
                  use_fill=False, base_layers=3, max_color_sandwiches=None):
         """
@@ -38,10 +38,10 @@ class STLGenerator:
             model_height: Total model height in mm (e.g., 2.0)
             selected_filaments: DataFrame of selected filaments (sorted dark to light)
             alpha_mask: Optional transparency mask
-            use_cap_layers: If True, add flat base + negative + flat top
+            use_flat: If True, generate flat color slabs with multi-color per pixel
             image_rgb: Full RGB image for color matching (HxWx3 array, 0-1 range)
             contrast_strength: S-curve contrast boost (1.0=none, 2.0=moderate, 3.0=strong)
-            use_face_down: If True, generate flat voxel grid for face-down printing
+            use_flat_cap: If True, flat mode + transparent cap layer
             use_exploded: If True, generate standalone single-color sandwiches
             use_exploded_multi: If True, generate multi-color sandwiches (up to 3 colors each)
             max_color_sandwiches: Max sandwiches per colour in exploded modes (None = use mode default)
@@ -53,8 +53,8 @@ class STLGenerator:
         self.model_height = model_height
         self.selected_filaments = selected_filaments
         self.alpha_mask = alpha_mask if alpha_mask is not None else np.ones_like(image_grayscale)
-        self.use_cap_layers = use_cap_layers
-        self.use_face_down = use_face_down
+        self.use_flat = use_flat
+        self.use_flat_cap = use_flat_cap
         self.use_exploded = use_exploded
         self.use_exploded_multi = use_exploded_multi
         self.use_exploded_cmyk = use_exploded_cmyk
@@ -123,12 +123,8 @@ class STLGenerator:
 
         return enhanced
 
-    def _sort_filaments_by_luminosity(self, cap_layers_sort=False):
+    def _sort_filaments_by_luminosity(self):
         """Sort filaments by LAB luminosity (dark to light).
-
-        Args:
-            cap_layers_sort: If True, keep first (base) and last (clear) in place,
-                             sort only middle filaments by luminosity.
 
         Returns:
             DataFrame of sorted filaments (reset index)
@@ -136,17 +132,7 @@ class STLGenerator:
         sorted_filaments = self.selected_filaments.copy()
         sorted_filaments['luminosity'] = sorted_filaments['lab'].apply(
             lambda x: float(np.asarray(x).flat[0]))
-
-        if cap_layers_sort:
-            middle = sorted_filaments.iloc[1:-1].sort_values('luminosity').reset_index(drop=True)
-            sorted_filaments = pd.concat([
-                sorted_filaments.iloc[:1],
-                middle,
-                sorted_filaments.iloc[-1:]
-            ]).reset_index(drop=True)
-        else:
-            sorted_filaments = sorted_filaments.sort_values('luminosity').reset_index(drop=True)
-
+        sorted_filaments = sorted_filaments.sort_values('luminosity').reset_index(drop=True)
         return sorted_filaments
 
     def _allocate_layers_td_proportional(self, filament_tds, total_layers):
@@ -180,14 +166,13 @@ class STLGenerator:
 
         return layer_counts, layer_boundaries, z_boundaries
 
-    def _compute_heightmap(self, enhanced_grayscale, alpha_pixels, max_height, invert=False):
+    def _compute_heightmap(self, enhanced_grayscale, alpha_pixels, max_height):
         """Compute per-pixel height from contrast-enhanced grayscale.
 
         Args:
             enhanced_grayscale: 2D array of contrast-enhanced brightness (0-1)
             alpha_pixels: 2D boolean mask of valid pixels
             max_height: Maximum height in mm
-            invert: If True, dark pixels are tall (for face-down mode)
 
         Returns:
             2D array of per-pixel heights in mm (0 for transparent pixels)
@@ -196,10 +181,7 @@ class STLGenerator:
         min_height = 2 * self.layer_height
         normalized = enhanced_grayscale / max(global_brightness_max, 1e-6)
 
-        if invert:
-            pixel_height = min_height + (1.0 - normalized) * (max_height - min_height)
-        else:
-            pixel_height = min_height + normalized * (max_height - min_height)
+        pixel_height = min_height + normalized * (max_height - min_height)
 
         pixel_height = np.clip(pixel_height, min_height, max_height)
         pixel_height = np.where(alpha_pixels, pixel_height, 0)
@@ -298,7 +280,7 @@ class STLGenerator:
             return mesh_outputs
         return generated_files
 
-    def _vectorized_beer_lambert(self, filament_rgbs, filament_tds, thickness_combos, reverse=False):
+    def _vectorized_beer_lambert(self, filament_rgbs, filament_tds, thickness_combos):
         """Compute Beer-Lambert transmitted colors for all thickness combinations
 
         Uses corrected transmissive filter model:
@@ -308,8 +290,6 @@ class STLGenerator:
             filament_rgbs: (num_colors, 3) array of filament RGB values (0-1)
             filament_tds: (num_colors,) array of transmission distances (mm)
             thickness_combos: (n_combos, num_colors) array of thicknesses (mm)
-            reverse: If True, iterate filaments in reverse order (for face-down mode
-                     where light enters from the dark/top side first)
 
         Returns:
             (n_combos, 3) array of resulting RGB colors (0-1)
@@ -317,7 +297,7 @@ class STLGenerator:
         n_combos = len(thickness_combos)
         light = np.ones((n_combos, 3))  # White backlight
 
-        indices = range(len(filament_tds) - 1, -1, -1) if reverse else range(len(filament_tds))
+        indices = range(len(filament_tds))
         for k in indices:
             thickness = thickness_combos[:, k]  # (n_combos,)
             td = max(filament_tds[k], 0.1)
@@ -352,12 +332,8 @@ class STLGenerator:
             return self._generate_exploded_multi(output_base_path)
         if self.use_exploded:
             return self._generate_exploded(output_base_path)
-        if self.use_face_down and self.use_cap_layers:
-            return self._generate_face_down_with_cap_layers(output_base_path)
-        if self.use_face_down:
-            return self._generate_face_down(output_base_path)
-        if self.use_cap_layers:
-            return self._generate_with_cap_layers(output_base_path)
+        if self.use_flat or self.use_flat_cap:
+            return self._generate_flat(output_base_path)
         return self._generate_standard(output_base_path)
 
     def _generate_standard(self, output_base_path):
@@ -384,6 +360,262 @@ class STLGenerator:
         return self._generate_color_band_stls(
             sorted_filaments, pixel_height, z_boundaries, layer_boundaries,
             alpha_pixels, output_base_path)
+
+    def _compute_flat_layer_counts(self, sorted_filaments, total_layers, image_rgb, alpha_pixels):
+        """Compute per-pixel integer layer counts via Beer-Lambert optimization.
+
+        Each color gets a per-color cap based on TD (low TD = opaque = few layers
+        needed, high TD = translucent = more layers allowed). Combos are filtered
+        by total layers per pixel <= total_layers budget.
+
+        Args:
+            sorted_filaments: DataFrame of color filaments (sorted dark to light)
+            total_layers: int, total layer budget per pixel
+            image_rgb: HxWx3 RGB image (0-1 range)
+            alpha_pixels: 2D boolean mask of valid pixels
+
+        Returns:
+            (H, W, N) int32 array of per-pixel layer counts per filament
+        """
+        from itertools import product
+        from scipy.spatial import cKDTree
+
+        N = len(sorted_filaments)
+        H, W = alpha_pixels.shape
+
+        filament_rgbs = np.array([f['rgb'] for _, f in sorted_filaments.iterrows()])
+        filament_tds = np.array([f['transmission_distance'] for _, f in sorted_filaments.iterrows()])
+
+        # Per-color caps based on TD: low TD (opaque) needs few layers, high TD needs more
+        # Cap at 3-4 for very opaque (TD < 1), up to total_layers for very translucent
+        per_color_caps = []
+        for td in filament_tds:
+            if td < 0.5:
+                cap = 3
+            elif td < 2.0:
+                cap = 4
+            else:
+                cap = min(total_layers, max(6, int(td * 2)))
+            per_color_caps.append(min(cap, total_layers))
+
+        # Generate all combos respecting per-color caps
+        ranges = [range(0, cap + 1) for cap in per_color_caps]
+        all_combos = np.array(list(product(*ranges)))  # (n_combos, N)
+
+        # Filter: total layers per pixel <= budget
+        combo_totals = all_combos.sum(axis=1)
+        valid = combo_totals <= total_layers
+        combos = all_combos[valid]
+
+        # Cap combo space at 500K by reducing largest per-color cap
+        while len(combos) > 500000:
+            max_idx = per_color_caps.index(max(per_color_caps))
+            per_color_caps[max_idx] -= 1
+            ranges = [range(0, cap + 1) for cap in per_color_caps]
+            all_combos = np.array(list(product(*ranges)))
+            combo_totals = all_combos.sum(axis=1)
+            combos = all_combos[combo_totals <= total_layers]
+
+        n_combos = len(combos)
+
+        # Build thickness array
+        thicknesses = combos * self.layer_height  # (n_combos, N)
+
+        # Simulate Beer-Lambert for each combo
+        combo_colors_rgb = self._vectorized_beer_lambert(filament_rgbs, filament_tds, thicknesses)
+        combo_colors_lab = color.rgb2lab(combo_colors_rgb.reshape(-1, 1, 3)).reshape(-1, 3)
+
+        caps_str = ', '.join(f"{sorted_filaments.iloc[k]['name']}={per_color_caps[k]}"
+                              for k in range(N))
+        logger.info(f"Flat mode: {N} colors, budget={total_layers}, caps=[{caps_str}] "
+                     f"-> {n_combos} combos")
+
+        # Build KDTree
+        tree = cKDTree(combo_colors_lab)
+
+        # Target pixel colors in LAB
+        target_lab = color.rgb2lab(image_rgb).reshape(-1, 3)
+
+        # Find nearest combo for each pixel
+        distances, indices = tree.query(target_lab, k=1)
+
+        # Log matching quality
+        valid_mask = alpha_pixels.ravel()
+        valid_distances = distances[valid_mask]
+        logger.info(f"  Flat Beer-Lambert matching: mean deltaE={np.mean(valid_distances):.2f}, "
+                     f"median={np.median(valid_distances):.2f}, "
+                     f"95th={np.percentile(valid_distances, 95):.2f}")
+
+        # Map back to per-pixel layer counts
+        pixel_counts = combos[indices].reshape(H, W, N).astype(np.int32)
+
+        # Zero out transparent pixels
+        pixel_counts[~alpha_pixels] = 0
+
+        # Log per-color stats
+        for k in range(N):
+            name = sorted_filaments.iloc[k]['name']
+            active = pixel_counts[:, :, k][alpha_pixels]
+            max_k = int(pixel_counts[:, :, k].max())
+            mean_k = float(active.mean()) if len(active) > 0 else 0
+            pixel_count = int((pixel_counts[:, :, k] > 0).sum())
+            logger.info(f"  {name}: max {max_k} layers, mean {mean_k:.1f}, "
+                         f"{pixel_count} pixels ({pixel_count / max(alpha_pixels.sum(), 1) * 100:.1f}%)")
+
+        return pixel_counts
+
+    def _render_flat_preview(self, pixel_counts, sorted_filaments,
+                              transparent_filament=None, cap_layers=0):
+        """Render Beer-Lambert preview from per-pixel layer counts.
+
+        White backlight passes through each color at per-pixel varying thickness.
+
+        Args:
+            pixel_counts: (H, W, N) int32 array of per-pixel layer counts
+            sorted_filaments: DataFrame of color filaments (dark to light)
+            transparent_filament: Series for transparent filament (flat-cap only)
+            cap_layers: Number of transparent cap layers (flat-cap only)
+
+        Returns:
+            HxWx3 RGB preview image (0-1 range)
+        """
+        H, W = pixel_counts.shape[:2]
+        light = np.ones((H, W, 3))  # White backlight
+
+        for k in range(len(sorted_filaments)):
+            filament = sorted_filaments.iloc[k]
+            td = max(filament['transmission_distance'], 0.1)
+            rgb = np.array(filament['rgb'])
+            thickness = pixel_counts[:, :, k] * self.layer_height  # (H, W) varying
+
+            transmission = np.exp(-thickness / td)  # (H, W)
+            transmission = transmission[:, :, np.newaxis]  # (H, W, 1)
+
+            light = light * transmission + rgb * (1.0 - transmission)
+
+        # Apply transparent cap if present
+        if transparent_filament is not None and cap_layers > 0:
+            trans_td = max(transparent_filament['transmission_distance'], 0.1)
+            trans_rgb = np.array(transparent_filament['rgb'])
+            cap_thickness = cap_layers * self.layer_height
+            transmission = np.exp(-cap_thickness / trans_td)
+            light = light * transmission + trans_rgb * (1.0 - transmission)
+
+        return np.clip(light, 0, 1)
+
+    def _generate_flat(self, output_base_path):
+        """Generate flat mode with per-pixel varying layer counts via Beer-Lambert.
+
+        For each pixel, finds the optimal integer layer count (0..max) per filament
+        that best reproduces the target color. Colors stack cumulatively per-pixel:
+        color k's z_bottom = sum of layers 0..k-1 at that pixel × layer_height.
+
+        If use_flat_cap: separates transparent filament, adds transparent fill in gaps
+        and cap layer on top.
+        """
+        generated_files = []
+
+        if self.use_flat_cap:
+            logger.info("Generating flat-cap mode: flat color slabs + transparent cap")
+            sorted_filaments = self._sort_filaments_by_luminosity()
+            transparent_filament = sorted_filaments.iloc[-1]
+            color_filaments = sorted_filaments.iloc[:-1].reset_index(drop=True)
+
+            cap_layers = self.base_layers
+            cap_height_layers = cap_layers
+            color_total_layers = self.num_layers - cap_layers
+
+            logger.info(f"Transparent (cap + fill): {transparent_filament['name']} "
+                         f"(TD={transparent_filament['transmission_distance']:.1f})")
+            logger.info(f"Color filaments: {len(color_filaments)}, "
+                         f"cap layers: {cap_layers}, color layers: {color_total_layers}")
+        else:
+            logger.info("Generating flat mode: multi-level per pixel")
+            color_filaments = self._sort_filaments_by_luminosity()
+            transparent_filament = None
+            cap_layers = 0
+            cap_height_layers = 0
+            color_total_layers = self.num_layers
+
+        alpha_pixels = self.alpha_mask >= 0.5
+
+        # Compute per-pixel layer counts via budget-constrained Beer-Lambert optimization
+        pixel_counts = self._compute_flat_layer_counts(
+            color_filaments, color_total_layers, self.image_rgb, alpha_pixels)
+
+        # Cumulative per-pixel stacking: each color sits on top of the previous
+        N = len(color_filaments)
+        z_cursor = np.zeros_like(self.image_grayscale)
+
+        for k in range(N):
+            filament = color_filaments.iloc[k]
+            color_name = filament['name'].replace(' ', '_').replace('/', '_')
+
+            z_bottom_k = z_cursor.copy()
+            z_top_k = z_bottom_k + pixel_counts[:, :, k] * self.layer_height
+
+            pixel_mask = pixel_counts[:, :, k] > 0
+            pixel_count = int(pixel_mask.sum())
+
+            if pixel_count > 0:
+                output_path = output_base_path.parent / f"{output_base_path.stem}_{color_name}.stl"
+                mesh = self._generate_quantized_stl(z_bottom_k, z_top_k, pixel_mask)
+                if len(mesh.vertices) > 0:
+                    mesh.export(str(output_path))
+                    generated_files.append((output_path, filament['name'], k, k + 1))
+                    max_layers = int(pixel_counts[:, :, k].max())
+                    logger.info(f"  {color_name}: max {max_layers} layers, {pixel_count} pixels")
+            else:
+                logger.warning(f"  No pixels for {color_name} - skipping")
+
+            # Advance cursor for all pixels (even those with 0 layers for this color)
+            z_cursor = z_top_k
+
+        # Flat-cap: generate transparent fill + cap as single STL
+        if self.use_flat_cap and transparent_filament is not None:
+            color_name = transparent_filament['name'].replace(' ', '_').replace('/', '_')
+            output_path = output_base_path.parent / f"{output_base_path.stem}_{color_name}.stl"
+
+            vertices_list = []
+            faces_list = []
+            vertex_offset = 0
+
+            # Per-pixel total color height = z_cursor after all colors
+            # Fill from z_cursor up to max total height across all pixels
+            max_color_height = float(np.max(z_cursor[alpha_pixels])) if alpha_pixels.any() else 0.0
+
+            # Transparent fill: from per-pixel color top to max color height
+            fill_z_bottom = z_cursor
+            fill_z_top = np.where(alpha_pixels, max_color_height, 0.0)
+            fill_mask = alpha_pixels & (fill_z_top > fill_z_bottom + self.layer_height * 0.5)
+
+            if fill_mask.any():
+                fill_mesh = self._generate_quantized_stl(fill_z_bottom, fill_z_top, fill_mask)
+                if len(fill_mesh.vertices) > 0:
+                    vertices_list.append(fill_mesh.vertices)
+                    faces_list.append(fill_mesh.faces + vertex_offset)
+                    vertex_offset += len(fill_mesh.vertices)
+
+            # Cap layer on top of max color height
+            cap_z_bottom = np.where(alpha_pixels, max_color_height, 0.0)
+            cap_z_top = np.where(alpha_pixels, max_color_height + cap_height_layers * self.layer_height, 0.0)
+            cap_mask = alpha_pixels
+            cap_mesh = self._generate_quantized_stl(cap_z_bottom, cap_z_top, cap_mask)
+            if len(cap_mesh.vertices) > 0:
+                vertices_list.append(cap_mesh.vertices)
+                faces_list.append(cap_mesh.faces + vertex_offset)
+
+            if vertices_list:
+                combined_vertices = np.vstack(vertices_list)
+                combined_faces = np.vstack(faces_list)
+                combined_mesh = trimesh.Trimesh(
+                    vertices=combined_vertices, faces=combined_faces, process=False)
+                combined_mesh.export(str(output_path))
+                generated_files.append((output_path, transparent_filament['name'], N, N + 1))
+                logger.info(f"  Transparent fill + cap: {cap_height_layers} cap layers")
+
+        logger.info(f"Flat mode: generated {len(generated_files)} STL files")
+        return generated_files
 
     def _compute_exploded_layer_counts(self, color_filaments, transparent_filament,
                                        max_layers_per_pixel, per_color_caps):
@@ -824,9 +1056,9 @@ class STLGenerator:
     def generate_preview_scene(self):
         """Generate a trimesh.Scene with colored meshes for interactive 3D preview
 
-        Mirrors the heightmap pipeline from generate_all() / _generate_face_down()
-        and returns a Scene instead of exporting STLs. Downsamples to ~100K pixels
-        for browser-renderable mesh size while preserving good detail.
+        Mirrors the heightmap pipeline from generate_all() and returns a Scene
+        instead of exporting STLs. Downsamples to ~100K pixels for browser-renderable
+        mesh size while preserving good detail.
 
         Returns:
             trimesh.Scene with one colored mesh per filament
@@ -842,107 +1074,108 @@ class STLGenerator:
         ds = max(1, int(sqrt(H * W / 100000)))
         ds_grayscale = self.image_grayscale[::ds, ::ds]
         ds_alpha = self.alpha_mask[::ds, ::ds]
+        ds_image_rgb = self.image_rgb[::ds, ::ds] if self.image_rgb is not None else None
         ds_H, ds_W = ds_grayscale.shape
         ds_pixel_size = self.width_mm / ds_W
 
         logger.info(f"3D preview: {H}x{W} -> {ds_H}x{ds_W} (ds={ds}), "
                      f"pixel_size={ds_pixel_size:.3f}mm")
 
-        # Sort dark-to-light (same as generate_all)
-        cap_sort = self.use_cap_layers and not self.use_face_down
-        sorted_filaments = self._sort_filaments_by_luminosity(cap_layers_sort=cap_sort)
+        sorted_filaments = self._sort_filaments_by_luminosity()
 
         # Swap only pixel_size and alpha_mask (used by called methods)
         orig_pixel_size = self.pixel_size
         orig_alpha = self.alpha_mask
+        orig_rgb = self.image_rgb
+        orig_grayscale = self.image_grayscale
         try:
             self.pixel_size = ds_pixel_size
             self.alpha_mask = ds_alpha
-
-            # Contrast enhancement (uses self.alpha_mask internally)
-            enhanced = self._apply_contrast_enhancement(ds_grayscale.copy())
+            self.image_rgb = ds_image_rgb
+            self.image_grayscale = ds_grayscale
 
             alpha_pixels = ds_alpha >= 0.5
+            scene = trimesh.Scene()
 
-            if self.use_face_down and self.use_cap_layers:
-                # Face-down + cap layers: image colors exclude transparent filament
-                image_filaments = sorted_filaments.iloc[:-1].reset_index(drop=True)
-                transparent_filament = sorted_filaments.iloc[-1]
+            if self.use_flat or self.use_flat_cap:
+                # Flat modes: one mesh per color, cumulative stacking
+                if self.use_flat_cap:
+                    transparent_filament = sorted_filaments.iloc[-1]
+                    color_filaments = sorted_filaments.iloc[:-1].reset_index(drop=True)
+                    cap_layers = self.base_layers
+                    color_total_layers = self.num_layers - cap_layers
+                else:
+                    color_filaments = sorted_filaments
+                    transparent_filament = None
+                    cap_layers = 0
+                    color_total_layers = self.num_layers
 
-                cap_layers_count = self.base_layers
-                cap_height = cap_layers_count * self.layer_height
-                model_height_minus_cap = self.model_height - cap_height
+                pixel_counts = self._compute_flat_layer_counts(
+                    color_filaments, color_total_layers, ds_image_rgb, alpha_pixels)
 
-                image_tds = np.array([f['transmission_distance'] for _, f in image_filaments.iterrows()])
-                _, _, z_boundaries = self._allocate_layers_td_proportional(
-                    image_tds, self.num_layers - cap_layers_count)
-                pixel_height = self._compute_heightmap(enhanced, alpha_pixels, model_height_minus_cap)
+                # Compute Beer-Lambert preview for accurate face colors
+                preview_rgb = self._render_flat_preview(
+                    pixel_counts, color_filaments, transparent_filament, cap_layers)
+                preview_rgb = self._auto_contrast_preview(preview_rgb, alpha_pixels)
+
+                # Build one mesh per color with cumulative z stacking
+                z_cursor = np.zeros((ds_H, ds_W))
+
+                for k in range(len(color_filaments)):
+                    filament = color_filaments.iloc[k]
+                    z_bottom_k = z_cursor.copy()
+                    z_top_k = z_bottom_k + pixel_counts[:, :, k] * self.layer_height
+                    pixel_mask = pixel_counts[:, :, k] > 0
+
+                    if pixel_mask.any():
+                        mesh = self._generate_topographical_stl(z_bottom_k, z_top_k, pixel_mask)
+                        if len(mesh.vertices) > 0:
+                            self._apply_preview_face_colors(
+                                mesh, preview_rgb, ds_W, ds_H)
+                            name = filament['name'].replace(' ', '_')
+                            hex_color = '%02x%02x%02x' % tuple(
+                                (np.array(filament['rgb']) * 255).astype(int))
+                            scene.add_geometry(
+                                mesh, geom_name=f"S{k+1:02d}_{name}_C{hex_color}")
+
+                    z_cursor = z_top_k
+
             else:
+                # Standard mode: one mesh per color band
+                enhanced = self._apply_contrast_enhancement(ds_grayscale.copy())
+
                 filament_tds = np.array([f['transmission_distance'] for _, f in sorted_filaments.iterrows()])
                 _, _, z_boundaries = self._allocate_layers_td_proportional(
                     filament_tds, self.num_layers)
-                pixel_height = self._compute_heightmap(
-                    enhanced, alpha_pixels, self.model_height, invert=self.use_face_down)
+                pixel_height = self._compute_heightmap(enhanced, alpha_pixels, self.model_height)
+                min_thickness = self.layer_height * 0.5
+                combined_mask = alpha_pixels & (pixel_height > min_thickness)
 
-            scene = trimesh.Scene()
-            min_thickness = self.layer_height * 0.5
+                # Compute Beer-Lambert preview for accurate face colors
+                preview_rgb = self._render_standard_preview(
+                    pixel_height, z_boundaries, sorted_filaments)
+                preview_rgb = self._auto_contrast_preview(preview_rgb, combined_mask)
 
-            combined_mask = alpha_pixels & (pixel_height > min_thickness)
-            z_bottom_all = np.zeros_like(pixel_height)
+                for k in range(len(sorted_filaments)):
+                    filament = sorted_filaments.iloc[k]
+                    z_lo = z_boundaries[k]
+                    z_hi = z_boundaries[k + 1]
 
-            if self.use_cap_layers:
-                # Flat top for cap-layer modes (both standalone and face-down+cap)
-                z_top = np.full_like(pixel_height, self.model_height)
-            else:
-                # Topographical heightmap for standard and face-down modes
-                z_top = pixel_height
+                    # Clip pixel height to this band
+                    band_bottom = np.full_like(pixel_height, z_lo)
+                    band_top = np.clip(pixel_height, z_lo, z_hi)
+                    band_mask = combined_mask & (band_top > band_bottom + min_thickness)
 
-            z_top = np.where(combined_mask, z_top, 0)
-            mesh = self._generate_topographical_stl(z_bottom_all, z_top, combined_mask)
-
-            if len(mesh.vertices) > 0:
-                if self.use_face_down and self.use_cap_layers:
-                    preview_rgb = self._render_face_down_cap_preview(
-                        pixel_height, z_boundaries, image_filaments,
-                        transparent_filament, cap_height)
-                elif self.use_cap_layers:
-                    preview_rgb = self._render_cap_layer_preview(
-                        enhanced, sorted_filaments)
-                else:
-                    preview_rgb = self._render_face_down_preview(
-                        pixel_height, z_boundaries, sorted_filaments)
-
-                # Auto-contrast: Beer-Lambert output is physically correct but
-                # visually compressed (often near-white or near-black depending
-                # on filament TDs). Stretch to use full display range.
-                valid_pixels = preview_rgb[combined_mask]
-                if len(valid_pixels) > 0:
-                    p_lo = np.percentile(valid_pixels, 0.5)
-                    p_hi = np.percentile(valid_pixels, 99.5)
-                    rng = max(p_hi - p_lo, 0.01)
-                    preview_rgb = (preview_rgb - p_lo) / rng
-                    preview_rgb = np.clip(preview_rgb, 0, 1)
-
-                centroids = mesh.triangles_center
-                px = np.clip((centroids[:, 0] / self.pixel_size).astype(int),
-                             0, ds_W - 1)
-                py = np.clip((centroids[:, 1] / self.pixel_size).astype(int),
-                             0, ds_H - 1)
-
-                face_colors = np.zeros((len(mesh.faces), 4), dtype=np.uint8)
-                face_colors[:, :3] = (preview_rgb[py, px] * 255).astype(np.uint8)
-                face_colors[:, 3] = 255
-                mesh.visual.face_colors = face_colors
-
-                if self.use_face_down:
-                    # Flip to show as-printed view: bed surface up + undo fliplr
-                    max_x = float(np.max(mesh.vertices[:, 0]))
-                    max_z = float(np.max(mesh.vertices[:, 2]))
-                    mesh.vertices[:, 0] = max_x - mesh.vertices[:, 0]
-                    mesh.vertices[:, 2] = max_z - mesh.vertices[:, 2]
-                    mesh.fix_normals()
-
-                scene.add_geometry(mesh, geom_name='preview')
+                    if band_mask.any():
+                        mesh = self._generate_topographical_stl(band_bottom, band_top, band_mask)
+                        if len(mesh.vertices) > 0:
+                            self._apply_preview_face_colors(
+                                mesh, preview_rgb, ds_W, ds_H)
+                            name = filament['name'].replace(' ', '_')
+                            hex_color = '%02x%02x%02x' % tuple(
+                                (np.array(filament['rgb']) * 255).astype(int))
+                            scene.add_geometry(
+                                mesh, geom_name=f"S{k+1:02d}_{name}_C{hex_color}")
 
             logger.info(f"3D preview scene: {len(scene.geometry)} meshes")
             return scene
@@ -950,6 +1183,80 @@ class STLGenerator:
         finally:
             self.pixel_size = orig_pixel_size
             self.alpha_mask = orig_alpha
+            self.image_rgb = orig_rgb
+            self.image_grayscale = orig_grayscale
+
+    def _render_standard_preview(self, pixel_height, z_boundaries, sorted_filaments):
+        """Render Beer-Lambert preview for standard topographical mode.
+
+        Light passes through each color band based on per-pixel thickness.
+
+        Args:
+            pixel_height: 2D array of per-pixel heights (mm)
+            z_boundaries: 1D array of color band boundaries (mm)
+            sorted_filaments: DataFrame of filaments (dark to light)
+
+        Returns:
+            HxWx3 RGB preview image (0-1 range)
+        """
+        H, W = pixel_height.shape
+        num_colors = len(sorted_filaments)
+
+        filament_rgbs = np.array([f['rgb'] for _, f in sorted_filaments.iterrows()])
+        filament_tds = np.array([f['transmission_distance'] for _, f in sorted_filaments.iterrows()])
+
+        light = np.ones((H, W, 3))  # White backlight
+
+        for i in range(num_colors):
+            z_lo = z_boundaries[i]
+            z_hi = z_boundaries[i + 1]
+
+            thickness = np.clip(pixel_height, z_lo, z_hi) - z_lo
+            td = max(filament_tds[i], 0.1)
+            rgb = filament_rgbs[i]
+
+            transmission = np.exp(-thickness / td)
+            transmission_3d = transmission[:, :, np.newaxis]
+            light = light * transmission_3d + rgb * (1.0 - transmission_3d)
+
+        return np.clip(light, 0, 1)
+
+    def _auto_contrast_preview(self, preview_rgb, valid_mask):
+        """Auto-contrast stretch Beer-Lambert preview to use full display range.
+
+        Args:
+            preview_rgb: HxWx3 RGB image (0-1 range)
+            valid_mask: 2D boolean mask of valid pixels
+
+        Returns:
+            HxWx3 RGB image with contrast stretched
+        """
+        valid_pixels = preview_rgb[valid_mask]
+        if len(valid_pixels) > 0:
+            p_lo = np.percentile(valid_pixels, 0.5)
+            p_hi = np.percentile(valid_pixels, 99.5)
+            rng = max(p_hi - p_lo, 0.01)
+            preview_rgb = (preview_rgb - p_lo) / rng
+            preview_rgb = np.clip(preview_rgb, 0, 1)
+        return preview_rgb
+
+    def _apply_preview_face_colors(self, mesh, preview_rgb, width, height):
+        """Map Beer-Lambert preview image onto mesh faces by centroid position.
+
+        Args:
+            mesh: trimesh.Trimesh to color
+            preview_rgb: HxWx3 RGB preview image (0-1 range)
+            width: preview image width (pixels)
+            height: preview image height (pixels)
+        """
+        centroids = mesh.triangles_center
+        px = np.clip((centroids[:, 0] / self.pixel_size).astype(int), 0, width - 1)
+        py = np.clip((centroids[:, 1] / self.pixel_size).astype(int), 0, height - 1)
+
+        face_colors = np.zeros((len(mesh.faces), 4), dtype=np.uint8)
+        face_colors[:, :3] = (preview_rgb[py, px] * 255).astype(np.uint8)
+        face_colors[:, 3] = 255
+        mesh.visual.face_colors = face_colors
 
     def _generate_exploded_preview_scene(self):
         """Generate 3D preview for exploded/exploded-multi modes.
@@ -1140,141 +1447,6 @@ class STLGenerator:
             self.alpha_mask = orig_alpha
             self.image_rgb = orig_rgb
             self.image_grayscale = orig_grayscale
-
-    def _generate_with_cap_layers(self, output_base_path):
-        """Generate cap layers mode: flat base + colors + negative + flat top
-
-        Structure:
-        1. Flat base (darkest): Full layer at bottom (layers 0-1)
-        2. Color 1: Shaped areas (layers 2-8)
-        3. Color 2: Shaped areas (layers 9-15)
-        4. Color 3: Shaped areas (layers 16-22)
-        5. Clear negative: Fills gaps NOT covered by colors (layers 2-22)
-        6. Flat top (clear): Full layer at top (layers 23-25)
-
-        The negative ensures perfectly flat model throughout.
-        """
-        logger.info("Generating cap layers mode: flat base + shaped colors + negative + flat top")
-
-        enhanced_grayscale = self._apply_contrast_enhancement(self.image_grayscale.copy())
-
-        generated_files = []
-
-        # Sort middle filaments by luminosity (darkest first = most coverage)
-        # Keep base (index 0) and clear (index -1) in their fixed positions
-        sorted_filaments = self.selected_filaments.copy()
-        sorted_filaments['luminosity'] = sorted_filaments['lab'].apply(
-            lambda x: float(np.asarray(x).flat[0]))
-        middle = sorted_filaments.iloc[1:-1].sort_values('luminosity').reset_index(drop=True)
-        sorted_filaments = pd.concat([
-            sorted_filaments.iloc[:1],
-            middle,
-            sorted_filaments.iloc[-1:]
-        ]).reset_index(drop=True)
-
-        # Number of middle color layers (exclude dark base and clear top)
-        num_middle_colors = self.num_colors - 2
-
-        # Layer allocation
-        bl = self.base_layers
-        middle_layers = self.num_layers - 2 * bl
-        layers_per_color = middle_layers // num_middle_colors if num_middle_colors > 0 else 0
-
-        # 1. FLAT BASE (darkest filament)
-        darkest_filament = sorted_filaments.iloc[0]
-        color_name = darkest_filament['name'].replace(' ', '_').replace('/', '_')
-        output_path = output_base_path.parent / f"{output_base_path.stem}_{color_name}_base.stl"
-
-        logger.info(f"Generating flat base: {color_name} (layers 0-{bl})")
-
-        # Full flat layer covering all valid pixels
-        all_pixels_mask = self.alpha_mask >= 0.5
-        mesh = self._generate_flat_layer_stl(all_pixels_mask, 0, bl)
-        mesh.export(str(output_path))
-        generated_files.append((output_path, f"{darkest_filament['name']} (base)", 0, bl))
-
-        # Track which pixels are covered by colored layers (for negative calculation)
-        combined_color_mask = np.zeros_like(self.image_grayscale, dtype=bool)
-
-        # 2. MIDDLE COLOR LAYERS (shaped)
-        for i in range(num_middle_colors):
-            filament = sorted_filaments.iloc[i + 1]  # Skip darkest (used for base)
-            color_name = filament['name'].replace(' ', '_').replace('/', '_')
-            output_path = output_base_path.parent / f"{output_base_path.stem}_{color_name}.stl"
-
-            layer_start = bl + (i * layers_per_color)
-            layer_end = bl + ((i + 1) * layers_per_color)
-
-            # Brightness threshold: colored layers appear on DARK pixels
-            # (more colored material = more absorption = darker in transmission)
-            # Darkest middle color covers most area, lightest covers least
-            # Lightest middle → highest threshold (widest coverage, base tone)
-            # Darkest middle → lowest threshold (only darkest pixels, detail)
-            brightness_threshold = (i + 1) / (num_middle_colors + 1)
-
-            logger.info(f"Generating {color_name}: layers {layer_start}-{layer_end}, brightness <= {brightness_threshold:.2f}")
-
-            # Mask of pixels that get this color
-            # Cover DARK pixels where more absorption is needed
-            pixel_mask = enhanced_grayscale <= brightness_threshold
-            pixel_mask = pixel_mask & (self.alpha_mask >= 0.5)
-
-            if pixel_mask.any():
-                mesh = self._generate_flat_layer_stl(pixel_mask, layer_start, layer_end)
-                mesh.export(str(output_path))
-                generated_files.append((output_path, filament['name'], layer_start, layer_end))
-                logger.info(f"  Generated: {pixel_mask.sum()} pixels")
-
-                # Track for negative calculation
-                combined_color_mask = combined_color_mask | pixel_mask
-            else:
-                logger.warning(f"  No pixels for {color_name} - skipping")
-
-        # 3. CLEAR LAYER (combines negative fill + flat top into single STL)
-        clear_filament = sorted_filaments.iloc[-1]  # Lightest/clearest
-        color_name = clear_filament['name'].replace(' ', '_').replace('/', '_')
-        output_path = output_base_path.parent / f"{output_base_path.stem}_{color_name}.stl"
-
-        middle_layer_start = bl
-        middle_layer_end = self.num_layers
-
-        logger.info(f"Generating clear layer: {color_name} (layers {middle_layer_start}-{middle_layer_end})")
-
-        # Combine negative (gaps) with flat top
-        # Negative = pixels NOT covered by any colored layer (in middle section)
-        negative_mask = ~combined_color_mask & (self.alpha_mask >= 0.5)
-
-        # For middle section: use negative mask (fills gaps)
-        # For top section: use all pixels (flat top)
-        # Generate as single combined mesh
-        vertices_list = []
-        faces_list = []
-        vertex_offset = 0
-
-        # Part 1: Negative fill (middle layers)
-        if negative_mask.any():
-            mesh_negative = self._generate_flat_layer_stl(negative_mask, middle_layer_start, self.num_layers - bl)
-            vertices_list.append(mesh_negative.vertices)
-            faces_list.append(mesh_negative.faces + vertex_offset)
-            vertex_offset += len(mesh_negative.vertices)
-            logger.info(f"  Negative fill: {negative_mask.sum()} pixels (fills gaps in layers {middle_layer_start}-{self.num_layers - bl})")
-
-        # Part 2: Flat top (top layers)
-        mesh_top = self._generate_flat_layer_stl(all_pixels_mask, self.num_layers - bl, middle_layer_end)
-        vertices_list.append(mesh_top.vertices)
-        faces_list.append(mesh_top.faces + vertex_offset)
-        logger.info(f"  Flat top: all pixels (layers {self.num_layers - bl}-{middle_layer_end})")
-
-        # Combine into single mesh
-        if len(vertices_list) > 0:
-            combined_vertices = np.vstack(vertices_list)
-            combined_faces = np.vstack(faces_list)
-            combined_mesh = trimesh.Trimesh(vertices=combined_vertices, faces=combined_faces, process=False)
-            combined_mesh.export(str(output_path))
-            generated_files.append((output_path, clear_filament['name'], middle_layer_start, middle_layer_end))
-            logger.info(f"  Generated combined clear STL")
-
-        return generated_files
 
     @staticmethod
     def _greedy_mesh_rects(mask):
@@ -1629,320 +1801,3 @@ class STLGenerator:
         logger.info(f"    Flat layer: {original_pixels:,} pixels -> {len(rects)} rects, {len(faces)} faces")
 
         return mesh
-
-    def _render_face_down_preview(self, pixel_height, z_boundaries, sorted_filaments):
-        """Render Beer-Lambert preview of face-down print as viewed from bed side
-
-        Light enters from z=max (back/top of print, darkest filament), passes through
-        each color band based on per-pixel thickness, and exits at z=0 (bed side).
-
-        Args:
-            pixel_height: 2D array of per-pixel heights (mm)
-            z_boundaries: 1D array of color band boundaries (mm)
-            sorted_filaments: DataFrame of filaments (light-to-dark order)
-
-        Returns:
-            HxWx3 RGB preview image (0-1 range)
-        """
-        H, W = pixel_height.shape
-        num_colors = len(sorted_filaments)
-
-        filament_rgbs = np.array([f['rgb'] for _, f in sorted_filaments.iterrows()])
-        filament_tds = np.array([f['transmission_distance'] for _, f in sorted_filaments.iterrows()])
-
-        # After user flips model: light enters from z=0 (darkest) through to z=max (lightest)
-        light = np.ones((H, W, 3))  # White backlight from behind
-
-        # Process from lightest (highest z, viewing surface after flip) to darkest (lowest z, back after flip)
-        for i in range(num_colors):
-            z_lo = z_boundaries[i]
-            z_hi = z_boundaries[i + 1]
-
-            # Per-pixel thickness in this color band
-            thickness = np.clip(pixel_height, z_lo, z_hi) - z_lo
-            td = max(filament_tds[i], 0.1)
-            rgb = filament_rgbs[i]
-
-            # Beer-Lambert: transmission fraction per pixel
-            transmission = np.exp(-thickness / td)
-
-            transmission_3d = transmission[:, :, np.newaxis]
-            light = light * transmission_3d + rgb * (1.0 - transmission_3d)
-
-        return np.clip(light, 0, 1)
-
-    def _render_cap_layer_preview(self, enhanced_grayscale, sorted_filaments):
-        """Render Beer-Lambert preview for cap-layer mode
-
-        Cap layers use binary brightness thresholds (pixel has a color or not),
-        unlike standard/face-down which use continuous heightmaps.
-
-        Structure: flat base (darkest) + shaped middle colors + clear fill + flat top (lightest)
-
-        Args:
-            enhanced_grayscale: 2D array of contrast-enhanced grayscale values
-            sorted_filaments: DataFrame of filaments sorted dark-to-light
-
-        Returns:
-            HxWx3 RGB preview image (0-1 range)
-        """
-        H, W = enhanced_grayscale.shape
-        num_colors = len(sorted_filaments)
-        num_middle_colors = num_colors - 2
-
-        filament_rgbs = np.array([f['rgb'] for _, f in sorted_filaments.iterrows()])
-        filament_tds = np.array([f['transmission_distance'] for _, f in sorted_filaments.iterrows()])
-
-        # Layer allocation (matches _generate_with_cap_layers)
-        bl = self.base_layers
-        middle_layers = self.num_layers - 2 * bl
-        layers_per_color = middle_layers // num_middle_colors if num_middle_colors > 0 else 0
-
-        base_thickness = bl * self.layer_height
-        middle_thickness = layers_per_color * self.layer_height
-        top_thickness = bl * self.layer_height
-
-        # Start with white backlight
-        light = np.ones((H, W, 3))
-
-        # Use subtractive (multiplicative) filter model for cap layers.
-        # The opaque base reduces light to ~20%. With additive model,
-        # colored middles would ADD brightness (filament_rgb > remaining light),
-        # causing inversion. Subtractive model ensures light only decreases.
-
-        # 1. Base layer (darkest filament) — always present, uniform thickness
-        td = max(filament_tds[0], 0.1)
-        transmission = np.exp(-base_thickness / td)
-        light = light * (transmission + filament_rgbs[0] * (1.0 - transmission))
-
-        # 2. Middle colors — present where enhanced_grayscale <= threshold
-        clear_td = max(filament_tds[-1], 0.1)
-        clear_rgb = filament_rgbs[-1]
-
-        for i in range(num_middle_colors):
-            threshold = (i + 1) / (num_middle_colors + 1)
-            present = enhanced_grayscale <= threshold
-
-            td = max(filament_tds[i + 1], 0.1)
-            rgb = filament_rgbs[i + 1]
-
-            # Where color is present: subtractive filter by this color
-            color_trans = np.exp(-middle_thickness / td)
-            # Where color is absent: subtractive filter by clear fill
-            clear_trans = np.exp(-middle_thickness / clear_td)
-
-            present_3d = present[:, :, np.newaxis]
-            colored = light * (color_trans + rgb * (1.0 - color_trans))
-            cleared = light * (clear_trans + clear_rgb * (1.0 - clear_trans))
-            light = np.where(present_3d, colored, cleared)
-
-        # 3. Clear top layer — always present, uniform thickness
-        transmission = np.exp(-top_thickness / clear_td)
-        light = light * (transmission + clear_rgb * (1.0 - transmission))
-
-        return np.clip(light, 0, 1)
-
-    def _render_face_down_cap_preview(self, pixel_height, z_boundaries,
-                                       image_filaments, transparent_filament, cap_height):
-        """Render Beer-Lambert preview for face-down + cap layers mode
-
-        Uses standard heightmap (bright=tall, dark=short). After physical flip,
-        light enters from back (darkest color at highest z-band), passes through
-        color bands from dark-to-light, through negative fill, and exits through
-        the transparent cap (viewing surface).
-
-        Args:
-            pixel_height: 2D array of per-pixel heights (mm), standard heightmap
-            z_boundaries: 1D array of image color band boundaries (mm), dark-to-light
-            image_filaments: DataFrame of image filaments (dark-to-light order)
-            transparent_filament: Series for the transparent filament
-            cap_height: Height of transparent cap (mm)
-
-        Returns:
-            HxWx3 RGB preview image (0-1 range)
-        """
-        H, W = pixel_height.shape
-        num_image_colors = len(image_filaments)
-        model_height_minus_cap = self.model_height - cap_height
-
-        image_rgbs = np.array([f['rgb'] for _, f in image_filaments.iterrows()])
-        image_tds = np.array([f['transmission_distance'] for _, f in image_filaments.iterrows()])
-        trans_rgb = transparent_filament['rgb']
-        trans_td = max(transparent_filament['transmission_distance'], 0.1)
-
-        # White backlight from behind (after flip: enters from darkest side)
-        light = np.ones((H, W, 3))
-
-        # After physical flip, light path is:
-        # 1. Darkest color bands (highest z in generation space, back after flip)
-        # 2. Through lighter color bands toward viewing surface
-        # 3. Through transparent negative fill
-        # 4. Through transparent cap (viewing surface)
-
-        # Process from darkest (highest z) to lightest (lowest z)
-        for i in range(num_image_colors - 1, -1, -1):
-            z_lo = z_boundaries[i]
-            z_hi = z_boundaries[i + 1]
-
-            # Per-pixel thickness in this color band
-            thickness = np.clip(pixel_height, z_lo, z_hi) - z_lo
-            td = max(image_tds[i], 0.1)
-            rgb = image_rgbs[i]
-
-            transmission = np.exp(-thickness / td)
-            transmission_3d = transmission[:, :, np.newaxis]
-            light = light * transmission_3d + rgb * (1.0 - transmission_3d)
-
-        # Transparent negative fill (from pixel_height to model_height - cap_height)
-        neg_thickness = model_height_minus_cap - pixel_height
-        neg_thickness = np.clip(neg_thickness, 0, model_height_minus_cap)
-        transmission = np.exp(-neg_thickness / trans_td)
-        transmission_3d = transmission[:, :, np.newaxis]
-        light = light * transmission_3d + trans_rgb * (1.0 - transmission_3d)
-
-        # Transparent cap (uniform thickness, viewing surface)
-        transmission = np.exp(-cap_height / trans_td)
-        light = light * transmission + trans_rgb * (1.0 - transmission)
-
-        return np.clip(light, 0, 1)
-
-    def _generate_face_down(self, output_base_path):
-        """Generate face-down mode with inverted heightmap (dark=tall, light=short).
-
-        Same pipeline as standard but with inverted heightmap for face-down printing.
-        """
-        logger.info("=" * 60)
-        logger.info("FACE-DOWN MODE: Topographical generation (inverted heightmap)")
-        logger.info("=" * 60)
-
-        sorted_filaments = self._sort_filaments_by_luminosity()
-        enhanced_grayscale = self._apply_contrast_enhancement(self.image_grayscale.copy())
-        alpha_pixels = self.alpha_mask >= 0.5
-
-        filament_tds = np.array([f['transmission_distance'] for _, f in sorted_filaments.iterrows()])
-        layer_counts, layer_boundaries, z_boundaries = self._allocate_layers_td_proportional(
-            filament_tds, self.num_layers)
-
-        for idx in range(self.num_colors):
-            name = sorted_filaments.iloc[idx]['name']
-            lc = layer_counts[idx]
-            logger.info(f"  {name}: TD={filament_tds[idx]:.1f}mm -> {lc} layers ({lc * self.layer_height:.2f}mm)")
-
-        pixel_height = self._compute_heightmap(enhanced_grayscale, alpha_pixels, self.model_height, invert=True)
-
-        # Store for preview
-        self.face_down_pixel_height = pixel_height
-        self.face_down_z_boundaries = z_boundaries
-        self.face_down_filaments = sorted_filaments
-
-        generated_files = self._generate_color_band_stls(
-            sorted_filaments, pixel_height, z_boundaries, layer_boundaries,
-            alpha_pixels, output_base_path)
-
-        logger.info(f"Face-down generation complete: {len(generated_files)} STL files")
-        return generated_files
-
-    def _generate_face_down_with_cap_layers(self, output_base_path):
-        """Generate face-down + cap layers: standard heightmap + negative fill + transparent cap, then Z-flip.
-
-        After Z-flip: cap at z=0 (bed), darkest at z=model_height (back).
-        """
-        logger.info("=" * 60)
-        logger.info("FACE-DOWN + CAP LAYERS: Standard generation + Z-flip")
-        logger.info("=" * 60)
-
-        sorted_filaments = self._sort_filaments_by_luminosity()
-
-        # Last filament (lightest/most transparent) = cap + negative fill
-        transparent_filament = sorted_filaments.iloc[-1]
-        image_filaments = sorted_filaments.iloc[:-1].reset_index(drop=True)
-        num_image_colors = len(image_filaments)
-
-        logger.info(f"Transparent (cap + negative): {transparent_filament['name']} "
-                     f"(TD={transparent_filament['transmission_distance']:.1f})")
-        logger.info(f"Image colors: {num_image_colors}")
-
-        # Layer allocation: cap layers + image colors
-        cap_layers_count = self.base_layers
-        cap_height = cap_layers_count * self.layer_height
-        image_total_layers = self.num_layers - cap_layers_count
-        model_height_minus_cap = self.model_height - cap_height
-
-        image_tds = np.array([f['transmission_distance'] for _, f in image_filaments.iterrows()])
-        layer_counts, image_layer_boundaries, z_boundaries = self._allocate_layers_td_proportional(
-            image_tds, image_total_layers)
-
-        for idx in range(num_image_colors):
-            name = image_filaments.iloc[idx]['name']
-            lc = layer_counts[idx]
-            logger.info(f"  {name}: TD={image_tds[idx]:.1f}mm -> {lc} layers ({lc * self.layer_height:.2f}mm)")
-
-        # Standard heightmap (bright=tall), capped at model_height - cap_height
-        enhanced_grayscale = self._apply_contrast_enhancement(self.image_grayscale.copy())
-        alpha_pixels = self.alpha_mask >= 0.5
-        pixel_height = self._compute_heightmap(enhanced_grayscale, alpha_pixels, model_height_minus_cap)
-
-        # Store for preview
-        self.face_down_pixel_height = pixel_height
-        self.face_down_z_boundaries = z_boundaries
-        self.face_down_image_filaments = image_filaments
-        self.face_down_transparent_filament = transparent_filament
-        self.face_down_cap_height = cap_height
-
-        # 1. IMAGE COLOR STLs (collect meshes for Z-flip)
-        all_mesh_outputs = self._generate_color_band_stls(
-            image_filaments, pixel_height, z_boundaries, image_layer_boundaries,
-            alpha_pixels, output_base_path, collect_meshes=True)
-
-        # 2. TRANSPARENT NEGATIVE FILL + FLAT CAP (combined into single STL)
-        min_thickness = self.layer_height * 0.5
-        z_bottom_negative = pixel_height.copy()
-        z_top_negative = np.full_like(pixel_height, model_height_minus_cap)
-        negative_mask = alpha_pixels & (pixel_height < model_height_minus_cap - min_thickness)
-
-        logger.info(f"Generating transparent negative fill: {int(np.sum(negative_mask))} pixels")
-
-        cap_mesh = self._generate_flat_layer_stl(
-            alpha_pixels,
-            int(round(model_height_minus_cap / self.layer_height)),
-            int(round(self.model_height / self.layer_height)))
-
-        color_name = transparent_filament['name'].replace(' ', '_').replace('/', '_')
-        cap_output_path = output_base_path.parent / f"{output_base_path.stem}_{color_name}.stl"
-
-        vertices_list = [cap_mesh.vertices]
-        faces_list = [cap_mesh.faces]
-        vertex_offset = len(cap_mesh.vertices)
-
-        if negative_mask.any():
-            negative_mesh = self._generate_quantized_stl(
-                z_bottom_negative, z_top_negative, negative_mask)
-            if len(negative_mesh.vertices) > 0:
-                vertices_list.append(negative_mesh.vertices)
-                faces_list.append(negative_mesh.faces + vertex_offset)
-                logger.info(f"  Negative fill: {len(negative_mesh.vertices)} vertices, "
-                             f"{len(negative_mesh.faces)} faces")
-
-        combined_mesh = trimesh.Trimesh(
-            vertices=np.vstack(vertices_list),
-            faces=np.vstack(faces_list), process=False)
-        all_mesh_outputs.append((combined_mesh, cap_output_path, transparent_filament['name']))
-
-        # 3. Z-FLIP ALL MESHES
-        logger.info(f"Z-flipping all meshes (model_height={self.model_height:.2f}mm)")
-        generated_files = []
-
-        for mesh, output_path, filament_name in all_mesh_outputs:
-            mesh.vertices[:, 2] = self.model_height - mesh.vertices[:, 2]
-            mesh.fix_normals()
-            mesh.export(str(output_path))
-
-            min_z = float(np.min(mesh.vertices[:, 2]))
-            max_z = float(np.max(mesh.vertices[:, 2]))
-            layer_start_actual = int(np.floor(min_z / self.layer_height))
-            layer_end_actual = int(np.ceil(max_z / self.layer_height))
-            generated_files.append((output_path, filament_name, layer_start_actual, layer_end_actual))
-            logger.info(f"  {filament_name}: z={min_z:.2f}-{max_z:.2f}mm (flipped)")
-
-        logger.info(f"Face-down cap layers complete: {len(generated_files)} STL files")
-        return generated_files

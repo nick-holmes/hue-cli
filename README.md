@@ -24,13 +24,30 @@ python3 huecli.py image.png -f filaments.csv -c 5 -n 0.4 -l 0.04 -m 3.0 -s 120x1
 
 A 3D preview opens in your browser before generating STLs. From the preview you can generate, adjust colours (reduce delta-E), or cancel.
 
+## 3D Preview
+
+The browser preview is an interactive Three.js viewer that renders a downsampled version of your model.
+
+**Controls:**
+
+- **Drag** to rotate
+- **scroll** to zoom 
+- **right-drag** to pan
+
+**Toolbar (bottom of screen):**
+
+- **Gap slider** — separates layers along the Z axis so you can inspect individual colour bands. Defaults to 0 for standard/flat modes (showing the finished product) and 2mm for exploded modes.
+- **Realistic / Filaments toggle** — switches between two colour modes:
+  - **Realistic** — simulates light passing through stacked filament layers using Beer-Lambert physics, showing how the print will actually look when backlit.
+  - **Filaments** — shows each layer in its raw filament colour so you can see which filament is assigned where. Automatically applies a small gap so all layers are visible.
+- **ⓘ button** — click for a description of each colour mode.
+
 ## Which Mode Should I Use?
 
 | Situation | Recommended Mode |
 |-----------|-----------------|
 | Multi-material printer, general use | `standard` |
-| Multi-material, fine detail / high contrast | `cap-layers` |
-| Multi-material, smooth viewing surface | `face-down` or `face-down-cap` |
+| Multi-material, flat slabs with multi-colour mixing | `flat` or `flat-cap` |
 | Single-material printer | `exploded` |
 | Multi-material, highest fidelity stacking | `exploded-multi` |
 | Subtractive CMYK colour mixing | `exploded-cmyk` |
@@ -41,13 +58,13 @@ A 3D preview opens in your browser before generating STLs. From the preview you 
 
 Stacked topographical STLs — one per colour. Load all into your slicer and assign filaments.
 
-### Cap Layers (`--mode cap-layers`)
+### Flat (`--mode flat`)
 
-Dark base + shaped colour middles + clear top. Enhanced contrast for fine detail. The `--base-layers` flag controls the number of flat base and top layers (default 2).
+Flat uniform-thickness colour slabs. For each pixel, brute-force tests all 2^N filament presence/absence combinations to find the subset that best reproduces the target colour via Beer-Lambert transmission. Multiple colours can stack on the same pixel (e.g., red under blue = purple).
 
-### Face-Down (`--mode face-down`)
+### Flat-Cap (`--mode flat-cap`)
 
-Inverted heightmap (dark=tall). Flip after printing for a smooth viewing surface. Combine with `--mode face-down-cap` for cap layers + face-down.
+Same as flat + transparent cap layer on top and transparent fill in gaps. Reserves one filament slot for transparent. `--base-layers` controls cap thickness (default 1).
 
 ### Exploded (`--mode exploded`)
 
@@ -93,11 +110,11 @@ Fixed CMYK primaries (auto-selected from your library by delta-E). Each primary 
 | `--max-color-sandwiches` | Max sandwiches per colour | `3` (multi: `5`, CMYK: `1`) |
 | `--fill` | Fill non-colour areas with transparent + top layer | `no` |
 
-### Cap Layers / Face-Down-Cap Flag
+### Flat-Cap Flag
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `--base-layers` | Flat base/top layer count | `2` |
+| `--base-layers` | Transparent cap layer count | `1` |
 
 ## Output Files
 
@@ -105,7 +122,7 @@ All files saved to `output/`:
 
 | Mode | Naming | Example |
 |------|--------|---------|
-| Standard / Cap / Face-down | One STL per colour | `image_Black.stl` |
+| Standard / Flat / Flat-Cap | One STL per colour | `image_Black.stl` |
 | Exploded | 2 STLs per colour per level | `image_Black_1_color.stl`, `image_Black_1_transparent.stl` |
 | Exploded-multi | Up to 4 per sandwich | `image_S01_Black_color.stl`, `image_S01_transparent.stl` |
 | Exploded-CMYK | 2 per primary per level | `image_Aquatic_Blue_1_color.stl` |
