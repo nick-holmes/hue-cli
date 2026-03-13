@@ -722,11 +722,12 @@ def show_3d_preview(stl_gen):
         stl_gen: STLGenerator instance with all parameters configured
     """
     import base64
+    import json
     import tempfile
     import webbrowser
 
     logger.info("Generating 3D preview scene...")
-    scene = stl_gen.generate_preview_scene()
+    scene, preview_filaments = stl_gen.generate_preview_scene()
 
     if len(scene.geometry) == 0:
         logger.warning("No geometry generated for 3D preview")
@@ -737,9 +738,28 @@ def show_3d_preview(stl_gen):
     b64 = base64.b64encode(glb_data).decode("utf-8")
     logger.info(f"GLB size: {len(glb_data)/1024/1024:.1f} MB")
 
+    # Build filament info for sidebar
+    total_faces = sum(g.faces.shape[0] for g in scene.geometry.values())
+    filament_info = []
+    for k, (_, f) in enumerate(preview_filaments.iterrows()):
+        prefix = f"S{k+1:02d}_"
+        mesh_faces = sum(g.faces.shape[0] for name, g in scene.geometry.items() if name.startswith(prefix))
+        coverage = (mesh_faces / total_faces * 100) if total_faces > 0 else 0
+        filament_info.append({
+            'name': f['name'],
+            'hex': '#%02x%02x%02x' % tuple((np.array(f['rgb']) * 255).astype(int)),
+            'brand': f.get('Brand', ''),
+            'td': round(float(f['transmission_distance']), 2),
+            'coverage': round(coverage, 1),
+            'layer': k + 1,
+            'meshPrefix': f"S{k+1:02d}",
+        })
+    filament_info_json = json.dumps(filament_info)
+
     is_exploded = stl_gen.use_exploded or stl_gen.use_exploded_multi or stl_gen.use_exploded_cmyk
     html = _build_viewer_html(b64, use_transparency=is_exploded, use_slider=True,
-                               default_gap=2.0 if is_exploded else 0.0)
+                               default_gap=2.0 if is_exploded else 0.0,
+                               filament_info_json=filament_info_json)
 
     with tempfile.NamedTemporaryFile('w', suffix='.html', delete=False) as f:
         f.write(html)
@@ -749,7 +769,8 @@ def show_3d_preview(stl_gen):
     webbrowser.open('file://' + tmp_path)
 
 
-def _build_viewer_html(b64_glb, use_transparency=False, use_slider=False, default_gap=2.0):
+def _build_viewer_html(b64_glb, use_transparency=False, use_slider=False, default_gap=2.0,
+                       filament_info_json='[]'):
     """Build a self-contained HTML page with an embedded Three.js GLB viewer.
 
     Uses CDN-loaded Three.js with GLTFLoader.parse() to decode the base64
@@ -760,6 +781,7 @@ def _build_viewer_html(b64_glb, use_transparency=False, use_slider=False, defaul
         use_transparency: if True, enable transparent materials with vertex alpha
         use_slider: if True, show layer gap slider and parse S## mesh names
         default_gap: initial gap value for the slider (0.0 for standard/flat)
+        filament_info_json: JSON string of filament metadata for sidebar
 
     Returns:
         Complete HTML string
@@ -775,8 +797,9 @@ def _build_viewer_html(b64_glb, use_transparency=False, use_slider=False, defaul
   body {{ margin: 0; overflow: hidden; background: #2a2a2a; }}
   canvas {{ display: block; }}
   #info {{
-    position: absolute; top: 10px; left: 10px; color: #ccc;
-    font: 13px/1.4 system-ui, sans-serif; pointer-events: none;
+    position: absolute; bottom: 70px; left: 50%; transform: translateX(-50%);
+    color: #ccc; font: 13px/1.4 system-ui, sans-serif; pointer-events: none;
+    text-align: center;
   }}
   #error {{
     position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
@@ -820,6 +843,61 @@ def _build_viewer_html(b64_glb, use_transparency=False, use_slider=False, defaul
   }}
   #info-tooltip strong {{ color: #fff; }}
   #info-tooltip.visible {{ display: block; }}
+
+  /* Sidebar */
+  #sidebar {{
+    position: absolute; top: 0; left: 0; bottom: 0; width: 180px;
+    background: rgba(0,0,0,0.7); backdrop-filter: blur(8px);
+    display: flex; flex-direction: column; padding: 12px 10px;
+    transition: transform 0.25s ease; z-index: 10;
+    overflow-y: auto; border-right: 1px solid rgba(255,255,255,0.1);
+    scrollbar-width: thin; scrollbar-color: rgba(255,255,255,0.2) transparent;
+  }}
+  #sidebar.collapsed {{ transform: translateX(-100%); }}
+  #sidebar-header {{
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 10px; flex-shrink: 0;
+  }}
+  #sidebar-header span {{ color: #fff; font: bold 13px system-ui, sans-serif; }}
+  #bulk-toggle {{
+    color: rgba(255,255,255,0.5); font: 11px system-ui, sans-serif;
+    text-decoration: none; cursor: pointer;
+  }}
+  #bulk-toggle:hover {{ color: #fff; }}
+  #sidebar-toggle {{
+    position: absolute; top: 12px; left: 180px; z-index: 11;
+    width: 24px; height: 28px; border: 1px solid rgba(255,255,255,0.2);
+    border-left: none; border-radius: 0 6px 6px 0;
+    background: rgba(0,0,0,0.6); color: rgba(255,255,255,0.6);
+    cursor: pointer; font: 12px system-ui; display: flex;
+    align-items: center; justify-content: center;
+    transition: left 0.25s ease, background 0.15s;
+  }}
+  #sidebar-toggle:hover {{ background: rgba(0,0,0,0.8); color: #fff; }}
+  #sidebar.collapsed ~ #sidebar-toggle {{ left: 0; }}
+  .swatch-item {{
+    text-align: center; margin-bottom: 10px; cursor: pointer;
+    padding: 6px 4px; border-radius: 6px; transition: opacity 0.15s;
+    position: relative;
+  }}
+  .swatch-item:hover {{ background: rgba(255,255,255,0.08); }}
+  .swatch-item.hidden {{ opacity: 0.25; }}
+  .swatch-color {{
+    width: 44px; height: 44px; border-radius: 8px; margin: 0 auto;
+    border: 2px solid rgba(255,255,255,0.2);
+  }}
+  .swatch-name {{
+    color: #ccc; font: 11px system-ui, sans-serif; margin-top: 4px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }}
+  .swatch-tooltip {{
+    position: fixed; background: rgba(0,0,0,0.92);
+    border: 1px solid rgba(255,255,255,0.2);
+    border-radius: 8px; padding: 10px 12px; color: #ddd;
+    font: 12px/1.6 system-ui, sans-serif;
+    white-space: nowrap; pointer-events: none; z-index: 20;
+  }}
+  .swatch-tooltip strong {{ color: #fff; }}
 </style>
 </head>
 <body>
@@ -840,6 +918,15 @@ def _build_viewer_html(b64_glb, use_transparency=False, use_slider=False, defaul
   <strong>Filaments</strong> &mdash; Shows the raw filament colour for each layer, so you can see which filament is assigned where. Layers separate slightly for visibility.
 </div>
 
+<div id="sidebar">
+  <div id="sidebar-header">
+    <span>Filaments</span>
+    <a id="bulk-toggle" href="#">Hide all</a>
+  </div>
+  <div id="swatch-list"></div>
+</div>
+<button id="sidebar-toggle">&#9664;</button>
+
 <script type="importmap">
 {{
   "imports": {{
@@ -855,6 +942,7 @@ import {{ OrbitControls }} from 'three/addons/controls/OrbitControls.js';
 import {{ GLTFLoader }} from 'three/addons/loaders/GLTFLoader.js';
 
 const base64 = "{b64_glb}";
+const FILAMENT_DATA = {filament_info_json};
 
 // Decode base64 → ArrayBuffer (avoids data-URL size limits)
 const bin = atob(base64);
@@ -1080,6 +1168,72 @@ window.addEventListener('resize', () => {{
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
+}});
+
+// --- Sidebar: build swatches from FILAMENT_DATA ---
+const swatchList = document.getElementById('swatch-list');
+const tooltip = document.createElement('div');
+tooltip.className = 'swatch-tooltip';
+tooltip.style.display = 'none';
+document.body.appendChild(tooltip);
+
+FILAMENT_DATA.forEach((f, i) => {{
+  const item = document.createElement('div');
+  item.className = 'swatch-item';
+  item.dataset.prefix = f.meshPrefix;
+  item.innerHTML = `
+    <div class="swatch-color" style="background:${{f.hex}}"></div>
+    <div class="swatch-name">${{f.name}}</div>
+  `;
+
+  // Hover tooltip
+  item.addEventListener('mouseenter', (e) => {{
+    const r = item.getBoundingClientRect();
+    tooltip.innerHTML = `<strong>${{f.name}}</strong><br>` +
+      (f.brand ? `Brand: ${{f.brand}}<br>` : '') +
+      `TD: ${{f.td}}mm<br>Hex: ${{f.hex}}<br>Coverage: ${{f.coverage}}%<br>Layer: ${{f.layer}}`;
+    tooltip.style.display = 'block';
+    tooltip.style.left = (r.right + 8) + 'px';
+    tooltip.style.top = r.top + 'px';
+  }});
+  item.addEventListener('mouseleave', () => {{ tooltip.style.display = 'none'; }});
+
+  // Click to toggle visibility
+  item.addEventListener('click', () => {{
+    const isHidden = item.classList.toggle('hidden');
+    const targetIdx = f.layer - 1;
+    for (const entry of layerMeshes) {{
+      if (entry.idx === targetIdx) {{
+        entry.mesh.visible = !isHidden;
+      }}
+    }}
+  }});
+
+  swatchList.appendChild(item);
+}});
+
+// Sidebar toggle
+document.getElementById('sidebar-toggle').addEventListener('click', () => {{
+  const sidebar = document.getElementById('sidebar');
+  const btn = document.getElementById('sidebar-toggle');
+  sidebar.classList.toggle('collapsed');
+  btn.innerHTML = sidebar.classList.contains('collapsed') ? '&#9654;' : '&#9664;';
+}});
+
+// Bulk show/hide
+document.getElementById('bulk-toggle').addEventListener('click', (e) => {{
+  e.preventDefault();
+  const items = document.querySelectorAll('.swatch-item');
+  const anyHidden = [...items].some(i => i.classList.contains('hidden'));
+  const show = anyHidden;
+  items.forEach(item => {{
+    if (show) item.classList.remove('hidden');
+    else item.classList.add('hidden');
+  }});
+  for (const entry of layerMeshes) {{
+    entry.mesh.visible = show;
+  }}
+  e.target.textContent = show ? 'Hide all' : 'Show all';
 }});
 
 (function animate() {{

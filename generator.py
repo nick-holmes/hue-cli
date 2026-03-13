@@ -1113,15 +1113,24 @@ class STLGenerator:
                 pixel_counts = self._compute_flat_layer_counts(
                     color_filaments, color_total_layers, ds_image_rgb, alpha_pixels)
 
-                # Compute Beer-Lambert preview for accurate face colors
-                preview_rgb = self._render_flat_preview(
-                    pixel_counts, color_filaments, transparent_filament, cap_layers)
-                preview_rgb = self._auto_contrast_preview(preview_rgb, alpha_pixels)
+                # Compute per-layer cumulative Beer-Lambert previews
+                num_flat_colors = len(color_filaments)
+                light = np.ones((ds_H, ds_W, 3))
+                layer_previews = []
+                for i in range(num_flat_colors):
+                    fil = color_filaments.iloc[i]
+                    td = max(fil['transmission_distance'], 0.1)
+                    rgb = np.array(fil['rgb'])
+                    thickness = pixel_counts[:, :, i] * self.layer_height
+                    transmission = np.exp(-thickness / td)[:, :, np.newaxis]
+                    light = light * transmission + rgb * (1.0 - transmission)
+                    layer_previews.append(self._auto_contrast_preview(
+                        np.clip(light.copy(), 0, 1), alpha_pixels))
 
                 # Build one mesh per color with cumulative z stacking
                 z_cursor = np.zeros((ds_H, ds_W))
 
-                for k in range(len(color_filaments)):
+                for k in range(num_flat_colors):
                     filament = color_filaments.iloc[k]
                     z_bottom_k = z_cursor.copy()
                     z_top_k = z_bottom_k + pixel_counts[:, :, k] * self.layer_height
@@ -1131,7 +1140,7 @@ class STLGenerator:
                         mesh = self._generate_topographical_stl(z_bottom_k, z_top_k, pixel_mask)
                         if len(mesh.vertices) > 0:
                             self._apply_preview_face_colors(
-                                mesh, preview_rgb, ds_W, ds_H)
+                                mesh, layer_previews[k], ds_W, ds_H)
                             name = filament['name'].replace(' ', '_')
                             hex_color = '%02x%02x%02x' % tuple(
                                 (np.array(filament['rgb']) * 255).astype(int))
@@ -1151,12 +1160,25 @@ class STLGenerator:
                 min_thickness = self.layer_height * 0.5
                 combined_mask = alpha_pixels & (pixel_height > min_thickness)
 
-                # Compute Beer-Lambert preview for accurate face colors
-                preview_rgb = self._render_standard_preview(
-                    pixel_height, z_boundaries, sorted_filaments)
-                preview_rgb = self._auto_contrast_preview(preview_rgb, combined_mask)
+                # Compute per-layer cumulative Beer-Lambert previews so each mesh
+                # shows the correct appearance at its layer boundary. This allows
+                # hiding a top layer to naturally reveal correct colors beneath.
+                num_colors = len(sorted_filaments)
+                filament_rgbs = np.array([f['rgb'] for _, f in sorted_filaments.iterrows()])
+                filament_tds = np.array([f['transmission_distance'] for _, f in sorted_filaments.iterrows()])
+                light = np.ones((ds_H, ds_W, 3))
+                layer_previews = []
+                for i in range(num_colors):
+                    z_lo = z_boundaries[i]
+                    z_hi = z_boundaries[i + 1]
+                    thickness = np.clip(pixel_height, z_lo, z_hi) - z_lo
+                    td = max(filament_tds[i], 0.1)
+                    transmission = np.exp(-thickness / td)[:, :, np.newaxis]
+                    light = light * transmission + filament_rgbs[i] * (1.0 - transmission)
+                    layer_previews.append(self._auto_contrast_preview(
+                        np.clip(light.copy(), 0, 1), combined_mask))
 
-                for k in range(len(sorted_filaments)):
+                for k in range(num_colors):
                     filament = sorted_filaments.iloc[k]
                     z_lo = z_boundaries[k]
                     z_hi = z_boundaries[k + 1]
@@ -1170,7 +1192,7 @@ class STLGenerator:
                         mesh = self._generate_topographical_stl(band_bottom, band_top, band_mask)
                         if len(mesh.vertices) > 0:
                             self._apply_preview_face_colors(
-                                mesh, preview_rgb, ds_W, ds_H)
+                                mesh, layer_previews[k], ds_W, ds_H)
                             name = filament['name'].replace(' ', '_')
                             hex_color = '%02x%02x%02x' % tuple(
                                 (np.array(filament['rgb']) * 255).astype(int))
@@ -1178,7 +1200,7 @@ class STLGenerator:
                                 mesh, geom_name=f"S{k+1:02d}_{name}_C{hex_color}")
 
             logger.info(f"3D preview scene: {len(scene.geometry)} meshes")
-            return scene
+            return scene, sorted_filaments
 
         finally:
             self.pixel_size = orig_pixel_size
@@ -1440,7 +1462,7 @@ class STLGenerator:
                             scene.add_geometry(mesh, geom_name=geom_name)
 
             logger.info(f"3D exploded preview: {len(scene.geometry)} meshes in scene")
-            return scene
+            return scene, color_filaments
 
         finally:
             self.pixel_size = orig_pixel_size
