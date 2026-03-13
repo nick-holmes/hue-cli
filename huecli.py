@@ -15,8 +15,6 @@ from sklearn.cluster import KMeans
 from skimage import color
 import trimesh
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-from tqdm import tqdm
 
 from generator import STLGenerator
 
@@ -425,7 +423,7 @@ class FilamentLibrary:
         result_indices = color_indices + [transparent_idx]
         return self.df.iloc[result_indices].reset_index(drop=True)
 
-    def select_for_exploded_cmyk(self, layer_height=0.08, model_height=2.0, sandwich_layers=3):
+    def select_for_exploded_cmyk(self, layer_height=0.08, model_height=2.0, sandwich_layers=3, max_color_sandwiches=1):
         """Select filaments for exploded CMYK mode: C/M/Y/K primaries + transparent.
 
         Uses fixed CMYK target colors instead of K-means. Finds the best filament
@@ -433,6 +431,7 @@ class FilamentLibrary:
 
         Args:
             sandwich_layers: Color layers per sandwich (default 3 for CMYK)
+            max_color_sandwiches: Max sandwiches per colour (default 1)
 
         Returns:
             DataFrame: [cyan, magenta, yellow, black, transparent] (transparent last)
@@ -440,8 +439,7 @@ class FilamentLibrary:
         logger.info("Exploded CMYK: selecting C/M/Y/K filaments + transparent")
 
         # Max material thickness per color in CMYK mode
-        # (2 sandwiches × sandwich_layers color layers × layer_height)
-        max_sandwiches_per_color = 2
+        max_sandwiches_per_color = max_color_sandwiches
         max_color_thickness = max_sandwiches_per_color * sandwich_layers * layer_height
 
         # 1. Auto-select transparent filament
@@ -695,63 +693,6 @@ class ImageProcessor:
             logger.error(f"Failed to load image: {e}")
             raise
 
-    def _apply_selective_smoothing(self, image):
-        """Apply smoothing to gradients while preserving text and sharp details
-
-        Uses edge detection to identify text/details and applies smoothing only to
-        smooth gradient areas. This reduces color banding while keeping text crisp.
-        """
-        logger.info("Applying selective smoothing (preserving text and sharp details)...")
-
-        try:
-            from scipy import ndimage
-
-            # Convert to grayscale for edge detection
-            grayscale = np.mean(image, axis=2)
-
-            # Detect edges using Sobel operator
-            # High gradient = text/edges, low gradient = smooth areas
-            gradient_x = ndimage.sobel(grayscale, axis=1)
-            gradient_y = ndimage.sobel(grayscale, axis=0)
-            gradient_magnitude = np.sqrt(gradient_x**2 + gradient_y**2)
-
-            # Normalize gradient to 0-1
-            gradient_magnitude = (gradient_magnitude - gradient_magnitude.min()) / (gradient_magnitude.max() - gradient_magnitude.min() + 1e-8)
-
-            # Create edge mask: high gradient = edge (preserve), low gradient = smooth area
-            edge_threshold = 0.08  # VERY sensitive to preserve text and sharp features
-            edge_mask = gradient_magnitude > edge_threshold
-
-            # Dilate edge mask to protect areas around edges (prevents halos around text)
-            edge_mask_dilated = ndimage.binary_dilation(edge_mask, iterations=4)
-
-            logger.info(f"Preserving edges: {edge_mask_dilated.sum() / edge_mask_dilated.size * 100:.1f}% of image")
-
-            # Apply LIGHT Gaussian smoothing only to pure gradients (not near any edges)
-            smoothed = np.zeros_like(image)
-            for channel in range(3):
-                # Light blur - just enough to reduce noise, not enough to blur detail
-                smoothed[:, :, channel] = ndimage.gaussian_filter(image[:, :, channel], sigma=0.8)
-
-            # Blend: use original at edges, smoothed in gradient areas
-            result = np.zeros_like(image)
-            for channel in range(3):
-                result[:, :, channel] = np.where(
-                    edge_mask_dilated,
-                    image[:, :, channel],  # Keep original at edges (100% sharp)
-                    smoothed[:, :, channel]  # Use smoothed in gradients
-                )
-
-            logger.info("Selective smoothing complete - text and details preserved")
-            return result
-
-        except ImportError:
-            logger.warning("scipy not available - skipping selective smoothing")
-            return image
-        except Exception as e:
-            logger.warning(f"Selective smoothing failed: {e} - using original image")
-            return image
-
     def quantize_colors(self):
         """Extract dominant colors using K-means clustering
 
@@ -857,301 +798,6 @@ class ImageProcessor:
         return optimal_k
 
 
-class TransmissionColorSimulator:
-    """Simulates color appearance based on light transmission through layered filaments"""
-
-    def __init__(self, selected_filaments, layer_height):
-        self.selected_filaments = selected_filaments
-        self.layer_height = layer_height
-
-    def calculate_transmission_factor(self, td_value, thickness_mm):
-        """
-        Calculate how much light passes through a layer using Beer-Lambert law approximation
-        TD = transmission distance (mm of material that transmits ~37% of light)
-        """
-        if td_value < 0.1:  # Completely opaque
-            return 0.0
-        # Exponential decay: transmission = e^(-thickness / TD)
-        return np.exp(-thickness_mm / max(td_value, 0.1))
-
-    def simulate_layer_stack_color(self, layer_indices, layer_heights, subtractive=False):
-        """
-        Simulate the perceived color of a stack of layers
-        layer_indices: list of filament indices from bottom to top
-        layer_heights: thickness of each layer in mm
-        subtractive: If True, use multiplicative filter model (light only decreases).
-                     Required for cap-layer mode where opaque base + additive model
-                     causes inversion.
-        Returns: RGB color (0-1 range)
-        """
-        # Start with white light from below (backlit assumption)
-        light_rgb = np.array([1.0, 1.0, 1.0])
-
-        # Process each layer from bottom to top
-        for layer_idx, thickness in zip(layer_indices, layer_heights):
-            filament = self.selected_filaments.iloc[layer_idx]
-            filament_rgb = np.array(filament['rgb'])
-            td = filament['transmission_distance']
-
-            # Calculate transmission factor
-            transmission = self.calculate_transmission_factor(td, thickness)
-
-            if subtractive:
-                # Subtractive filter: filament color acts as per-channel multiplier
-                # on the absorbed fraction. Light can only decrease.
-                # Clear (RGB≈1): filter≈1, no absorption. Black (RGB≈0): filter=t, pure absorption.
-                # Colored: selective wavelength absorption (e.g. red filter passes red, blocks blue)
-                light_rgb = light_rgb * (transmission + filament_rgb * (1 - transmission))
-            else:
-                # Additive model: absorbed fraction replaced with filament color
-                light_rgb = light_rgb * transmission + filament_rgb * (1 - transmission)
-
-            # Clamp to [0, 1]
-            light_rgb = np.clip(light_rgb, 0, 1)
-
-        return light_rgb
-
-    def calculate_perceived_color_at_height(self, heightmap_layers, filament_assignments, y, x):
-        """
-        Calculate the perceived color at a specific pixel considering all layers below it
-        """
-        pixel_layer = heightmap_layers[y, x]
-
-        # Build layer stack from bottom (layer 0) to current height
-        layer_stack = []
-        layer_thicknesses = []
-
-        for layer_num in range(pixel_layer + 1):
-            # Find which filament is assigned to this layer
-            filament_idx = filament_assignments[layer_num]
-            layer_stack.append(filament_idx)
-            layer_thicknesses.append(self.layer_height)
-
-        if not layer_stack:
-            return np.array([1.0, 1.0, 1.0])  # White if no layers
-
-        return self.simulate_layer_stack_color(layer_stack, layer_thicknesses)
-
-
-class PreviewGenerator:
-    """Generates preview images of layer assignments"""
-
-    def __init__(self, heightmap_layers, selected_filaments, layer_height, layer_assignments=None, use_cap_layers=False, flat=False):
-        self.heightmap_layers = heightmap_layers
-        self.selected_filaments = selected_filaments
-        self.layer_height = layer_height
-        self.num_layers = heightmap_layers.max() + 1
-        self.layer_assignments = layer_assignments  # 3D array: [height, width, layer]
-        self.use_cap_layers = use_cap_layers
-        self.flat = flat
-
-    def generate(self, output_path=None, use_transmission_preview=True, interactive=False):
-        """Create preview PNG showing layer bands with transmission simulation
-
-        Args:
-            output_path: Path to save PNG (optional if interactive=True)
-            use_transmission_preview: Whether to simulate transmission colors
-            interactive: If True, display interactive window instead of saving
-        """
-        if output_path:
-            logger.info(f"Generating preview image to {output_path}")
-        else:
-            logger.info("Generating interactive preview...")
-
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
-
-        # Left: layer visualization on image
-        colored_preview = np.zeros((*self.heightmap_layers.shape, 3))
-
-        if self.layer_assignments is not None and use_transmission_preview:
-            # TD-based transmission mode: use actual layer-by-layer assignments
-            logger.info("Rendering TD-based transmission preview (VECTORIZED)...")
-            simulator = TransmissionColorSimulator(self.selected_filaments, self.layer_height)
-
-            height_px, width_px = self.heightmap_layers.shape
-
-            # OPTIMIZATION: Build unique layer stacks and compute colors only once
-            # Then map back to pixels - this is MUCH faster than per-pixel computation
-            logger.info("Building unique layer stack catalog...")
-
-            # Create a hashable representation of each pixel's layer stack
-            stack_to_color = {}  # Maps stack tuple -> RGB color
-            pixel_stack_map = {}  # Maps (y, x) -> stack tuple
-
-            for y in tqdm(range(height_px), desc="Cataloging stacks", leave=False):
-                for x in range(width_px):
-                    # Determine number of layers for this pixel
-                    if self.flat:
-                        num_pixel_layers = self.num_layers
-                    else:
-                        num_pixel_layers = self.heightmap_layers[y, x] + 1
-
-                    # Build layer stack tuple (hashable)
-                    layer_stack = tuple(
-                        self.layer_assignments[y, x, layer_num]
-                        for layer_num in range(num_pixel_layers)
-                    )
-
-                    pixel_stack_map[(y, x)] = layer_stack
-
-                    # Track unique stacks
-                    if layer_stack not in stack_to_color:
-                        stack_to_color[layer_stack] = None  # Placeholder
-
-            # Compute transmission color for each UNIQUE stack
-            logger.info(f"Computing colors for {len(stack_to_color)} unique layer stacks (was {height_px * width_px} pixels)...")
-            for layer_stack in tqdm(stack_to_color.keys(), desc="Computing colors", leave=False):
-                layer_heights = [self.layer_height] * len(layer_stack)
-                color_rgb = simulator.simulate_layer_stack_color(list(layer_stack), layer_heights)
-                stack_to_color[layer_stack] = color_rgb
-
-            # Map computed colors back to pixels (FAST)
-            logger.info("Mapping colors to pixels...")
-            for y in range(height_px):
-                for x in range(width_px):
-                    layer_stack = pixel_stack_map[(y, x)]
-                    colored_preview[y, x] = stack_to_color[layer_stack]
-
-            if self.flat:
-                ax1.set_title('Flat Transmission Preview (All Layers)')
-            else:
-                ax1.set_title('TD-Based Transmission Preview (Heightmap)')
-        else:
-            # Standard mode: VECTORIZED transmission simulation
-            simulator = TransmissionColorSimulator(self.selected_filaments, self.layer_height)
-
-            logger.info("Simulating transmission colors for preview (vectorized)...")
-
-            if self.use_cap_layers:
-                # CAP LAYERS MODE: dark base + colors + clear top
-                num_filaments = len(self.selected_filaments)
-                num_color_filaments = num_filaments - 2  # Exclude dark base and clear cap
-
-                logger.info(f"Cap layers mode: dark base + {num_color_filaments} colors + clear top")
-
-                # Create layer-to-filament assignment
-                # Layer 0-1: dark base (filament 0)
-                # Layer 2 to num_layers-2: colors (filaments 1 to n-2)
-                # Layer num_layers-1: clear cap (filament n-1)
-                layer_assignments = {}
-
-                # Dark base layers (first 2 layers)
-                layer_assignments[0] = 0
-                if self.num_layers > 1:
-                    layer_assignments[1] = 0
-
-                # Clear cap layer (top layer)
-                if self.num_layers > 2:
-                    layer_assignments[self.num_layers - 1] = num_filaments - 1
-
-                # Color layers in between
-                if self.num_layers > 3 and num_color_filaments > 0:
-                    for i in range(2, self.num_layers - 1):
-                        # Map to color filaments (indices 1 to num_filaments-2)
-                        color_layer_num = i - 2
-                        total_color_layers = self.num_layers - 3
-                        if total_color_layers > 0:
-                            filament_idx = int((color_layer_num / total_color_layers) * num_color_filaments) + 1
-                            filament_idx = min(filament_idx, num_filaments - 2)
-                        else:
-                            filament_idx = 1
-                        layer_assignments[i] = filament_idx
-
-            else:
-                # STANDARD MODE: distribute filaments evenly
-                colors_per_layer = len(self.selected_filaments)
-                layer_assignments = {}
-                for i in range(self.num_layers):
-                    filament_idx = int((i / self.num_layers) * colors_per_layer)
-                    filament_idx = min(filament_idx, colors_per_layer - 1)
-                    layer_assignments[i] = filament_idx
-
-            if use_transmission_preview:
-                # VECTORIZED: Pre-compute color for each unique layer height
-                unique_layers = np.unique(self.heightmap_layers)
-                layer_colors = {}
-
-                logger.info(f"Computing transmission colors for {len(unique_layers)} unique layer heights...")
-
-                for current_layer in tqdm(unique_layers, desc="Computing layer colors", leave=False):
-                    # Build layer stack from bottom to this height
-                    layer_stack = []
-                    for layer_num in range(int(current_layer) + 1):
-                        filament_idx = layer_assignments[layer_num]
-                        layer_stack.append(filament_idx)
-
-                    layer_heights = [self.layer_height] * len(layer_stack)
-                    color_rgb = simulator.simulate_layer_stack_color(layer_stack, layer_heights)
-                    layer_colors[int(current_layer)] = color_rgb
-
-                # VECTORIZED: Map pre-computed colors to all pixels based on their layer height
-                logger.info("Mapping colors to pixels (vectorized)...")
-                for layer_val, color in layer_colors.items():
-                    mask = self.heightmap_layers == layer_val
-                    colored_preview[mask] = color
-
-                logger.info("Vectorized transmission preview complete")
-                if self.use_cap_layers:
-                    ax1.set_title('Cap Layers Preview (Dark Base + Colors + Clear Top)')
-                else:
-                    ax1.set_title('Transmission-Simulated Color Preview')
-            else:
-                # Simple flat color assignment (old behavior)
-                colors_per_layer = len(self.selected_filaments)
-                for i, filament in self.selected_filaments.iterrows():
-                    layer_start = int((i / colors_per_layer) * self.num_layers)
-                    layer_end = int(((i + 1) / colors_per_layer) * self.num_layers)
-
-                    mask = (self.heightmap_layers >= layer_start) & (self.heightmap_layers < layer_end)
-                    colored_preview[mask] = filament['rgb']
-                ax1.set_title('Layer Color Preview')
-
-        # Flip preview vertically only to match image orientation
-        colored_preview_display = np.flipud(colored_preview)
-        ax1.imshow(colored_preview_display)
-        ax1.axis('off')
-
-        # Right: filament summary
-        filament_names = []
-        filament_colors = []
-
-        for i, filament in self.selected_filaments.iterrows():
-            name = filament['name']
-            td = filament['transmission_distance']
-            filament_names.append(f"{name}\n(TD: {td}mm)")
-            filament_colors.append(filament['rgb'])
-
-        # Create bar chart showing filament order
-        ax2.barh(range(len(filament_names)), [1] * len(filament_names),
-                color=filament_colors, edgecolor='black', linewidth=2)
-        ax2.set_yticks(range(len(filament_names)))
-        ax2.set_yticklabels(filament_names, fontsize=9)
-        ax2.set_xlabel('Filament')
-        ax2.set_xlim(0, 1)
-        ax2.set_xticks([])
-
-        if self.use_cap_layers:
-            ax2.set_title('Filaments (Bottom → Top)\nDark Base → Colors → Clear Cap')
-        else:
-            ax2.set_title('Filaments (Bottom → Top)')
-
-        plt.tight_layout()
-
-        if interactive:
-            # Interactive mode: display non-blocking window
-            logger.info("Displaying preview window...")
-            plt.show(block=False)
-            # Return figure handle so caller can close it later
-            return fig
-        elif output_path:
-            # Save mode: export to file
-            plt.savefig(output_path, dpi=150, bbox_inches='tight')
-            plt.close()
-            logger.info("Preview generated successfully")
-        else:
-            plt.close()
-
-
 def prompt_with_default(prompt_text, default_value, value_type=str):
     """Prompt user for input with a default value
 
@@ -1179,216 +825,6 @@ def prompt_with_default(prompt_text, default_value, value_type=str):
             print(f"Invalid input, using default: {default_value}")
             return default_value
 
-
-
-def _enhance_contrast(brightness, alpha_mask, strength=2.0):
-    """Apply contrast enhancement matching STLGenerator._apply_contrast_enhancement"""
-    mean_brightness = np.mean(brightness[alpha_mask >= 0.5]) if np.any(alpha_mask >= 0.5) else 0.5
-
-    if mean_brightness > 0.65:
-        gamma = 1.5
-        enhanced = np.power(brightness, gamma)
-        center = np.mean(enhanced)
-        s = 4.0
-        enhanced = 1.0 / (1.0 + np.exp(-s * (enhanced - center)))
-        enhanced = (enhanced - enhanced.min()) / (enhanced.max() - enhanced.min() + 1e-8)
-    elif mean_brightness < 0.35:
-        enhanced = np.power(brightness, 0.7)
-    else:
-        enhanced = 1.0 / (1.0 + np.exp(-strength * (brightness - 0.5)))
-        enhanced = (enhanced - enhanced.min()) / (enhanced.max() - enhanced.min() + 1e-8)
-
-    return enhanced
-
-
-def generate_preview(grayscale, selected_filaments, layer_height, model_height, use_cap_layers, alpha_mask,
-                     image_rgb=None, use_exploded=False, exploded_max_cap=3, sandwich_layers=1, use_fill=False):
-    """Generate preview image showing simulated color stacking appearance."""
-    height_px, width_px = grayscale.shape
-    preview = np.ones((height_px, width_px, 3))
-
-    num_colors = len(selected_filaments)
-    num_layers = int(model_height / layer_height)
-
-    if use_exploded and image_rgb is not None:
-        # Exploded mode preview: Beer-Lambert simulation of optimal layer assignments
-        from itertools import product as iter_product
-
-        num_color_filaments = num_colors - 1
-        if num_color_filaments <= 0:
-            return preview
-
-        total_sandwiches = num_layers
-
-        # Filament properties (colors + transparent)
-        color_rgbs = np.array([selected_filaments.iloc[i]['rgb'] for i in range(num_color_filaments)])
-        color_tds = np.array([selected_filaments.iloc[i]['transmission_distance'] for i in range(num_color_filaments)])
-        trans_rgb = np.array(selected_filaments.iloc[-1]['rgb'])
-        trans_td = selected_filaments.iloc[-1]['transmission_distance']
-
-        all_rgbs = np.vstack([color_rgbs, trans_rgb.reshape(1, 3)])
-        all_tds = np.append(color_tds, trans_td)
-
-        # Cap each color (matches _generate_exploded / _generate_exploded_multi)
-        per_color_caps = [min(exploded_max_cap, total_sandwiches) for _ in range(num_color_filaments)]
-
-        # Reduce caps if combo space too large
-        combo_size = 1
-        for cap in per_color_caps:
-            combo_size *= (cap + 1)
-        while combo_size > 500_000:
-            max_idx = per_color_caps.index(max(per_color_caps))
-            per_color_caps[max_idx] -= 1
-            combo_size = 1
-            for cap in per_color_caps:
-                combo_size *= (cap + 1)
-
-        # Generate valid combos with per-color caps
-        ranges = [range(0, cap + 1) for cap in per_color_caps]
-        all_combos = np.array(list(iter_product(*ranges)))
-        valid = all_combos.sum(axis=1) <= total_sandwiches
-        combos = all_combos[valid]
-
-        # Thicknesses including transparent fill
-        # Each sandwich has sandwich_layers color layers in the middle
-        color_thickness = layer_height * sandwich_layers
-        trans_layers = total_sandwiches - combos.sum(axis=1)
-        # With fill: unused sandwiches are fully transparent (same thickness as color)
-        # Without fill: unused sandwiches only have bottom transparent layer
-        trans_per_sandwich = color_thickness if use_fill else layer_height
-        thickness_combos = np.column_stack([
-            combos * color_thickness,
-            (trans_layers * trans_per_sandwich).reshape(-1, 1)
-        ])
-
-        # Beer-Lambert simulation
-        n_combos = len(thickness_combos)
-        light = np.ones((n_combos, 3))
-        for k in range(len(all_tds)):
-            thickness = thickness_combos[:, k]
-            td = max(all_tds[k], 0.1)
-            rgb = all_rgbs[k]
-            transmission = np.exp(-thickness / td)[:, None]
-            light = light * transmission + rgb[None, :] * (1.0 - transmission)
-            light = np.clip(light, 0, 1)
-
-        # Convert to LAB and build KDTree
-        from scipy.spatial import cKDTree
-        combo_lab = color.rgb2lab(light.reshape(-1, 1, 3)).reshape(-1, 3)
-        tree = cKDTree(combo_lab)
-
-        # Match each pixel
-        target_lab = color.rgb2lab(image_rgb).reshape(-1, 3)
-        _, indices = tree.query(target_lab, k=1)
-
-        # Preview shows the simulated Beer-Lambert color
-        preview = light[indices].reshape(height_px, width_px, 3)
-        preview[alpha_mask < 0.5] = [1, 1, 1]
-
-        return preview
-
-    if use_cap_layers:
-        # Cap layers mode: Beer-Lambert simulation matching STL generation
-        num_middle_colors = num_colors - 2
-
-        # Apply contrast enhancement to match STL generation
-        enhanced = _enhance_contrast(grayscale, alpha_mask)
-
-        # Sort middle filaments by luminosity (darkest first) to match _generate_with_cap_layers
-        sorted_fils = selected_filaments.copy()
-        sorted_fils['luminosity'] = sorted_fils['lab'].apply(
-            lambda x: float(np.asarray(x).flat[0]))
-        middle = sorted_fils.iloc[1:-1].sort_values('luminosity').reset_index(drop=True)
-        sorted_fils = pd.concat([
-            sorted_fils.iloc[:1],
-            middle,
-            sorted_fils.iloc[-1:]
-        ]).reset_index(drop=True)
-
-        simulator = TransmissionColorSimulator(sorted_fils, layer_height)
-
-        # Layer allocation matching _generate_with_cap_layers
-        base_layers = 2
-        top_layers = 2
-        middle_layers = num_layers - base_layers - top_layers
-        layers_per_color = middle_layers // num_middle_colors if num_middle_colors > 0 else 0
-
-        # Precompute Beer-Lambert color for 256 brightness levels
-        level_colors = np.zeros((256, 3))
-        for bi in range(256):
-            brightness = bi / 255.0
-            layer_stack = [0] * base_layers  # dark base
-            for i in range(num_middle_colors):
-                # Lightest middle → highest threshold (widest coverage)
-                # Darkest middle → lowest threshold (only darkest pixels)
-                threshold = (i + 1) / (num_middle_colors + 1)
-                filament_idx = i + 1 if brightness <= threshold else num_colors - 1
-                layer_stack.extend([filament_idx] * layers_per_color)
-            layer_stack.extend([num_colors - 1] * top_layers)  # clear top
-            layer_heights_list = [layer_height] * len(layer_stack)
-            level_colors[bi] = simulator.simulate_layer_stack_color(layer_stack, layer_heights_list, subtractive=True)
-
-        # Normalize range — Beer-Lambert through many layers compresses dynamic range
-        # into a narrow band (e.g. 0.6-0.9), making everything look grey.
-        # Stretch to full [0,1] to restore visible contrast.
-        min_val = level_colors.min()
-        max_val = level_colors.max()
-        if max_val > min_val:
-            level_colors = (level_colors - min_val) / (max_val - min_val)
-
-        # Map pixels to precomputed colors by contrast-enhanced brightness
-        for y in range(height_px):
-            for x in range(width_px):
-                if alpha_mask[y, x] < 0.5:
-                    preview[y, x] = [1, 1, 1]
-                    continue
-                bi = int(np.clip(enhanced[y, x] * 255, 0, 255))
-                preview[y, x] = level_colors[bi]
-
-    else:
-        # Standard mode: shaped color layers
-        for y in range(height_px):
-            for x in range(width_px):
-                if alpha_mask[y, x] < 0.5:
-                    preview[y, x] = [1, 1, 1]  # White for transparent areas
-                    continue
-
-                brightness = grayscale[y, x]
-
-                # Determine which layers this pixel gets
-                color_stack = []
-                for i in range(num_colors):
-                    threshold = i / num_colors
-                    if brightness >= threshold:
-                        color_stack.append(selected_filaments.iloc[i]['color_hex'])
-
-                # Simulate color mixing
-                final_color = simulate_color_stack(color_stack)
-                preview[y, x] = final_color
-
-    return preview
-
-
-def simulate_color_stack(color_hex_list):
-    """Simulate appearance of stacked colored layers
-
-    Simple simulation: average the RGB values of all layers
-    More sophisticated would use transmission distance, but this is good enough for preview
-    """
-    if not color_hex_list:
-        return [1, 1, 1]  # White if no colors
-
-    rgb_values = []
-    for hex_color in color_hex_list:
-        # Convert hex to RGB (0-1 range)
-        hex_color = hex_color.lstrip('#')
-        r = int(hex_color[0:2], 16) / 255.0
-        g = int(hex_color[2:4], 16) / 255.0
-        b = int(hex_color[4:6], 16) / 255.0
-        rgb_values.append([r, g, b])
-
-    # Simple average (could be weighted by transmission distance for accuracy)
-    return np.mean(rgb_values, axis=0)
 
 
 def show_3d_preview(stl_gen):
@@ -1660,6 +1096,8 @@ def main():
                         help='Fill sandwiches with transparent (inverse middle + top layer) [yes/no] (default: no)')
     parser.add_argument('--base-layers', type=int, default=None,
                         help='Transparent base layers per sandwich in exploded modes (default: 3)')
+    parser.add_argument('--max-color-sandwiches', type=int, default=None,
+                        help='Max sandwiches per colour in exploded modes (default: 3, multi: 5, CMYK: 1)')
 
     args = parser.parse_args()
 
@@ -1786,8 +1224,23 @@ def main():
         # Resolve fill (transparent fill in exploded sandwiches)
         use_fill = (args.fill.lower() in ('y', 'yes', 'true', '1')) if args.fill is not None else False
 
-        # Resolve base_layers (transparent base layers per sandwich)
-        base_layers = args.base_layers if args.base_layers is not None else 3
+        # Resolve base_layers (transparent base layers per sandwich / cap layers in cap-layers mode)
+        if args.base_layers is not None:
+            base_layers = args.base_layers
+        elif exploded_any:
+            base_layers = 3
+        else:
+            base_layers = 2
+
+        # Resolve max_color_sandwiches (max sandwiches per colour in exploded modes)
+        if args.max_color_sandwiches is not None:
+            max_color_sandwiches = args.max_color_sandwiches
+        elif use_exploded_cmyk:
+            max_color_sandwiches = 1
+        elif use_exploded_multi:
+            max_color_sandwiches = 5
+        else:
+            max_color_sandwiches = 3
 
         print("\n" + "=" * 60)
 
@@ -1814,7 +1267,7 @@ def main():
                 grayscale_tmp = (grayscale_tmp - grayscale_tmp.min()) / (grayscale_tmp.max() - grayscale_tmp.min())
 
             total_sandwiches = int(model_height / layer_height)
-            MAX_S_PER_COLOR = 5 if use_exploded_multi else 3
+            MAX_S_PER_COLOR = max_color_sandwiches
             max_try_k = min(total_sandwiches, 12)  # cap search at 12 colors
             mode_name = "exploded-multi" if use_exploded_multi else "exploded"
             logger.info(f"Auto-determining optimal color count for {mode_name} (K=3..{max_try_k}, cap={MAX_S_PER_COLOR})...")
@@ -1917,6 +1370,7 @@ def main():
                 layer_height=layer_height,
                 model_height=model_height,
                 sandwich_layers=sandwich_layers,
+                max_color_sandwiches=max_color_sandwiches,
             )
         elif exploded_any:
             selected_filaments = filament_lib.select_for_exploded(
@@ -1955,75 +1409,39 @@ def main():
 
         logger.info(f"Grayscale range: {grayscale.min():.3f} to {grayscale.max():.3f}")
 
-        # 6. Preview loop - show preview and get user approval
-        logger.info("\nGenerating preview...")
+        # 6. Preview loop — 3D browser preview + simplified menu
+        def _make_preview_gen():
+            return STLGenerator(
+                grayscale, width, layer_height, model_height,
+                selected_filaments,
+                alpha_mask=img_processor.alpha_mask,
+                use_cap_layers=use_cap_layers,
+                image_rgb=img_processor.image,
+                use_face_down=use_face_down,
+                use_exploded=use_exploded,
+                use_exploded_multi=use_exploded_multi,
+                use_exploded_cmyk=use_exploded_cmyk,
+                sandwich_layers=sandwich_layers,
+                use_fill=use_fill,
+                base_layers=base_layers,
+                max_color_sandwiches=max_color_sandwiches,
+            )
 
-        preview_approved = False
-        preview_img = generate_preview(
-            grayscale,
-            selected_filaments,
-            layer_height,
-            model_height,
-            use_cap_layers,
-            img_processor.alpha_mask,
-            image_rgb=img_processor.image if exploded_any else None,
-            use_exploded=exploded_any,
-            exploded_max_cap=2 if use_exploded_cmyk else (5 if use_exploded_multi else 3),
-            sandwich_layers=sandwich_layers,
-            use_fill=use_fill,
-        )
-        while not preview_approved:
+        show_3d_preview(_make_preview_gen())
 
-            # Show preview in non-blocking mode
-            import matplotlib.pyplot as plt
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 7))
-
-            # Left: Original image
-            # During load_and_prepare, image was flipud for STL orientation
-            # Flip it back for display to show original orientation
-            original_display = np.flipud(img_processor.image)
-            if use_face_down:
-                original_display = np.fliplr(original_display)
-            ax1.imshow(original_display)
-            ax1.set_title('Original Image', fontsize=14)
-            ax1.axis('off')
-
-            # Right: Stacking preview
-            preview_display = np.flipud(preview_img)
-            if use_face_down:
-                preview_display = np.fliplr(preview_display)
-            ax2.imshow(preview_display)
-            ax2.set_title('Color Stacking Preview', fontsize=14)
-            ax2.axis('off')
-
-            # Add filament legend
-            filament_text = "Filaments:\n"
-            for i, row in selected_filaments.iterrows():
-                filament_text += f"{i+1}. {row['name']}\n"
-            fig.text(0.98, 0.02, filament_text, fontsize=10, ha='right', va='bottom',
-                     bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-
-            plt.tight_layout()
-            plt.show(block=False)  # Non-blocking so CLI prompt appears
-            plt.pause(0.1)  # Brief pause to ensure window renders
-
-            # Ask user to proceed (prompt appears in CLI while window is open)
+        while True:
             print("\n" + "=" * 60)
-            print("Preview window displayed. What would you like to do?")
+            print("3D preview opened in browser. What would you like to do?")
             print("1. Generate STLs")
-            print("2. Regenerate with lower color delta")
-            print("3. View 3D preview (opens in browser)")
-            print("4. Cancel")
+            print("2. Adjust colors (reduce delta-E, re-preview)")
+            print("3. Cancel")
             print("=" * 60)
             choice = input("Enter choice [1]: ").strip() or "1"
 
-            plt.close(fig)
-
-            if choice == "4":
+            if choice == "3":
                 logger.info("Cancelled by user")
                 return 0
             elif choice == "2":
-                # Reduce color delta to allow more similar colors
                 min_color_difference = min_color_difference * 0.7
                 logger.info(f"Reducing color delta to {min_color_difference:.1f} and re-selecting filaments...")
                 if use_exploded_cmyk:
@@ -2031,6 +1449,7 @@ def main():
                         layer_height=layer_height,
                         model_height=model_height,
                         sandwich_layers=sandwich_layers,
+                        max_color_sandwiches=max_color_sandwiches,
                     )
                 elif exploded_any:
                     selected_filaments = filament_lib.select_for_exploded(
@@ -2048,47 +1467,12 @@ def main():
                         use_face_down=use_face_down,
                         randomize=False
                     )
-                logger.info("New filaments selected (dark to light):")
+                logger.info("New filaments selected:")
                 for i, row in selected_filaments.iterrows():
                     logger.info(f"  {i+1}. {row['name']} ({row['color_hex']}) - L={row['lab'][0]:.1f}")
-                preview_img = generate_preview(
-                    grayscale,
-                    selected_filaments,
-                    layer_height,
-                    model_height,
-                    use_cap_layers,
-                    img_processor.alpha_mask,
-                    image_rgb=img_processor.image if exploded_any else None,
-                    use_exploded=exploded_any,
-                    exploded_max_cap=2 if use_exploded_cmyk else (5 if use_exploded_multi else 3),
-                    sandwich_layers=sandwich_layers,
-                    use_fill=use_fill,
-                    base_layers=base_layers,
-                )
-            elif choice == "3":
-                # 3D preview in browser
-                preview_stl_gen = STLGenerator(
-                    grayscale,
-                    width,
-                    layer_height,
-                    model_height,
-                    selected_filaments,
-                    alpha_mask=img_processor.alpha_mask,
-                    use_cap_layers=use_cap_layers,
-                    image_rgb=img_processor.image,
-                    use_face_down=use_face_down,
-                    use_exploded=use_exploded,
-                    use_exploded_multi=use_exploded_multi,
-                    use_exploded_cmyk=use_exploded_cmyk,
-                    sandwich_layers=sandwich_layers,
-                    use_fill=use_fill,
-                    base_layers=base_layers,
-                )
-                show_3d_preview(preview_stl_gen)
-                # Loop continues to show 2D preview + menu again
+                show_3d_preview(_make_preview_gen())
             else:
-                # Choice 1 or default - proceed with STL generation
-                preview_approved = True
+                break
 
         logger.info("Generating STLs...")
 
@@ -2119,9 +1503,10 @@ def main():
             sandwich_layers=sandwich_layers,
             use_fill=use_fill,
             base_layers=base_layers,
+            max_color_sandwiches=max_color_sandwiches,
         )
 
-        generated_files = stl_gen.generate_all(output_path, single_stl=False)
+        generated_files = stl_gen.generate_all(output_path)
         logger.info(f"Generated {len(generated_files)} STL file(s)")
 
         # Show Beer-Lambert preview for face-down mode
@@ -2186,7 +1571,7 @@ def main():
             if use_exploded_cmyk:
                 f.write("EXPLODED CMYK MODE\n")
                 f.write("Uses 4 subtractive primaries (Cyan, Magenta, Yellow, Black) + transparent.\n")
-                f.write(f"Each colour has up to 2 intensity levels = max 8 sandwiches.\n")
+                f.write(f"Each colour has up to {max_color_sandwiches} intensity level(s) = max {4 * max_color_sandwiches} sandwiches.\n")
                 f.write(f"Each sandwich has {base_layers} base layer(s) + {sandwich_layers} colour layer(s)")
                 if use_fill:
                     f.write(f" + 1 top = {base_layers + sandwich_layers + 1} layers.\n\n")
