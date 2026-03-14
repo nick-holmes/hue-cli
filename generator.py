@@ -398,6 +398,14 @@ class STLGenerator:
                 cap = min(total_layers, max(6, int(td * 2)))
             per_color_caps.append(min(cap, total_layers))
 
+        # Reduce caps BEFORE generating combos to avoid memory explosion
+        # with many colors (e.g. 16 colors can produce trillions of combos)
+        from math import prod as math_prod
+        max_raw_combos = 2_000_000
+        while math_prod(c + 1 for c in per_color_caps) > max_raw_combos:
+            max_idx = per_color_caps.index(max(per_color_caps))
+            per_color_caps[max_idx] -= 1
+
         # Generate all combos respecting per-color caps
         ranges = [range(0, cap + 1) for cap in per_color_caps]
         all_combos = np.array(list(product(*ranges)))  # (n_combos, N)
@@ -407,7 +415,7 @@ class STLGenerator:
         valid = combo_totals <= total_layers
         combos = all_combos[valid]
 
-        # Cap combo space at 500K by reducing largest per-color cap
+        # Further reduce if still too many after budget filtering
         while len(combos) > 500000:
             max_idx = per_color_caps.index(max(per_color_caps))
             per_color_caps[max_idx] -= 1
@@ -1113,24 +1121,17 @@ class STLGenerator:
                 pixel_counts = self._compute_flat_layer_counts(
                     color_filaments, color_total_layers, ds_image_rgb, alpha_pixels)
 
-                # Compute per-layer cumulative Beer-Lambert previews
-                num_flat_colors = len(color_filaments)
-                light = np.ones((ds_H, ds_W, 3))
-                layer_previews = []
-                for i in range(num_flat_colors):
-                    fil = color_filaments.iloc[i]
-                    td = max(fil['transmission_distance'], 0.1)
-                    rgb = np.array(fil['rgb'])
-                    thickness = pixel_counts[:, :, i] * self.layer_height
-                    transmission = np.exp(-thickness / td)[:, :, np.newaxis]
-                    light = light * transmission + rgb * (1.0 - transmission)
-                    layer_previews.append(self._auto_contrast_preview(
-                        np.clip(light.copy(), 0, 1), alpha_pixels))
+                # Compute final Beer-Lambert preview through all layers
+                # In flat mode all layers overlap spatially, so every mesh
+                # should show the same final cumulative appearance
+                flat_preview = self._render_flat_preview(
+                    pixel_counts, color_filaments, transparent_filament, cap_layers)
+                flat_preview = self._auto_contrast_preview(flat_preview, alpha_pixels)
 
                 # Build one mesh per color with cumulative z stacking
                 z_cursor = np.zeros((ds_H, ds_W))
 
-                for k in range(num_flat_colors):
+                for k in range(len(color_filaments)):
                     filament = color_filaments.iloc[k]
                     z_bottom_k = z_cursor.copy()
                     z_top_k = z_bottom_k + pixel_counts[:, :, k] * self.layer_height
@@ -1140,7 +1141,7 @@ class STLGenerator:
                         mesh = self._generate_topographical_stl(z_bottom_k, z_top_k, pixel_mask)
                         if len(mesh.vertices) > 0:
                             self._apply_preview_face_colors(
-                                mesh, layer_previews[k], ds_W, ds_H)
+                                mesh, flat_preview, ds_W, ds_H)
                             name = filament['name'].replace(' ', '_')
                             hex_color = '%02x%02x%02x' % tuple(
                                 (np.array(filament['rgb']) * 255).astype(int))
@@ -1255,11 +1256,23 @@ class STLGenerator:
         """
         valid_pixels = preview_rgb[valid_mask]
         if len(valid_pixels) > 0:
+            # Linear percentile stretch
             p_lo = np.percentile(valid_pixels, 0.5)
             p_hi = np.percentile(valid_pixels, 99.5)
             rng = max(p_hi - p_lo, 0.01)
             preview_rgb = (preview_rgb - p_lo) / rng
             preview_rgb = np.clip(preview_rgb, 0, 1)
+
+            # Adaptive gamma: if median luminance is too bright (detail
+            # compressed into near-white range), apply gamma to spread it out
+            valid_stretched = preview_rgb[valid_mask]
+            median_lum = np.median(
+                0.299 * valid_stretched[:, 0] +
+                0.587 * valid_stretched[:, 1] +
+                0.114 * valid_stretched[:, 2])
+            if median_lum > 0.6:
+                gamma = np.log(0.5) / np.log(median_lum)
+                preview_rgb = np.power(preview_rgb, gamma)
         return preview_rgb
 
     def _apply_preview_face_colors(self, mesh, preview_rgb, width, height):
