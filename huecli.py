@@ -855,15 +855,10 @@ def _build_viewer_html(b64_glb, use_transparency=False, use_slider=False, defaul
   }}
   #sidebar.collapsed {{ transform: translateX(-100%); }}
   #sidebar-header {{
-    display: flex; justify-content: space-between; align-items: center;
+    text-align: center;
     margin-bottom: 10px; flex-shrink: 0;
   }}
   #sidebar-header span {{ color: #fff; font: bold 13px system-ui, sans-serif; }}
-  #bulk-toggle {{
-    color: rgba(255,255,255,0.5); font: 11px system-ui, sans-serif;
-    text-decoration: none; cursor: pointer;
-  }}
-  #bulk-toggle:hover {{ color: #fff; }}
   #sidebar-toggle {{
     position: absolute; top: 12px; left: 180px; z-index: 11;
     width: 24px; height: 28px; border: 1px solid rgba(255,255,255,0.2);
@@ -921,7 +916,6 @@ def _build_viewer_html(b64_glb, use_transparency=False, use_slider=False, defaul
 <div id="sidebar">
   <div id="sidebar-header">
     <span>Filaments</span>
-    <a id="bulk-toggle" href="#">Hide all</a>
   </div>
   <div id="swatch-list"></div>
 </div>
@@ -1220,21 +1214,6 @@ document.getElementById('sidebar-toggle').addEventListener('click', () => {{
   btn.innerHTML = sidebar.classList.contains('collapsed') ? '&#9654;' : '&#9664;';
 }});
 
-// Bulk show/hide
-document.getElementById('bulk-toggle').addEventListener('click', (e) => {{
-  e.preventDefault();
-  const items = document.querySelectorAll('.swatch-item');
-  const anyHidden = [...items].some(i => i.classList.contains('hidden'));
-  const show = anyHidden;
-  items.forEach(item => {{
-    if (show) item.classList.remove('hidden');
-    else item.classList.add('hidden');
-  }});
-  for (const entry of layerMeshes) {{
-    entry.mesh.visible = show;
-  }}
-  e.target.textContent = show ? 'Hide all' : 'Show all';
-}});
 
 (function animate() {{
   requestAnimationFrame(animate);
