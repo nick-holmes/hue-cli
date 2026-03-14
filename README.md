@@ -100,6 +100,7 @@ Fixed CMYK primaries (auto-selected from your library by delta-E). Each primary 
 | `-o, --output` | Output filename | `<input_stem>.stl` |
 | `-d, --min-delta-e` | Min colour difference | `5.0` |
 | `--mode` | Generation mode | `standard` |
+| `--scheme` | Remap image to a colour scheme palette | none |
 | `--flip` | Flip image: `horizontal`, `vertical`, or `both` | none |
 
 ### Exploded Mode Flags
@@ -116,6 +117,28 @@ Fixed CMYK primaries (auto-selected from your library by delta-E). Each primary 
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--base-layers` | Transparent cap layer count | `1` |
+
+## Colour Schemes
+
+Use `--scheme <name>` to remap your image to a preset colour palette before processing. The image pixels are reassigned to the nearest palette colour (in perceptual LAB space), then the normal pipeline runs on the remapped image. `-c` defaults to the number of colours in the scheme but can be overridden to use fewer.
+
+Works with all modes.
+
+| Scheme | Colours | Palette |
+|--------|---------|---------|
+| `greyscale` | 5 | ![#000000](https://placehold.co/20x20/000000/000000) ![#404040](https://placehold.co/20x20/404040/404040) ![#808080](https://placehold.co/20x20/808080/808080) ![#B0B0B0](https://placehold.co/20x20/B0B0B0/B0B0B0) ![#FFFFFF](https://placehold.co/20x20/FFFFFF/FFFFFF) |
+| `cyberpunk` | 6 | ![#0D0221](https://placehold.co/20x20/0D0221/0D0221) ![#FF00FF](https://placehold.co/20x20/FF00FF/FF00FF) ![#00FFFF](https://placehold.co/20x20/00FFFF/00FFFF) ![#FF6600](https://placehold.co/20x20/FF6600/FF6600) ![#FFFF00](https://placehold.co/20x20/FFFF00/FFFF00) ![#8B00FF](https://placehold.co/20x20/8B00FF/8B00FF) |
+| `sepia` | 5 | ![#2B1700](https://placehold.co/20x20/2B1700/2B1700) ![#6B3A1F](https://placehold.co/20x20/6B3A1F/6B3A1F) ![#A0724A](https://placehold.co/20x20/A0724A/A0724A) ![#C4A47A](https://placehold.co/20x20/C4A47A/C4A47A) ![#F5E6C8](https://placehold.co/20x20/F5E6C8/F5E6C8) |
+| `sunset` | 5 | ![#1A0533](https://placehold.co/20x20/1A0533/1A0533) ![#8B1A4A](https://placehold.co/20x20/8B1A4A/8B1A4A) ![#E94E3D](https://placehold.co/20x20/E94E3D/E94E3D) ![#F49D37](https://placehold.co/20x20/F49D37/F49D37) ![#FFD662](https://placehold.co/20x20/FFD662/FFD662) |
+| `ocean` | 5 | ![#001B2E](https://placehold.co/20x20/001B2E/001B2E) ![#014F6B](https://placehold.co/20x20/014F6B/014F6B) ![#0496A8](https://placehold.co/20x20/0496A8/0496A8) ![#5CC8D4](https://placehold.co/20x20/5CC8D4/5CC8D4) ![#D1F0F0](https://placehold.co/20x20/D1F0F0/D1F0F0) |
+| `vaporwave` | 5 | ![#2B0A3D](https://placehold.co/20x20/2B0A3D/2B0A3D) ![#FF71CE](https://placehold.co/20x20/FF71CE/FF71CE) ![#B967FF](https://placehold.co/20x20/B967FF/B967FF) ![#01CDFE](https://placehold.co/20x20/01CDFE/01CDFE) ![#05FFA1](https://placehold.co/20x20/05FFA1/05FFA1) |
+| `autumn` | 6 | ![#2D1B00](https://placehold.co/20x20/2D1B00/2D1B00) ![#8B2500](https://placehold.co/20x20/8B2500/8B2500) ![#CC5500](https://placehold.co/20x20/CC5500/CC5500) ![#E09540](https://placehold.co/20x20/E09540/E09540) ![#FFD700](https://placehold.co/20x20/FFD700/FFD700) ![#556B2F](https://placehold.co/20x20/556B2F/556B2F) |
+| `nordic` | 5 | ![#1C2833](https://placehold.co/20x20/1C2833/1C2833) ![#4A6A7A](https://placehold.co/20x20/4A6A7A/4A6A7A) ![#8EB8C4](https://placehold.co/20x20/8EB8C4/8EB8C4) ![#C8DDE0](https://placehold.co/20x20/C8DDE0/C8DDE0) ![#F0F5F5](https://placehold.co/20x20/F0F5F5/F0F5F5) |
+
+```bash
+# Example: sunset-themed print
+python3 huecli.py photo.png --scheme sunset --mode flat -s 120x160
+```
 
 ## Output Files
 

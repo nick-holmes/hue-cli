@@ -1247,6 +1247,12 @@ class STLGenerator:
     def _auto_contrast_preview(self, preview_rgb, valid_mask):
         """Auto-contrast stretch Beer-Lambert preview to use full display range.
 
+        Blends two stretch methods per-pixel based on saturation:
+        - Multiplicative (luminance ratio): preserves channel ratios, safe for
+          near-neutral colors (prevents grey→purple shifts)
+        - Subtractive (rgb - p_lo): preserves absolute channel differences,
+          safe for saturated colors (prevents color→greyscale wash-out)
+
         Args:
             preview_rgb: HxWx3 RGB image (0-1 range)
             valid_mask: 2D boolean mask of valid pixels
@@ -1256,23 +1262,41 @@ class STLGenerator:
         """
         valid_pixels = preview_rgb[valid_mask]
         if len(valid_pixels) > 0:
-            # Linear percentile stretch
-            p_lo = np.percentile(valid_pixels, 0.5)
-            p_hi = np.percentile(valid_pixels, 99.5)
-            rng = max(p_hi - p_lo, 0.01)
-            preview_rgb = (preview_rgb - p_lo) / rng
-            preview_rgb = np.clip(preview_rgb, 0, 1)
+            lum = (0.299 * preview_rgb[:, :, 0] +
+                   0.587 * preview_rgb[:, :, 1] +
+                   0.114 * preview_rgb[:, :, 2])
+            valid_lum = lum[valid_mask]
 
-            # Adaptive gamma: if median luminance is too bright (detail
-            # compressed into near-white range), apply gamma to spread it out
-            valid_stretched = preview_rgb[valid_mask]
-            median_lum = np.median(
-                0.299 * valid_stretched[:, 0] +
-                0.587 * valid_stretched[:, 1] +
-                0.114 * valid_stretched[:, 2])
+            p_lo = np.percentile(valid_lum, 0.5)
+            p_hi = np.percentile(valid_lum, 99.5)
+            rng = max(p_hi - p_lo, 0.01)
+            stretched_lum = np.clip((lum - p_lo) / rng, 0, 1)
+
+            # Multiplicative: preserves channel ratios (safe for near-neutral)
+            mul_scale = np.where(lum > 1e-10, stretched_lum / lum, 0.0)
+            stretched_mul = np.clip(preview_rgb * mul_scale[:, :, np.newaxis], 0, 1)
+
+            # Subtractive: preserves absolute channel diffs (safe for saturated)
+            stretched_sub = np.clip((preview_rgb - p_lo) / rng, 0, 1)
+
+            # Blend by original saturation: low sat → multiplicative, high sat → subtractive
+            sat = np.max(preview_rgb, axis=2) - np.min(preview_rgb, axis=2)
+            blend = np.clip((sat - 0.05) / 0.15, 0, 1)[:, :, np.newaxis]
+            preview_rgb = stretched_mul * (1 - blend) + stretched_sub * blend
+
+            # Adaptive gamma (recompute luminance after blend)
+            result_lum = (0.299 * preview_rgb[:, :, 0] +
+                          0.587 * preview_rgb[:, :, 1] +
+                          0.114 * preview_rgb[:, :, 2])
+            valid_result_lum = result_lum[valid_mask]
+            median_lum = np.median(valid_result_lum)
             if median_lum > 0.6:
                 gamma = np.log(0.5) / np.log(median_lum)
-                preview_rgb = np.power(preview_rgb, gamma)
+                corrected_lum = np.power(np.clip(result_lum, 1e-10, 1), gamma)
+                gamma_scale = np.where(result_lum > 1e-10,
+                                       corrected_lum / result_lum, 1.0)
+                preview_rgb = preview_rgb * gamma_scale[:, :, np.newaxis]
+                preview_rgb = np.clip(preview_rgb, 0, 1)
         return preview_rgb
 
     def _apply_preview_face_colors(self, mesh, preview_rgb, width, height):
@@ -1280,7 +1304,7 @@ class STLGenerator:
 
         Args:
             mesh: trimesh.Trimesh to color
-            preview_rgb: HxWx3 RGB preview image (0-1 range)
+            preview_rgb: HxWx3 RGB preview image (0-1 range, sRGB)
             width: preview image width (pixels)
             height: preview image height (pixels)
         """
@@ -1289,7 +1313,7 @@ class STLGenerator:
         py = np.clip((centroids[:, 1] / self.pixel_size).astype(int), 0, height - 1)
 
         face_colors = np.zeros((len(mesh.faces), 4), dtype=np.uint8)
-        face_colors[:, :3] = (preview_rgb[py, px] * 255).astype(np.uint8)
+        face_colors[:, :3] = (np.clip(preview_rgb[py, px], 0, 1) * 255).astype(np.uint8)
         face_colors[:, 3] = 255
         mesh.visual.face_colors = face_colors
 

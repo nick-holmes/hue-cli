@@ -21,6 +21,38 @@ from generator import STLGenerator
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
+# Color scheme palettes — each maps a name to a list of RGB hex colors.
+# When --scheme is used, image pixels are remapped to the nearest palette color
+# before entering the normal pipeline.
+COLOR_SCHEMES = {
+    'greyscale': [
+        '#000000', '#404040', '#808080', '#B0B0B0', '#FFFFFF',
+    ],
+    'cyberpunk': [
+        '#0D0221', '#FF00FF', '#00FFFF', '#FF6600', '#FFFF00',
+        '#8B00FF',
+    ],
+    'sepia': [
+        '#2B1700', '#6B3A1F', '#A0724A', '#C4A47A', '#F5E6C8',
+    ],
+    'sunset': [
+        '#1A0533', '#8B1A4A', '#E94E3D', '#F49D37', '#FFD662',
+    ],
+    'ocean': [
+        '#001B2E', '#014F6B', '#0496A8', '#5CC8D4', '#D1F0F0',
+    ],
+    'vaporwave': [
+        '#2B0A3D', '#FF71CE', '#B967FF', '#01CDFE', '#05FFA1',
+    ],
+    'autumn': [
+        '#2D1B00', '#8B2500', '#CC5500', '#E09540', '#FFD700',
+        '#556B2F',
+    ],
+    'nordic': [
+        '#1C2833', '#4A6A7A', '#8EB8C4', '#C8DDE0', '#F0F5F5',
+    ],
+}
+
 
 class FilamentLibrary:
     """Manages filament library from CSV"""
@@ -1262,6 +1294,9 @@ def main():
                         help='Transparent base layers per sandwich in exploded modes (default: 3)')
     parser.add_argument('--max-color-sandwiches', type=int, default=None,
                         help='Max sandwiches per colour in exploded modes (default: 3, multi: 5, CMYK: 1)')
+    parser.add_argument('--scheme', type=str, default=None,
+                        choices=list(COLOR_SCHEMES.keys()),
+                        help='Remap image to a colour scheme palette before processing')
     parser.add_argument('--flip', type=str, default=None,
                         choices=['horizontal', 'vertical', 'both'],
                         help='Flip the image before processing (horizontal, vertical, or both)')
@@ -1436,6 +1471,33 @@ def main():
             if img_processor.alpha_mask is not None:
                 img_processor.alpha_mask = np.flipud(img_processor.alpha_mask)
             logger.info("Applied vertical flip")
+
+        # Apply colour scheme remapping
+        if args.scheme is not None:
+            scheme_name = args.scheme
+            palette_hex = COLOR_SCHEMES[scheme_name]
+            palette_rgb = np.array([[int(h[1:3], 16), int(h[3:5], 16), int(h[5:7], 16)]
+                                    for h in palette_hex]) / 255.0
+            palette_lab = color.rgb2lab(palette_rgb.reshape(-1, 1, 3)).reshape(-1, 3)
+
+            # Remap every pixel to the nearest palette colour (in LAB space)
+            pixels_lab = img_processor.image_lab.reshape(-1, 3)
+            from scipy.spatial import cKDTree
+            tree = cKDTree(palette_lab)
+            _, indices = tree.query(pixels_lab, k=1)
+
+            # Rebuild the image from palette colours
+            remapped_rgb = palette_rgb[indices].reshape(img_processor.image.shape)
+            img_processor.image = remapped_rgb
+            img_processor.image_lab = color.rgb2lab(remapped_rgb)
+
+            logger.info(f"Remapped image to '{scheme_name}' scheme ({len(palette_hex)} colours)")
+
+            # Default -c to scheme size if not specified
+            if color_count is None and not use_exploded_cmyk:
+                color_count = len(palette_hex)
+                img_processor.color_count = color_count
+                logger.info(f"Defaulting colour count to scheme size: {color_count}")
 
         if exploded_any and not use_exploded_cmyk and color_count is None:
             # Iterative color count optimization: try K=3..max_k, score each by
