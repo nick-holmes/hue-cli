@@ -100,6 +100,7 @@ Fixed CMYK primaries (auto-selected from your library by delta-E). Each primary 
 | `-o, --output` | Output filename | `<input_stem>.stl` |
 | `-d, --min-delta-e` | Min colour difference | `5.0` |
 | `--mode` | Generation mode | `standard` |
+| `--flip` | Flip image: `horizontal`, `vertical`, or `both` | none |
 
 ### Exploded Mode Flags
 

@@ -1262,6 +1262,9 @@ def main():
                         help='Transparent base layers per sandwich in exploded modes (default: 3)')
     parser.add_argument('--max-color-sandwiches', type=int, default=None,
                         help='Max sandwiches per colour in exploded modes (default: 3, multi: 5, CMYK: 1)')
+    parser.add_argument('--flip', type=str, default=None,
+                        choices=['horizontal', 'vertical', 'both'],
+                        help='Flip the image before processing (horizontal, vertical, or both)')
 
     args = parser.parse_args()
 
@@ -1419,6 +1422,20 @@ def main():
         # For exploded mode, use placeholder color_count; auto-determine after loading
         img_processor = ImageProcessor(args.image, width, color_count or 4)
         img_processor.load_and_prepare(nozzle_diameter=nozzle_diameter)
+
+        # Apply user-requested flip
+        if args.flip in ('horizontal', 'both'):
+            img_processor.image = np.fliplr(img_processor.image)
+            img_processor.image_lab = np.fliplr(img_processor.image_lab)
+            if img_processor.alpha_mask is not None:
+                img_processor.alpha_mask = np.fliplr(img_processor.alpha_mask)
+            logger.info("Applied horizontal flip")
+        if args.flip in ('vertical', 'both'):
+            img_processor.image = np.flipud(img_processor.image)
+            img_processor.image_lab = np.flipud(img_processor.image_lab)
+            if img_processor.alpha_mask is not None:
+                img_processor.alpha_mask = np.flipud(img_processor.alpha_mask)
+            logger.info("Applied vertical flip")
 
         if exploded_any and not use_exploded_cmyk and color_count is None:
             # Iterative color count optimization: try K=3..max_k, score each by
