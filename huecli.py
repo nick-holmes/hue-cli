@@ -107,12 +107,15 @@ class FilamentLibrary:
             hex_color = hex_color[:6]  # Ignore alpha for now
         return tuple(int(hex_color[i:i+2], 16) / 255.0 for i in (0, 2, 4))
 
-    def select_best_filaments(self, target_colors_lab, count, layer_height=0.08, min_color_difference=15.0, randomize=False, use_flat_cap=False):
+    def select_best_filaments(self, target_colors_lab, count, layer_height=0.08, min_color_difference=15.0, randomize=False, use_flat_cap=False, model_height=2.0):
         """
         Select best matching filaments using direct delta-E color matching.
 
         Each filament's raw color is compared to target colors. The Beer-Lambert
         transmission physics are handled during generation, not selection.
+
+        Penalizes very high-TD filaments (TD > 20) in standard mode since they
+        need impractical thicknesses to show color and waste layer budget.
 
         When use_flat_cap=True, reserves 1 slot for transparent cap,
         and uses remaining slots for color matching.
@@ -121,6 +124,7 @@ class FilamentLibrary:
             min_color_difference: Minimum delta-E between selected filaments to ensure diversity
             randomize: Add random perturbation to selection to get variation
             use_flat_cap: Reserve a slot for transparent cap filament
+            model_height: Total model height in mm (for TD penalty scaling)
         """
         logger.info(f"Selecting {count} unique filaments from library (randomize: {randomize}, flat_cap: {use_flat_cap})")
 
@@ -166,6 +170,18 @@ class FilamentLibrary:
                     np.array([[target_lab]]),
                     np.array([[filament_lab]])
                 )[0][0]
+
+                # Penalize very high-TD filaments in standard mode.
+                # High TD means the filament is nearly transparent — it needs
+                # many mm of material to show color. In a model_height tall
+                # stack, a filament with TD >> model_height wastes its layer
+                # allocation producing almost no visible color.
+                td = row['transmission_distance']
+                if td > 20:
+                    # Logarithmic penalty: TD=20 -> +0, TD=100 -> +8, TD=200 -> +11
+                    td_penalty = np.log(td / 20) * 5.0
+                    delta_e += td_penalty
+                    logger.debug(f"  TD penalty for {row['name']}: +{td_penalty:.1f} (TD={td})")
 
                 # Add random perturbation if randomize mode enabled
                 if randomize:
@@ -1629,6 +1645,7 @@ def main():
                 layer_height=layer_height,
                 min_color_difference=min_color_difference,
                 use_flat_cap=use_flat_cap,
+                model_height=model_height,
             )
 
         logger.info("Selected filaments:")
@@ -1706,7 +1723,8 @@ def main():
                         layer_height=layer_height,
                         min_color_difference=min_color_difference,
                         use_flat_cap=use_flat_cap,
-                        randomize=False
+                        randomize=False,
+                        model_height=model_height,
                     )
                 logger.info("New filaments selected:")
                 for i, row in selected_filaments.iterrows():

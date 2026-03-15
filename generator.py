@@ -123,6 +123,66 @@ class STLGenerator:
 
         return enhanced
 
+    def _apply_unsharp_mask(self, grayscale, strength=1.5, radius=1.5):
+        """Apply unsharp mask to sharpen edges for crisper text and fine detail.
+
+        Enhances high-frequency detail (text strokes, edges) by amplifying the
+        difference between each pixel and its local neighbourhood. This makes
+        1-2 pixel text strokes stand out instead of blending into anti-aliased
+        gradients.
+
+        Includes spike suppression: isolated single-pixel extremes that would
+        create unprintable spikes are clamped to their neighbourhood range.
+        This preserves crisp edge TRANSITIONS (steep walls between regions)
+        while eliminating isolated SPIKES (single tall/short pixels).
+
+        Args:
+            grayscale: 2D array of brightness values (0-1)
+            strength: Sharpening strength (1.0 = subtle, 2.0 = aggressive)
+            radius: Gaussian blur radius in pixels for the unsharp kernel
+
+        Returns:
+            Sharpened grayscale (0-1, clipped)
+        """
+        from scipy.ndimage import gaussian_filter, maximum_filter, minimum_filter
+
+        blurred = gaussian_filter(grayscale, sigma=radius)
+        sharpened = grayscale + strength * (grayscale - blurred)
+        sharpened = np.clip(sharpened, 0, 1)
+
+        # Spike suppression: clamp each pixel to the min/max range of its
+        # immediate neighbours. This kills isolated single-pixel spikes while
+        # keeping legitimate edges (where at least one neighbour shares the
+        # extreme value). Uses a 3x3 footprint.
+        local_max = maximum_filter(sharpened, size=3)
+        local_min = minimum_filter(sharpened, size=3)
+
+        # For each pixel, find the range among its neighbours EXCLUDING itself.
+        # A pixel is a spike if it exceeds the range of ALL its neighbours.
+        # We approximate this by comparing to the local max/min of the original
+        # (pre-sharpened) image — spikes introduced by sharpening will exceed
+        # the original neighbourhood range.
+        orig_local_max = maximum_filter(grayscale, size=3)
+        orig_local_min = minimum_filter(grayscale, size=3)
+
+        # Clamp sharpened values that overshoot the original neighbourhood
+        # by more than a tolerance. This preserves real edges (which already
+        # existed in the original) while suppressing sharpening artifacts.
+        tolerance = 0.15  # Allow 15% overshoot for edge enhancement
+        upper_bound = orig_local_max + tolerance
+        lower_bound = orig_local_min - tolerance
+        sharpened = np.clip(sharpened, lower_bound, upper_bound)
+        sharpened = np.clip(sharpened, 0, 1)
+
+        # Preserve transparent areas
+        alpha_pixels = self.alpha_mask >= 0.5
+        sharpened = np.where(alpha_pixels, sharpened, grayscale)
+
+        spike_count = int(np.sum((sharpened != grayscale) & alpha_pixels))
+        logger.info(f"Unsharp mask: strength={strength:.1f}, radius={radius:.1f}px, "
+                     f"{spike_count:,} pixels sharpened")
+        return sharpened
+
     def _sort_filaments_by_luminosity(self):
         """Sort filaments by LAB luminosity (dark to light).
 
@@ -344,6 +404,7 @@ class STLGenerator:
         """
         sorted_filaments = self._sort_filaments_by_luminosity()
         enhanced_grayscale = self._apply_contrast_enhancement(self.image_grayscale.copy())
+        enhanced_grayscale = self._apply_unsharp_mask(enhanced_grayscale)
         alpha_pixels = self.alpha_mask >= 0.5
 
         filament_tds = np.array([f['transmission_distance'] for _, f in sorted_filaments.iterrows()])
@@ -1153,6 +1214,7 @@ class STLGenerator:
             else:
                 # Standard mode: one mesh per color band
                 enhanced = self._apply_contrast_enhancement(ds_grayscale.copy())
+                enhanced = self._apply_unsharp_mask(enhanced)
 
                 filament_tds = np.array([f['transmission_distance'] for _, f in sorted_filaments.iterrows()])
                 _, _, z_boundaries = self._allocate_layers_td_proportional(
@@ -1635,20 +1697,90 @@ class STLGenerator:
 
         mask_f = effective_mask.astype(np.float64)
 
-        # Compute corner z-values by averaging adjacent active pixels.
-        # Pixel (py, px) contributes to corners (py, px), (py, px+1), (py+1, px), (py+1, px+1).
-        # Corner grid is (H+1, W+1).
+        # Edge-preserving corner averaging: each corner averages adjacent active
+        # pixels, but only across edges where the height difference is small.
+        # At high-contrast edges (text boundaries, sharp detail), the corner
+        # keeps per-pixel heights instead of blending, preserving crispness.
+        #
+        # Corner grid is (H+1, W+1). Pixel (py, px) contributes to corners
+        # (py, px), (py, px+1), (py+1, px), (py+1, px+1).
+        # Threshold is relative to the height range within this mesh, so it
+        # adapts to both thin bands (black 0-0.28mm) and tall bands (yellow 2-3mm).
+        # A pixel whose corner deviation exceeds 15% of the local height range
+        # is considered an edge pixel.
+        zt_active = z_top[effective_mask]
+        height_range = zt_active.max() - zt_active.min()
+        edge_threshold = max(height_range * 0.15, self.layer_height)
+
         count = np.zeros((H + 1, W + 1))
         zb_sum = np.zeros((H + 1, W + 1))
         zt_sum = np.zeros((H + 1, W + 1))
 
+        # First pass: compute naive averages to detect edges
         for dy in range(2):
             for dx in range(2):
                 count[dy:H + dy, dx:W + dx] += mask_f
-                zb_sum[dy:H + dy, dx:W + dx] += z_bottom * mask_f
                 zt_sum[dy:H + dy, dx:W + dx] += z_top * mask_f
+                zb_sum[dy:H + dy, dx:W + dx] += z_bottom * mask_f
 
         corner_active = count > 0
+        zt_naive = np.divide(zt_sum, count, where=corner_active, out=np.zeros_like(zt_sum))
+
+        # Detect corners at high-contrast edges: compare each pixel's z_top
+        # to the naive average at its corners. If any corner shows a large
+        # deviation, this pixel sits on a sharp edge.
+        max_dev = np.zeros((H, W))
+        for dy in range(2):
+            for dx in range(2):
+                dev = np.abs(z_top - zt_naive[dy:H + dy, dx:W + dx])
+                max_dev = np.maximum(max_dev, dev)
+
+        is_edge_pixel = effective_mask & (max_dev > edge_threshold)
+        edge_count = int(is_edge_pixel.sum())
+
+        if edge_count > 0:
+            # Second pass: recompute with edge pixels excluded from averaging.
+            # Edge pixels contribute only to their own corners (weight=1),
+            # not blended with smooth neighbours.
+            smooth_f = effective_mask.astype(np.float64)
+            smooth_f[is_edge_pixel] = 0
+
+            count[:] = 0
+            zb_sum[:] = 0
+            zt_sum[:] = 0
+
+            # Smooth pixels: participate in normal averaging
+            smooth_zt = z_top * smooth_f
+            smooth_zb = z_bottom * smooth_f
+            for dy in range(2):
+                for dx in range(2):
+                    count[dy:H + dy, dx:W + dx] += smooth_f
+                    zt_sum[dy:H + dy, dx:W + dx] += smooth_zt
+                    zb_sum[dy:H + dy, dx:W + dx] += smooth_zb
+
+            # Edge pixels: add individually with weight 1 to each of their
+            # 4 corners, but only where no smooth pixels already contributed.
+            # Where smooth pixels exist, the edge pixel is excluded to prevent
+            # dragging the smooth average toward the sharp edge value.
+            edge_py, edge_px = np.where(is_edge_pixel)
+            edge_zt = z_top[edge_py, edge_px]
+            edge_zb = z_bottom[edge_py, edge_px]
+
+            for dy in range(2):
+                for dx in range(2):
+                    cy = edge_py + dy
+                    cx = edge_px + dx
+                    # Only fill corners that have no smooth-pixel contributions
+                    no_smooth = count[cy, cx] == 0
+                    if no_smooth.any():
+                        count[cy[no_smooth], cx[no_smooth]] += 1
+                        zt_sum[cy[no_smooth], cx[no_smooth]] += edge_zt[no_smooth]
+                        zb_sum[cy[no_smooth], cx[no_smooth]] += edge_zb[no_smooth]
+
+            corner_active = count > 0
+            logger.info(f"  Edge-preserving corners: {edge_count:,} edge pixels "
+                         f"({edge_count / effective_mask.sum() * 100:.1f}%) preserved sharp")
+
         zb_avg = np.divide(zb_sum, count, where=corner_active, out=np.zeros_like(zb_sum))
         zt_avg = np.divide(zt_sum, count, where=corner_active, out=np.zeros_like(zt_sum))
 
