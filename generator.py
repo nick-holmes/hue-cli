@@ -1330,8 +1330,8 @@ class STLGenerator:
 
         H, W = self.image_grayscale.shape
 
-        # Downsample for browser rendering (~100K pixels target)
-        ds = max(1, int(sqrt(H * W / 100000)))
+        # Downsample for browser rendering (~500K pixels target)
+        ds = max(1, int(sqrt(H * W / 500000)))
         ds_grayscale = self.image_grayscale[::ds, ::ds]
         ds_alpha = self.alpha_mask[::ds, ::ds]
         ds_image_rgb = self.image_rgb[::ds, ::ds] if self.image_rgb is not None else None
@@ -1373,39 +1373,30 @@ class STLGenerator:
                 pixel_counts = self._compute_flat_layer_counts(
                     color_filaments, color_total_layers, ds_image_rgb, alpha_pixels)
 
-                # Compute per-layer cumulative Beer-Lambert previews so each
-                # mesh shows correct appearance at its depth in the stack.
-                # Contrast params computed from final preview, applied uniformly.
+                # Compute single combined Beer-Lambert preview through ALL layers.
+                # All layer meshes show the same final combined result.
                 filament_rgbs = np.array([f['rgb'] for _, f in color_filaments.iterrows()])
                 filament_rgbs_lin = srgb_to_linear(filament_rgbs)
                 filament_tds = np.array([f['transmission_distance'] for _, f in color_filaments.iterrows()])
 
                 light = np.ones((ds_H, ds_W, 3))  # White backlight (linear)
-                raw_layer_previews = []
 
                 for k in range(len(color_filaments)):
                     td = max(filament_tds[k], 0.1)
                     thickness = pixel_counts[:, :, k] * self.layer_height
                     transmission = np.exp(-thickness / td)[:, :, np.newaxis]
                     light = light * transmission + filament_rgbs_lin[k] * (1.0 - transmission)
-                    raw_layer_previews.append(
-                        linear_to_srgb(np.clip(light.copy(), 0, 1)))
 
-                # Apply transparent cap to final preview if present
+                # Apply transparent cap if present
                 if transparent_filament is not None and cap_layers > 0:
                     trans_td = max(transparent_filament['transmission_distance'], 0.1)
                     trans_rgb_lin = srgb_to_linear(np.array(transparent_filament['rgb']))
                     cap_thickness = cap_layers * self.layer_height
                     cap_trans = np.exp(-cap_thickness / trans_td)
                     light = light * cap_trans + trans_rgb_lin * (1.0 - cap_trans)
-                    raw_layer_previews[-1] = linear_to_srgb(np.clip(light.copy(), 0, 1))
 
-                # Compute contrast params from final preview, apply to all
-                contrast_params = self._compute_contrast_params(
-                    raw_layer_previews[-1], alpha_pixels)
-                layer_previews = [
-                    self._apply_contrast_params(p, alpha_pixels, contrast_params)
-                    for p in raw_layer_previews]
+                combined_preview = self._auto_contrast_preview(
+                    linear_to_srgb(np.clip(light, 0, 1)), alpha_pixels)
 
                 # Build one mesh per color with cumulative z stacking
                 z_cursor = np.zeros((ds_H, ds_W))
@@ -1417,10 +1408,10 @@ class STLGenerator:
                     pixel_mask = pixel_counts[:, :, k] > 0
 
                     if pixel_mask.any():
-                        mesh = self._generate_topographical_stl(z_bottom_k, z_top_k, pixel_mask)
+                        mesh = self._generate_topographical_stl(z_bottom_k, z_top_k, pixel_mask, preview=True)
                         if len(mesh.vertices) > 0:
                             self._apply_preview_face_colors(
-                                mesh, layer_previews[k], ds_W, ds_H)
+                                mesh, combined_preview, ds_W, ds_H)
                             name = filament['name'].replace(' ', '_')
                             hex_color = '%02x%02x%02x' % tuple(
                                 (np.array(filament['rgb']) * 255).astype(int))
@@ -1441,17 +1432,14 @@ class STLGenerator:
                 min_thickness = self.layer_height * 0.5
                 combined_mask = alpha_pixels & (pixel_height > min_thickness)
 
-                # Compute per-layer cumulative Beer-Lambert previews so each mesh
-                # shows the correct appearance at its layer boundary. This allows
-                # hiding a top layer to naturally reveal correct colors beneath.
-                # Contrast params are computed from the FINAL cumulative preview
-                # and applied uniformly to all layers for visual consistency.
+                # Compute single combined Beer-Lambert preview through ALL layers.
+                # This shows what the final print looks like when backlit — each
+                # layer mesh is colored with the same combined result.
                 num_colors = len(sorted_filaments)
                 filament_rgbs = np.array([f['rgb'] for _, f in sorted_filaments.iterrows()])
                 filament_rgbs_lin = srgb_to_linear(filament_rgbs)
                 filament_tds = np.array([f['transmission_distance'] for _, f in sorted_filaments.iterrows()])
                 light = np.ones((ds_H, ds_W, 3))  # Linear light
-                raw_layer_previews = []
                 for i in range(num_colors):
                     z_lo = z_boundaries[i]
                     z_hi = z_boundaries[i + 1]
@@ -1459,15 +1447,9 @@ class STLGenerator:
                     td = max(filament_tds[i], 0.1)
                     transmission = np.exp(-thickness / td)[:, :, np.newaxis]
                     light = light * transmission + filament_rgbs_lin[i] * (1.0 - transmission)
-                    raw_layer_previews.append(
-                        linear_to_srgb(np.clip(light.copy(), 0, 1)))
 
-                # Compute contrast params from final cumulative preview, apply to all
-                contrast_params = self._compute_contrast_params(
-                    raw_layer_previews[-1], combined_mask)
-                layer_previews = [
-                    self._apply_contrast_params(p, combined_mask, contrast_params)
-                    for p in raw_layer_previews]
+                combined_preview = self._auto_contrast_preview(
+                    linear_to_srgb(np.clip(light, 0, 1)), combined_mask)
 
                 for k in range(num_colors):
                     filament = sorted_filaments.iloc[k]
@@ -1480,10 +1462,10 @@ class STLGenerator:
                     band_mask = combined_mask & (band_top > band_bottom + min_thickness)
 
                     if band_mask.any():
-                        mesh = self._generate_topographical_stl(band_bottom, band_top, band_mask)
+                        mesh = self._generate_topographical_stl(band_bottom, band_top, band_mask, preview=True)
                         if len(mesh.vertices) > 0:
                             self._apply_preview_face_colors(
-                                mesh, layer_previews[k], ds_W, ds_H)
+                                mesh, combined_preview, ds_W, ds_H)
                             name = filament['name'].replace(' ', '_')
                             hex_color = '%02x%02x%02x' % tuple(
                                 (np.array(filament['rgb']) * 255).astype(int))
@@ -1912,7 +1894,7 @@ class STLGenerator:
 
         return vertices, faces
 
-    def _generate_topographical_stl(self, z_bottom, z_top, pixel_mask):
+    def _generate_topographical_stl(self, z_bottom, z_top, pixel_mask, preview=False):
         """Generate topographical STL using shared-vertex grid.
 
         Each grid corner (H+1 x W+1) gets averaged z values from adjacent active
@@ -1984,7 +1966,7 @@ class STLGenerator:
         is_edge_pixel = effective_mask & (max_dev > edge_threshold)
         edge_count = int(is_edge_pixel.sum())
 
-        if edge_count > 0:
+        if edge_count > 0 and not preview:
             # Second pass: recompute with edge pixels excluded from averaging.
             # Edge pixels contribute only to their own corners (weight=1),
             # not blended with smooth neighbours.
@@ -2114,7 +2096,8 @@ class STLGenerator:
 
         combined_faces = np.vstack(all_faces)
         mesh = trimesh.Trimesh(vertices=vertices, faces=combined_faces, process=False)
-        mesh.fix_normals()
+        if not preview:
+            mesh.fix_normals()
 
         logger.info(f"  Shared-vertex grid: {effective_mask.sum():,} pixels, "
                      f"{n_active} corners -> {len(mesh.faces):,} faces")
