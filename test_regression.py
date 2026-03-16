@@ -21,6 +21,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from PIL import Image
+from skimage import color as skcolor
+
+from config import PipelineConfig, ProcessedImage
+import preview as preview_mod
 
 logging.basicConfig(level=logging.WARNING)
 
@@ -51,8 +55,6 @@ def create_test_image():
 
 def create_test_filaments(n_colors=4):
     """Create a small filament set for testing."""
-    from skimage import color as skcolor
-
     colors = [
         ('Dark Red', (0.3, 0.05, 0.05), 1.5),
         ('Forest Green', (0.05, 0.25, 0.05), 2.0),
@@ -67,7 +69,7 @@ def create_test_filaments(n_colors=4):
         'transmission_distance': [c[2] for c in colors],
         'Brand': ['Test'] * len(colors),
     })
-    # Add LAB column required by _sort_filaments_by_luminosity
+    # Add LAB column required by sort_filaments_by_luminosity
     df['lab'] = df['rgb'].apply(lambda rgb: skcolor.rgb2lab([[rgb]])[0][0])
     return df
 
@@ -127,44 +129,34 @@ def extract_metrics(scene, sorted_filaments):
 
 def run_mode_test(mode, verbose=False):
     """Run preview generation for a single mode and return metrics."""
-    from generator import STLGenerator
-
     img_rgb, grayscale, alpha = create_test_image()
     filaments = create_test_filaments(4)
 
-    use_flat = mode in ('flat', 'flat-cap')
-    use_flat_cap = mode == 'flat-cap'
-    use_exploded = mode == 'exploded'
-    use_exploded_multi = mode == 'exploded-multi'
-    use_exploded_cmyk = mode == 'exploded-cmyk'
-
     # Select filaments based on mode
-    if use_flat_cap:
+    if mode == 'flat-cap':
         selected = filaments  # Includes transparent
-    elif use_exploded_cmyk:
-        selected = filaments.iloc[:4]
     else:
         selected = filaments.iloc[:4]
 
-    stl_gen = STLGenerator(
-        image_grayscale=grayscale,
-        width_mm=40.0,
+    config = PipelineConfig(
         layer_height=0.08,
         model_height=1.5,
-        selected_filaments=selected,
-        alpha_mask=alpha,
-        use_flat=use_flat,
-        use_flat_cap=use_flat_cap,
-        use_exploded=use_exploded,
-        use_exploded_multi=use_exploded_multi,
-        use_exploded_cmyk=use_exploded_cmyk,
-        image_rgb=img_rgb,
+        width_mm=40.0,
+        mode=mode,
         sandwich_layers=1,
         base_layers=2,
     )
 
+    processed_image = ProcessedImage(
+        image_rgb=img_rgb,
+        image_lab=skcolor.rgb2lab(img_rgb),
+        grayscale=grayscale,
+        alpha_mask=alpha,
+    )
+
     t0 = time.time()
-    scene, sorted_filaments = stl_gen.generate_preview_scene()
+    scene, sorted_filaments = preview_mod.generate_preview_scene(
+        config, processed_image, selected)
     elapsed = time.time() - t0
 
     metrics = extract_metrics(scene, sorted_filaments)

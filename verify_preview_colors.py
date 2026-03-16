@@ -10,20 +10,13 @@ Run: python3 verify_preview_colors.py
 import numpy as np
 import sys
 sys.path.insert(0, '.')
-from generator import STLGenerator, srgb_to_linear, linear_to_srgb
+import color_science
+
+srgb_to_linear = color_science.srgb_to_linear
+linear_to_srgb = color_science.linear_to_srgb
 
 passed = 0
 failed = 0
-
-
-def make_generator():
-    """Create minimal STLGenerator for testing contrast methods."""
-    dummy_grey = np.zeros((10, 10))
-    dummy_filaments = __import__('pandas').DataFrame({
-        'name': ['test'], 'rgb': [(0.5, 0.5, 0.5)],
-        'transmission_distance': [2.0]
-    })
-    return STLGenerator(dummy_grey, 10.0, 0.08, 2.0, dummy_filaments)
 
 
 def test(name, condition, detail):
@@ -36,15 +29,13 @@ def test(name, condition, detail):
         failed += 1
 
 
-g = make_generator()
-
 # --- Test 1: Near-white subtle colors (the greyscale bug case) ---
 print("Test 1: Near-white pixels preserve hue (greyscale bug regression)")
 # Simulates Beer-Lambert output with translucent filaments: subtle warm tint
 preview = np.full((20, 20, 3), [0.95, 0.90, 0.85])  # Subtle warm
 preview[10:, :] = [0.92, 0.88, 0.82]  # Slightly more absorbed
 mask = np.ones((20, 20), dtype=bool)
-result = g._auto_contrast_preview(preview, mask)
+result = color_science.auto_contrast_preview(preview, mask)
 # After contrast, the warm tint should be AMPLIFIED, not greyed out
 pixel = result[5, 5]
 sat = max(pixel) - min(pixel)
@@ -59,7 +50,7 @@ test("warm hue order R>G>B", pixel[0] > pixel[1] > pixel[2],
 print("\nTest 2: Neutral grey stays neutral")
 preview = np.full((10, 10, 3), [0.5, 0.5, 0.5])
 mask = np.ones((10, 10), dtype=bool)
-result = g._auto_contrast_preview(preview, mask)
+result = color_science.auto_contrast_preview(preview, mask)
 pixel = result[5, 5]
 ratio = max(pixel) / max(min(pixel), 1e-10)
 test("channel ratio near 1.0", ratio < 1.02,
@@ -73,7 +64,7 @@ preview[5:10, :] = [0.9, 0.5, 0.0]  # orange
 preview[10:15, :] = [0.0, 0.0, 0.4] # dark blue
 preview[15:, :] = [1.0, 0.9, 0.0]   # yellow
 mask = np.ones((20, 20), dtype=bool)
-result = g._auto_contrast_preview(preview, mask)
+result = color_science.auto_contrast_preview(preview, mask)
 for name, (r, c) in [("blue", (2, 5)), ("orange", (7, 5)),
                        ("dark blue", (12, 5)), ("yellow", (17, 5))]:
     p = result[r, c]
@@ -102,7 +93,7 @@ for k in range(5):
     light = light * transmission + filament_colors_lin[k] * (1.0 - transmission)
 preview = linear_to_srgb(np.clip(light, 0, 1))
 mask = np.ones((H, W), dtype=bool)
-result = g._auto_contrast_preview(preview, mask)
+result = color_science.auto_contrast_preview(preview, mask)
 
 # Check color variance across image (should NOT be greyscale)
 r_std = result[:, :, 0].std()
@@ -131,8 +122,8 @@ for k in range(3):
     layer_previews.append(linear_to_srgb(np.clip(light.copy(), 0, 1)))
 
 mask = np.ones((30, 30), dtype=bool)
-params = g._compute_contrast_params(layer_previews[-1], mask)
-adjusted = [g._apply_contrast_params(p, mask, params) for p in layer_previews]
+params = color_science.compute_contrast_params(layer_previews[-1], mask)
+adjusted = [color_science.apply_contrast_params(p, mask, params) for p in layer_previews]
 
 # Each adjusted layer should have increasing absorption (darker)
 for i in range(1, len(adjusted)):
@@ -147,7 +138,7 @@ preview = np.zeros((20, 20, 3))
 preview[:10, :] = [0.95, 0.95, 0.90]  # near white (L≈96)
 preview[10:, :] = [0.05, 0.05, 0.10]  # near black (L≈5)
 mask = np.ones((20, 20), dtype=bool)
-params = g._compute_contrast_params(preview, mask)
+params = color_science.compute_contrast_params(preview, mask)
 test("no adjustment needed", params is None,
      f"params={params}")
 

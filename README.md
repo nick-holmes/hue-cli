@@ -4,7 +4,7 @@ Convert images into stacked topographical STL files using Beer-Lambert colour si
 
 ## How It Works
 
-HueCLI extracts dominant colours from an image via K-means clustering, matches them to your filament library using CIEDE2000 delta-E, then generates one STL per filament. Each layer's thickness varies per-pixel based on image brightness, creating colour through light transmission (Beer-Lambert physics). Filaments are sorted dark-to-light with layer height proportional to transmission distance.
+HueCLI extracts dominant colours from an image via K-means clustering, then selects filaments using physics-aware Beer-Lambert scoring — each candidate filament is evaluated at its estimated print thickness, not just its raw colour. Selection is automatically refined via simulated annealing. One STL is generated per filament, with per-pixel thickness varying based on image brightness, creating colour through light transmission (Beer-Lambert physics). Filaments are sorted dark-to-light with layer height proportional to transmission distance.
 
 ## Installation
 
@@ -165,6 +165,24 @@ A `.txt` file with printing instructions is also generated.
 Edit `filaments.csv`. Required columns: `Brand`, `Type`, `Color` (hex), `Name`, `TD` (transmission distance in mm), `Tags`.
 
 TD controls material needed to show colour: low TD = opaque, high TD = translucent.
+
+## Architecture
+
+Modular design with typed dataclasses and pure functions:
+
+| Module | Purpose |
+|--------|---------|
+| `config.py` | Typed dataclasses (`PipelineConfig`, `ProcessedImage`, etc.) |
+| `color_science.py` | Beer-Lambert, sRGB/linear, delta-E, contrast, dithering |
+| `mesh.py` | Topographical height-fields, greedy-meshed flat layers |
+| `filaments.py` | CSV loading, CIEDE2000 selection, SA optimization |
+| `image.py` | Load, resize, smooth, scheme remap, flip |
+| `preview.py` | Three.js GLB browser preview |
+| `cli.py` | Argparse wrapper |
+| `interactive.py` | Interactive prompt fallbacks |
+| `modes/` | One module per mode (`standard`, `flat`, `exploded`, `exploded_multi`, `exploded_cmyk`) |
+| `huecli.py` | Slim CLI orchestrator |
+| `generator.py` | Clean `STLGenerator` facade: config + image + filaments → STL files |
 
 ## License
 
