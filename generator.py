@@ -17,6 +17,19 @@ from skimage import color
 logger = logging.getLogger(__name__)
 
 
+def srgb_to_linear(srgb):
+    """IEC 61966-2-1 sRGB to linear light."""
+    return np.where(srgb <= 0.04045, srgb / 12.92,
+                    ((srgb + 0.055) / 1.055) ** 2.4)
+
+
+def linear_to_srgb(linear):
+    """IEC 61966-2-1 linear light to sRGB."""
+    linear = np.clip(linear, 0, 1)
+    return np.where(linear <= 0.0031308, linear * 12.92,
+                    1.055 * linear ** (1.0 / 2.4) - 0.055)
+
+
 class STLGenerator:
     """Generates stacked topographical STLs with cumulative Z-heights per color
 
@@ -29,7 +42,8 @@ class STLGenerator:
                  selected_filaments, alpha_mask=None, use_flat=False, image_rgb=None,
                  contrast_strength=2.0, use_flat_cap=False, use_exploded=False,
                  use_exploded_multi=False, use_exploded_cmyk=False, sandwich_layers=1,
-                 use_fill=False, base_layers=3, max_color_sandwiches=None):
+                 use_fill=False, base_layers=3, max_color_sandwiches=None,
+                 dither_mode='none'):
         """
         Args:
             image_grayscale: 2D array of brightness values (0=dark, 1=bright)
@@ -63,6 +77,7 @@ class STLGenerator:
         self.base_layers = base_layers
         self.max_color_sandwiches = max_color_sandwiches
         self.contrast_strength = contrast_strength
+        self.dither_mode = dither_mode
 
         self.num_layers = int(model_height / layer_height)
         self.num_colors = len(selected_filaments)
@@ -300,12 +315,12 @@ class STLGenerator:
                 pixel_count_filtered = int(np.sum(pixel_mask))
                 removed_pixels = pixel_count - pixel_count_filtered
                 if removed_pixels > 0:
-                    logger.info(f"  Filtered {removed_pixels} pixels in "
-                                 f"{int(np.sum(small_regions)) - 1} small regions")
+                    logger.debug(f"  Filtered {removed_pixels} pixels in "
+                                  f"{int(np.sum(small_regions)) - 1} small regions")
                 pixel_count = pixel_count_filtered
 
-            logger.info(f"  {color_name}: layers {layer_start}-{layer_end} "
-                         f"({layer_end - layer_start} layers, {pixel_count} px)")
+            logger.debug(f"  {color_name}: layers {layer_start}-{layer_end} "
+                          f"({layer_end - layer_start} layers, {pixel_count} px)")
 
             if pixel_count > 0:
                 z_top_color = np.clip(pixel_height, z_bottom_flat, z_top_boundary)
@@ -316,7 +331,7 @@ class STLGenerator:
 
                 if color_effective_mask.any():
                     z_top_max = np.max(z_top_color[color_effective_mask])
-                    logger.info(f"    z: {z_bottom_flat:.2f} - {z_top_max:.2f}mm")
+                    logger.debug(f"    z: {z_bottom_flat:.2f} - {z_top_max:.2f}mm")
 
                     output_path = output_base_path.parent / f"{output_base_path.stem}_{color_name}.stl"
                     mesh = self._generate_quantized_stl(z_bottom_color, z_top_color, color_effective_mask)
@@ -330,11 +345,11 @@ class STLGenerator:
                             layer_start_actual = int(np.floor(z_bottom_flat / self.layer_height))
                             layer_end_actual = int(np.ceil(max_z_top / self.layer_height))
                             generated_files.append((output_path, filament['name'], layer_start_actual, layer_end_actual))
-                        logger.info(f"  Generated: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
+                        logger.debug(f"  Generated: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
                     else:
-                        logger.warning(f"  Empty mesh for {color_name} - skipping")
+                        logger.debug(f"  Empty mesh for {color_name} - skipping")
             else:
-                logger.warning(f"  No pixels for {color_name} - skipping")
+                logger.debug(f"  No pixels for {color_name} - skipping")
 
         if collect_meshes:
             return mesh_outputs
@@ -343,35 +358,39 @@ class STLGenerator:
     def _vectorized_beer_lambert(self, filament_rgbs, filament_tds, thickness_combos):
         """Compute Beer-Lambert transmitted colors for all thickness combinations
 
-        Uses corrected transmissive filter model:
-        light_out = light_in * transmission + filament_rgb * (1 - transmission)
+        Uses corrected transmissive filter model in linear light space:
+        light_out = light_in * transmission + filament_rgb_lin * (1 - transmission)
 
         Args:
-            filament_rgbs: (num_colors, 3) array of filament RGB values (0-1)
+            filament_rgbs: (num_colors, 3) array of filament RGB values (0-1, sRGB)
             filament_tds: (num_colors,) array of transmission distances (mm)
             thickness_combos: (n_combos, num_colors) array of thicknesses (mm)
 
         Returns:
-            (n_combos, 3) array of resulting RGB colors (0-1)
+            (n_combos, 3) array of resulting RGB colors (0-1, sRGB)
         """
         n_combos = len(thickness_combos)
-        light = np.ones((n_combos, 3))  # White backlight
+        light = np.ones((n_combos, 3))  # White backlight (1.0 in both spaces)
+
+        # Linearize filament colors for physically correct simulation
+        filament_rgbs_lin = srgb_to_linear(np.array(filament_rgbs))
 
         indices = range(len(filament_tds))
         for k in indices:
             thickness = thickness_combos[:, k]  # (n_combos,)
             td = max(filament_tds[k], 0.1)
-            rgb = filament_rgbs[k]  # (3,)
+            rgb_lin = filament_rgbs_lin[k]  # (3,)
 
             # Beer-Lambert transmission factor
             transmission = np.exp(-thickness / td)  # (n_combos,)
             transmission = transmission[:, None]  # (n_combos, 1)
 
             # Transmissive filter: transparent → pass through, opaque → filament color
-            light = light * transmission + rgb[None, :] * (1.0 - transmission)
+            light = light * transmission + rgb_lin[None, :] * (1.0 - transmission)
             light = np.clip(light, 0, 1)
 
-        return light
+        # Convert back to sRGB for display/LAB conversion
+        return linear_to_srgb(light)
 
     def generate_all(self, output_base_path):
         """Generate STL files for the configured mode.
@@ -503,23 +522,39 @@ class STLGenerator:
         tree = cKDTree(combo_colors_lab)
 
         # Target pixel colors in LAB
-        target_lab = color.rgb2lab(image_rgb).reshape(-1, 3)
+        target_lab_flat = color.rgb2lab(image_rgb).reshape(-1, 3)
 
-        # Find nearest combo for each pixel
-        distances, indices = tree.query(target_lab, k=1)
+        # Apply dithering if requested
+        if self.dither_mode == 'ordered':
+            self._apply_ordered_dither(target_lab_flat, alpha_pixels.ravel())
 
-        # Log matching quality
-        valid_mask = alpha_pixels.ravel()
-        valid_distances = distances[valid_mask]
-        logger.info(f"  Flat Beer-Lambert matching: mean deltaE={np.mean(valid_distances):.2f}, "
-                     f"median={np.median(valid_distances):.2f}, "
-                     f"95th={np.percentile(valid_distances, 95):.2f}")
+        if self.dither_mode == 'floyd-steinberg':
+            target_lab_2d = color.rgb2lab(image_rgb)
+            pixel_counts = self._compute_flat_layer_counts_dithered(
+                target_lab_2d, alpha_pixels, combos, combo_colors_lab, tree)
 
-        # Map back to per-pixel layer counts
-        pixel_counts = combos[indices].reshape(H, W, N).astype(np.int32)
+            # Log matching quality
+            achieved_lab = combo_colors_lab[tree.query(target_lab_flat, k=1)[1]]
+            valid_mask = alpha_pixels.ravel()
+            valid_distances = np.sqrt(np.sum((target_lab_flat[valid_mask] - achieved_lab[valid_mask]) ** 2, axis=1))
+            logger.info(f"  Flat Beer-Lambert matching (dithered): mean deltaE={np.mean(valid_distances):.2f}")
+        else:
+            # Find nearest combo for each pixel (vectorized)
+            distances, indices = tree.query(target_lab_flat, k=1)
 
-        # Zero out transparent pixels
-        pixel_counts[~alpha_pixels] = 0
+            # Log matching quality
+            valid_mask = alpha_pixels.ravel()
+            valid_distances = distances[valid_mask]
+            dither_label = " (ordered dither)" if self.dither_mode == 'ordered' else ""
+            logger.info(f"  Flat Beer-Lambert matching{dither_label}: mean deltaE={np.mean(valid_distances):.2f}, "
+                         f"median={np.median(valid_distances):.2f}, "
+                         f"95th={np.percentile(valid_distances, 95):.2f}")
+
+            # Map back to per-pixel layer counts
+            pixel_counts = combos[indices].reshape(H, W, N).astype(np.int32)
+
+            # Zero out transparent pixels
+            pixel_counts[~alpha_pixels] = 0
 
         # Log per-color stats
         for k in range(N):
@@ -549,28 +584,28 @@ class STLGenerator:
             HxWx3 RGB preview image (0-1 range)
         """
         H, W = pixel_counts.shape[:2]
-        light = np.ones((H, W, 3))  # White backlight
+        light = np.ones((H, W, 3))  # White backlight (linear)
 
         for k in range(len(sorted_filaments)):
             filament = sorted_filaments.iloc[k]
             td = max(filament['transmission_distance'], 0.1)
-            rgb = np.array(filament['rgb'])
+            rgb_lin = srgb_to_linear(np.array(filament['rgb']))
             thickness = pixel_counts[:, :, k] * self.layer_height  # (H, W) varying
 
             transmission = np.exp(-thickness / td)  # (H, W)
             transmission = transmission[:, :, np.newaxis]  # (H, W, 1)
 
-            light = light * transmission + rgb * (1.0 - transmission)
+            light = light * transmission + rgb_lin * (1.0 - transmission)
 
         # Apply transparent cap if present
         if transparent_filament is not None and cap_layers > 0:
             trans_td = max(transparent_filament['transmission_distance'], 0.1)
-            trans_rgb = np.array(transparent_filament['rgb'])
+            trans_rgb_lin = srgb_to_linear(np.array(transparent_filament['rgb']))
             cap_thickness = cap_layers * self.layer_height
             transmission = np.exp(-cap_thickness / trans_td)
-            light = light * transmission + trans_rgb * (1.0 - transmission)
+            light = light * transmission + trans_rgb_lin * (1.0 - transmission)
 
-        return np.clip(light, 0, 1)
+        return linear_to_srgb(np.clip(light, 0, 1))
 
     def _generate_flat(self, output_base_path):
         """Generate flat mode with per-pixel varying layer counts via Beer-Lambert.
@@ -633,9 +668,9 @@ class STLGenerator:
                     mesh.export(str(output_path))
                     generated_files.append((output_path, filament['name'], k, k + 1))
                     max_layers = int(pixel_counts[:, :, k].max())
-                    logger.info(f"  {color_name}: max {max_layers} layers, {pixel_count} pixels")
+                    logger.debug(f"  {color_name}: max {max_layers} layers, {pixel_count} pixels")
             else:
-                logger.warning(f"  No pixels for {color_name} - skipping")
+                logger.debug(f"  No pixels for {color_name} - skipping")
 
             # Advance cursor for all pixels (even those with 0 layers for this color)
             z_cursor = z_top_k
@@ -753,28 +788,48 @@ class STLGenerator:
 
         # Target pixel colors in LAB
         if self.image_rgb is not None:
-            target_lab = color.rgb2lab(self.image_rgb).reshape(-1, 3)
+            target_lab_flat = color.rgb2lab(self.image_rgb).reshape(-1, 3)
         else:
             gray_rgb = np.stack([self.image_grayscale] * 3, axis=-1)
-            target_lab = color.rgb2lab(gray_rgb).reshape(-1, 3)
+            target_lab_flat = color.rgb2lab(gray_rgb).reshape(-1, 3)
 
-        # K=1 nearest neighbor (need integer results, not interpolated)
-        distances, indices = tree.query(target_lab, k=1)
+        alpha_pixels = self.alpha_mask >= 0.5
 
-        # Log matching quality
-        valid_mask = (self.alpha_mask >= 0.5).ravel()
-        valid_distances = distances[valid_mask]
-        logger.info(f"  Beer-Lambert matching: mean deltaE={np.mean(valid_distances):.2f}, "
-                     f"median={np.median(valid_distances):.2f}, "
-                     f"95th={np.percentile(valid_distances, 95):.2f}")
+        # Apply dithering if requested
+        if self.dither_mode == 'ordered':
+            self._apply_ordered_dither(target_lab_flat, alpha_pixels.ravel())
 
-        # Map back to layer counts
-        pixel_combos = combos[indices]
-        layer_counts = pixel_combos.reshape(H, W, num_colors).astype(np.int32)
+        if self.dither_mode == 'floyd-steinberg':
+            if self.image_rgb is not None:
+                target_lab_2d = color.rgb2lab(self.image_rgb)
+            else:
+                gray_rgb = np.stack([self.image_grayscale] * 3, axis=-1)
+                target_lab_2d = color.rgb2lab(gray_rgb)
 
-        # Zero out transparent pixels
-        alpha_mask_3d = (self.alpha_mask >= 0.5)[:, :, np.newaxis]
-        layer_counts = np.where(alpha_mask_3d, layer_counts, 0)
+            layer_counts = self._compute_exploded_layer_counts_dithered(
+                target_lab_2d, alpha_pixels, combos, combo_colors_lab, tree, num_colors)
+
+            valid_mask = alpha_pixels.ravel()
+            logger.info(f"  Beer-Lambert matching (Floyd-Steinberg dithered)")
+        else:
+            # K=1 nearest neighbor (need integer results, not interpolated)
+            distances, indices = tree.query(target_lab_flat, k=1)
+
+            # Log matching quality
+            valid_mask = alpha_pixels.ravel()
+            valid_distances = distances[valid_mask]
+            dither_label = " (ordered dither)" if self.dither_mode == 'ordered' else ""
+            logger.info(f"  Beer-Lambert matching{dither_label}: mean deltaE={np.mean(valid_distances):.2f}, "
+                         f"median={np.median(valid_distances):.2f}, "
+                         f"95th={np.percentile(valid_distances, 95):.2f}")
+
+            # Map back to layer counts
+            pixel_combos = combos[indices]
+            layer_counts = pixel_combos.reshape(H, W, num_colors).astype(np.int32)
+
+            # Zero out transparent pixels
+            alpha_mask_3d = alpha_pixels[:, :, np.newaxis]
+            layer_counts = np.where(alpha_mask_3d, layer_counts, 0)
 
         # Log per-color statistics
         total_sandwiches = 0
@@ -790,6 +845,142 @@ class STLGenerator:
         logger.info(f"  Total sandwiches: {total_sandwiches} ({total_sandwiches * 2} STL files)")
 
         return layer_counts
+
+    def _apply_ordered_dither(self, target_lab, alpha_mask):
+        """Apply ordered (Bayer) dithering to target LAB image.
+
+        Adds a spatially varying offset to the L channel based on an 8x8 Bayer matrix.
+        Fully vectorized — no serial dependency, so works with the existing KDTree pipeline.
+
+        Args:
+            target_lab: (H*W, 3) LAB array (modified in-place)
+            alpha_mask: (H*W,) boolean mask of valid pixels
+
+        Returns:
+            Modified target_lab (same array, modified in-place)
+        """
+        BAYER_8x8 = np.array([
+            [ 0, 32,  8, 40,  2, 34, 10, 42],
+            [48, 16, 56, 24, 50, 18, 58, 26],
+            [12, 44,  4, 36, 14, 46,  6, 38],
+            [60, 28, 52, 20, 62, 30, 54, 22],
+            [ 3, 35, 11, 43,  1, 33,  9, 41],
+            [51, 19, 59, 27, 49, 17, 57, 25],
+            [15, 47,  7, 39, 13, 45,  5, 37],
+            [63, 31, 55, 23, 61, 29, 53, 21],
+        ], dtype=np.float64) / 64.0 - 0.5  # Normalize to [-0.5, +0.5]
+
+        H, W = self.image_grayscale.shape
+        dither_strength = 5.0  # LAB L units
+
+        # Tile Bayer matrix to image size
+        bayer_tiled = np.tile(BAYER_8x8, (H // 8 + 1, W // 8 + 1))[:H, :W]
+        bayer_flat = bayer_tiled.ravel()
+
+        # Apply to L channel only for valid pixels
+        target_lab[alpha_mask, 0] += dither_strength * bayer_flat[alpha_mask]
+
+        return target_lab
+
+    def _compute_flat_layer_counts_dithered(self, target_lab, alpha_pixels, combos,
+                                             combo_colors_lab, tree):
+        """Floyd-Steinberg error diffusion for flat mode layer count assignment.
+
+        Processes pixels in scanline order, distributing quantization error to neighbours.
+
+        Args:
+            target_lab: (H, W, 3) LAB target image
+            alpha_pixels: (H, W) boolean mask
+            combos: (n_combos, N) int array of layer count combinations
+            combo_colors_lab: (n_combos, 3) LAB colors for each combo
+            tree: cKDTree built from combo_colors_lab
+
+        Returns:
+            (H, W, N) int32 array of per-pixel layer counts
+        """
+        H, W = alpha_pixels.shape
+        N = combos.shape[1]
+
+        # Work on a mutable copy of target LAB
+        error_lab = target_lab.copy()
+        pixel_counts = np.zeros((H, W, N), dtype=np.int32)
+
+        for y in range(H):
+            for x in range(W):
+                if not alpha_pixels[y, x]:
+                    continue
+
+                # Find nearest combo for this pixel
+                current_lab = error_lab[y, x].reshape(1, -1)
+                _, idx = tree.query(current_lab, k=1)
+                idx = int(idx)
+
+                pixel_counts[y, x] = combos[idx]
+
+                # Compute error: target - achieved
+                achieved_lab = combo_colors_lab[idx]
+                err = error_lab[y, x] - achieved_lab
+
+                # Distribute error to neighbours (Floyd-Steinberg kernel)
+                if x + 1 < W and alpha_pixels[y, x + 1]:
+                    error_lab[y, x + 1] += err * (7.0 / 16.0)
+                if y + 1 < H:
+                    if x - 1 >= 0 and alpha_pixels[y + 1, x - 1]:
+                        error_lab[y + 1, x - 1] += err * (3.0 / 16.0)
+                    if alpha_pixels[y + 1, x]:
+                        error_lab[y + 1, x] += err * (5.0 / 16.0)
+                    if x + 1 < W and alpha_pixels[y + 1, x + 1]:
+                        error_lab[y + 1, x + 1] += err * (1.0 / 16.0)
+
+        return pixel_counts
+
+    def _compute_exploded_layer_counts_dithered(self, target_lab, alpha_pixels, combos,
+                                                 combo_colors_lab, tree, num_colors):
+        """Floyd-Steinberg error diffusion for exploded mode layer count assignment.
+
+        Same algorithm as flat mode dithering but returns layer counts shaped for exploded mode.
+
+        Args:
+            target_lab: (H, W, 3) LAB target image
+            alpha_pixels: (H, W) boolean mask
+            combos: (n_combos, num_colors) int array of layer count combinations
+            combo_colors_lab: (n_combos, 3) LAB colors for each combo
+            tree: cKDTree built from combo_colors_lab
+            num_colors: number of color filaments
+
+        Returns:
+            (H, W, num_colors) int32 array of per-pixel layer counts
+        """
+        H, W = alpha_pixels.shape
+
+        error_lab = target_lab.copy()
+        pixel_counts = np.zeros((H, W, num_colors), dtype=np.int32)
+
+        for y in range(H):
+            for x in range(W):
+                if not alpha_pixels[y, x]:
+                    continue
+
+                current_lab = error_lab[y, x].reshape(1, -1)
+                _, idx = tree.query(current_lab, k=1)
+                idx = int(idx)
+
+                pixel_counts[y, x] = combos[idx]
+
+                achieved_lab = combo_colors_lab[idx]
+                err = error_lab[y, x] - achieved_lab
+
+                if x + 1 < W and alpha_pixels[y, x + 1]:
+                    error_lab[y, x + 1] += err * (7.0 / 16.0)
+                if y + 1 < H:
+                    if x - 1 >= 0 and alpha_pixels[y + 1, x - 1]:
+                        error_lab[y + 1, x - 1] += err * (3.0 / 16.0)
+                    if alpha_pixels[y + 1, x]:
+                        error_lab[y + 1, x] += err * (5.0 / 16.0)
+                    if x + 1 < W and alpha_pixels[y + 1, x + 1]:
+                        error_lab[y + 1, x + 1] += err * (1.0 / 16.0)
+
+        return pixel_counts
 
     def _generate_exploded_cmyk(self, output_base_path):
         """Generate exploded CMYK mode: 4 primaries with configurable sandwiches each."""
@@ -875,8 +1066,8 @@ class STLGenerator:
                 if pixel_count == 0:
                     continue
 
-                logger.info(f"  {color_name} sandwich {k}/{max_k}: {pixel_count} pixels "
-                             f"({layers_per_sandwich} layers/sandwich, {sl} color, fill={self.use_fill})")
+                logger.debug(f"  {color_name} sandwich {k}/{max_k}: {pixel_count} pixels "
+                              f"({layers_per_sandwich} layers/sandwich, {sl} color, fill={self.use_fill})")
 
                 # Color STL: middle layers
                 suffix = f"_{k}" if max_k > 1 else ""
@@ -1063,8 +1254,8 @@ class STLGenerator:
                 combined_color_mask |= mask
 
                 pixel_count = int(mask.sum())
-                logger.info(f"  Sandwich {sandwich_num}/{num_physical}: "
-                             f"{filament['name']} level {level} ({pixel_count} pixels)")
+                logger.debug(f"  Sandwich {sandwich_num}/{num_physical}: "
+                              f"{filament['name']} level {level} ({pixel_count} pixels)")
 
                 color_stl_path = (output_base_path.parent /
                     f"{output_base_path.stem}_S{sandwich_num:02d}_{color_name}_color.stl")
@@ -1182,12 +1373,39 @@ class STLGenerator:
                 pixel_counts = self._compute_flat_layer_counts(
                     color_filaments, color_total_layers, ds_image_rgb, alpha_pixels)
 
-                # Compute final Beer-Lambert preview through all layers
-                # In flat mode all layers overlap spatially, so every mesh
-                # should show the same final cumulative appearance
-                flat_preview = self._render_flat_preview(
-                    pixel_counts, color_filaments, transparent_filament, cap_layers)
-                flat_preview = self._auto_contrast_preview(flat_preview, alpha_pixels)
+                # Compute per-layer cumulative Beer-Lambert previews so each
+                # mesh shows correct appearance at its depth in the stack.
+                # Contrast params computed from final preview, applied uniformly.
+                filament_rgbs = np.array([f['rgb'] for _, f in color_filaments.iterrows()])
+                filament_rgbs_lin = srgb_to_linear(filament_rgbs)
+                filament_tds = np.array([f['transmission_distance'] for _, f in color_filaments.iterrows()])
+
+                light = np.ones((ds_H, ds_W, 3))  # White backlight (linear)
+                raw_layer_previews = []
+
+                for k in range(len(color_filaments)):
+                    td = max(filament_tds[k], 0.1)
+                    thickness = pixel_counts[:, :, k] * self.layer_height
+                    transmission = np.exp(-thickness / td)[:, :, np.newaxis]
+                    light = light * transmission + filament_rgbs_lin[k] * (1.0 - transmission)
+                    raw_layer_previews.append(
+                        linear_to_srgb(np.clip(light.copy(), 0, 1)))
+
+                # Apply transparent cap to final preview if present
+                if transparent_filament is not None and cap_layers > 0:
+                    trans_td = max(transparent_filament['transmission_distance'], 0.1)
+                    trans_rgb_lin = srgb_to_linear(np.array(transparent_filament['rgb']))
+                    cap_thickness = cap_layers * self.layer_height
+                    cap_trans = np.exp(-cap_thickness / trans_td)
+                    light = light * cap_trans + trans_rgb_lin * (1.0 - cap_trans)
+                    raw_layer_previews[-1] = linear_to_srgb(np.clip(light.copy(), 0, 1))
+
+                # Compute contrast params from final preview, apply to all
+                contrast_params = self._compute_contrast_params(
+                    raw_layer_previews[-1], alpha_pixels)
+                layer_previews = [
+                    self._apply_contrast_params(p, alpha_pixels, contrast_params)
+                    for p in raw_layer_previews]
 
                 # Build one mesh per color with cumulative z stacking
                 z_cursor = np.zeros((ds_H, ds_W))
@@ -1202,7 +1420,7 @@ class STLGenerator:
                         mesh = self._generate_topographical_stl(z_bottom_k, z_top_k, pixel_mask)
                         if len(mesh.vertices) > 0:
                             self._apply_preview_face_colors(
-                                mesh, flat_preview, ds_W, ds_H)
+                                mesh, layer_previews[k], ds_W, ds_H)
                             name = filament['name'].replace(' ', '_')
                             hex_color = '%02x%02x%02x' % tuple(
                                 (np.array(filament['rgb']) * 255).astype(int))
@@ -1226,20 +1444,30 @@ class STLGenerator:
                 # Compute per-layer cumulative Beer-Lambert previews so each mesh
                 # shows the correct appearance at its layer boundary. This allows
                 # hiding a top layer to naturally reveal correct colors beneath.
+                # Contrast params are computed from the FINAL cumulative preview
+                # and applied uniformly to all layers for visual consistency.
                 num_colors = len(sorted_filaments)
                 filament_rgbs = np.array([f['rgb'] for _, f in sorted_filaments.iterrows()])
+                filament_rgbs_lin = srgb_to_linear(filament_rgbs)
                 filament_tds = np.array([f['transmission_distance'] for _, f in sorted_filaments.iterrows()])
-                light = np.ones((ds_H, ds_W, 3))
-                layer_previews = []
+                light = np.ones((ds_H, ds_W, 3))  # Linear light
+                raw_layer_previews = []
                 for i in range(num_colors):
                     z_lo = z_boundaries[i]
                     z_hi = z_boundaries[i + 1]
                     thickness = np.clip(pixel_height, z_lo, z_hi) - z_lo
                     td = max(filament_tds[i], 0.1)
                     transmission = np.exp(-thickness / td)[:, :, np.newaxis]
-                    light = light * transmission + filament_rgbs[i] * (1.0 - transmission)
-                    layer_previews.append(self._auto_contrast_preview(
-                        np.clip(light.copy(), 0, 1), combined_mask))
+                    light = light * transmission + filament_rgbs_lin[i] * (1.0 - transmission)
+                    raw_layer_previews.append(
+                        linear_to_srgb(np.clip(light.copy(), 0, 1)))
+
+                # Compute contrast params from final cumulative preview, apply to all
+                contrast_params = self._compute_contrast_params(
+                    raw_layer_previews[-1], combined_mask)
+                layer_previews = [
+                    self._apply_contrast_params(p, combined_mask, contrast_params)
+                    for p in raw_layer_previews]
 
                 for k in range(num_colors):
                     filament = sorted_filaments.iloc[k]
@@ -1288,9 +1516,10 @@ class STLGenerator:
         num_colors = len(sorted_filaments)
 
         filament_rgbs = np.array([f['rgb'] for _, f in sorted_filaments.iterrows()])
+        filament_rgbs_lin = srgb_to_linear(filament_rgbs)
         filament_tds = np.array([f['transmission_distance'] for _, f in sorted_filaments.iterrows()])
 
-        light = np.ones((H, W, 3))  # White backlight
+        light = np.ones((H, W, 3))  # White backlight (linear)
 
         for i in range(num_colors):
             z_lo = z_boundaries[i]
@@ -1298,68 +1527,80 @@ class STLGenerator:
 
             thickness = np.clip(pixel_height, z_lo, z_hi) - z_lo
             td = max(filament_tds[i], 0.1)
-            rgb = filament_rgbs[i]
+            rgb_lin = filament_rgbs_lin[i]
 
             transmission = np.exp(-thickness / td)
             transmission_3d = transmission[:, :, np.newaxis]
-            light = light * transmission_3d + rgb * (1.0 - transmission_3d)
+            light = light * transmission_3d + rgb_lin * (1.0 - transmission_3d)
 
-        return np.clip(light, 0, 1)
+        return linear_to_srgb(np.clip(light, 0, 1))
 
-    def _auto_contrast_preview(self, preview_rgb, valid_mask):
-        """Auto-contrast stretch Beer-Lambert preview to use full display range.
+    def _compute_contrast_params(self, preview_rgb, valid_mask):
+        """Compute Lab lightness stretch parameters from a reference image.
 
-        Blends two stretch methods per-pixel based on saturation:
-        - Multiplicative (luminance ratio): preserves channel ratios, safe for
-          near-neutral colors (prevents grey→purple shifts)
-        - Subtractive (rgb - p_lo): preserves absolute channel differences,
-          safe for saturated colors (prevents color→greyscale wash-out)
+        Uses CIE Lab color space to stretch only the L (lightness) channel,
+        leaving a/b chrominance untouched. This guarantees hue preservation.
 
         Args:
-            preview_rgb: HxWx3 RGB image (0-1 range)
+            preview_rgb: HxWx3 RGB reference image (0-1 range, sRGB)
             valid_mask: 2D boolean mask of valid pixels
 
         Returns:
-            HxWx3 RGB image with contrast stretched
+            dict with 'p_lo' and 'rng' keys, or None if no adjustment needed
         """
-        valid_pixels = preview_rgb[valid_mask]
-        if len(valid_pixels) > 0:
-            lum = (0.299 * preview_rgb[:, :, 0] +
-                   0.587 * preview_rgb[:, :, 1] +
-                   0.114 * preview_rgb[:, :, 2])
-            valid_lum = lum[valid_mask]
+        if not valid_mask.any():
+            return None
 
-            p_lo = np.percentile(valid_lum, 0.5)
-            p_hi = np.percentile(valid_lum, 99.5)
-            rng = max(p_hi - p_lo, 0.01)
-            stretched_lum = np.clip((lum - p_lo) / rng, 0, 1)
+        lab = color.rgb2lab(np.clip(preview_rgb, 0, 1))
+        valid_L = lab[:, :, 0][valid_mask]
+        if len(valid_L) == 0:
+            return None
+        p_lo = np.percentile(valid_L, 1)
+        p_hi = np.percentile(valid_L, 99)
+        rng = p_hi - p_lo
+        if rng > 70:
+            return None  # Already uses most of L range
+        return {'p_lo': p_lo, 'rng': max(rng, 1.0)}
 
-            # Multiplicative: preserves channel ratios (safe for near-neutral)
-            mul_scale = np.where(lum > 1e-10, stretched_lum / lum, 0.0)
-            stretched_mul = np.clip(preview_rgb * mul_scale[:, :, np.newaxis], 0, 1)
+    def _apply_contrast_params(self, preview_rgb, valid_mask, params):
+        """Stretch L channel in Lab space, leave a/b unchanged.
 
-            # Subtractive: preserves absolute channel diffs (safe for saturated)
-            stretched_sub = np.clip((preview_rgb - p_lo) / rng, 0, 1)
+        Args:
+            preview_rgb: HxWx3 RGB image (0-1 range, sRGB)
+            valid_mask: 2D boolean mask of valid pixels
+            params: dict from _compute_contrast_params()
 
-            # Blend by original saturation: low sat → multiplicative, high sat → subtractive
-            sat = np.max(preview_rgb, axis=2) - np.min(preview_rgb, axis=2)
-            blend = np.clip((sat - 0.05) / 0.15, 0, 1)[:, :, np.newaxis]
-            preview_rgb = stretched_mul * (1 - blend) + stretched_sub * blend
+        Returns:
+            HxWx3 RGB image with lightness stretched
+        """
+        if params is None:
+            return preview_rgb
 
-            # Adaptive gamma (recompute luminance after blend)
-            result_lum = (0.299 * preview_rgb[:, :, 0] +
-                          0.587 * preview_rgb[:, :, 1] +
-                          0.114 * preview_rgb[:, :, 2])
-            valid_result_lum = result_lum[valid_mask]
-            median_lum = np.median(valid_result_lum)
-            if median_lum > 0.6:
-                gamma = np.log(0.5) / np.log(median_lum)
-                corrected_lum = np.power(np.clip(result_lum, 1e-10, 1), gamma)
-                gamma_scale = np.where(result_lum > 1e-10,
-                                       corrected_lum / result_lum, 1.0)
-                preview_rgb = preview_rgb * gamma_scale[:, :, np.newaxis]
-                preview_rgb = np.clip(preview_rgb, 0, 1)
-        return preview_rgb
+        lab = color.rgb2lab(np.clip(preview_rgb, 0, 1))
+        L = lab[:, :, 0]
+        new_L = 5 + (L - params['p_lo']) / params['rng'] * 90
+
+        # Boost chrominance proportionally to L-range expansion so colors
+        # remain visible at all lightness levels (not just near-white)
+        chroma_boost = min(90.0 / max(params['rng'], 1.0), 5.0)
+        lab[:, :, 1] *= chroma_boost
+        lab[:, :, 2] *= chroma_boost
+
+        lab[:, :, 0] = np.clip(new_L, 0, 100)
+        return np.clip(color.lab2rgb(lab), 0, 1)
+
+    def _auto_contrast_preview(self, preview_rgb, valid_mask):
+        """Auto-contrast Beer-Lambert preview using Lab lightness stretch.
+
+        Args:
+            preview_rgb: HxWx3 RGB image (0-1 range, sRGB)
+            valid_mask: 2D boolean mask of valid pixels
+
+        Returns:
+            HxWx3 RGB image with contrast adjusted
+        """
+        params = self._compute_contrast_params(preview_rgb, valid_mask)
+        return self._apply_contrast_params(preview_rgb, valid_mask, params)
 
     def _apply_preview_face_colors(self, mesh, preview_rgb, width, height):
         """Map Beer-Lambert preview image onto mesh faces by centroid position.
@@ -1374,8 +1615,10 @@ class STLGenerator:
         px = np.clip((centroids[:, 0] / self.pixel_size).astype(int), 0, width - 1)
         py = np.clip((centroids[:, 1] / self.pixel_size).astype(int), 0, height - 1)
 
+        rgb_float = np.clip(preview_rgb[py, px], 0, 1)
+
         face_colors = np.zeros((len(mesh.faces), 4), dtype=np.uint8)
-        face_colors[:, :3] = (np.clip(preview_rgb[py, px], 0, 1) * 255).astype(np.uint8)
+        face_colors[:, :3] = (rgb_float * 255).astype(np.uint8)
         face_colors[:, 3] = 255
         mesh.visual.face_colors = face_colors
 
@@ -1571,10 +1814,11 @@ class STLGenerator:
 
     @staticmethod
     def _greedy_mesh_rects(mask):
-        """Find maximal rectangles covering all True pixels using greedy meshing
+        """Find maximal rectangles covering all True pixels using greedy meshing.
 
-        Scans row by row, merging adjacent same-height pixels into rectangles.
-        This dramatically reduces face count compared to per-pixel geometry.
+        Uses numpy run-length detection per row for fast horizontal scanning,
+        then extends rectangles downward. Dramatically reduces face count
+        compared to per-pixel geometry.
 
         Args:
             mask: 2D boolean array
@@ -1586,31 +1830,33 @@ class STLGenerator:
             return []
 
         height, width = mask.shape
-        # Track which pixels have been consumed
         consumed = np.zeros_like(mask, dtype=bool)
         rects = []
 
         for y in range(height):
-            for x in range(width):
-                if not mask[y, x] or consumed[y, x]:
+            row_avail = mask[y] & ~consumed[y]
+            if not row_avail.any():
+                continue
+
+            # Find run starts and ends using numpy diff
+            padded = np.concatenate([[False], row_avail, [False]])
+            diff = np.diff(padded.astype(np.int8))
+            starts = np.where(diff == 1)[0]
+            ends = np.where(diff == -1)[0]
+
+            for s, e in zip(starts, ends):
+                if consumed[y, s]:
                     continue
 
-                # Extend rectangle rightward as far as possible
-                x_end = x + 1
-                while x_end < width and mask[y, x_end] and not consumed[y, x_end]:
-                    x_end += 1
-
-                # Extend rectangle downward as far as possible (vectorized row check)
+                # Extend downward as far as possible (vectorized row check)
                 y_end = y + 1
                 while y_end < height:
-                    row_slice = mask[y_end, x:x_end] & ~consumed[y_end, x:x_end]
-                    if not row_slice.all():
+                    if not (mask[y_end, s:e] & ~consumed[y_end, s:e]).all():
                         break
                     y_end += 1
 
-                # Mark consumed
-                consumed[y:y_end, x:x_end] = True
-                rects.append((y, x, y_end, x_end))
+                consumed[y:y_end, s:e] = True
+                rects.append((y, s, y_end, e))
 
         return rects
 

@@ -1,97 +1,72 @@
-"""Verify preview contrast stretch handles both grey and colorful filaments."""
+#!/usr/bin/env python3
+"""Verify preview contrast system preserves colors correctly.
+
+Tests the Lab-space contrast approach that stretches lightness and boosts
+a/b chrominance proportionally, so colors remain visible at all lightness
+levels (not washed out to greyscale).
+
+Run: python3 verify_preview_colors.py
+"""
 import numpy as np
 import sys
+sys.path.insert(0, '.')
+from generator import STLGenerator, srgb_to_linear, linear_to_srgb
 
-# Minimal mock of STLGenerator to test the fixed method
-class MockGenerator:
-    def _auto_contrast_preview(self, preview_rgb, valid_mask):
-        valid_pixels = preview_rgb[valid_mask]
-        if len(valid_pixels) > 0:
-            lum = (0.299 * preview_rgb[:, :, 0] +
-                   0.587 * preview_rgb[:, :, 1] +
-                   0.114 * preview_rgb[:, :, 2])
-            valid_lum = lum[valid_mask]
-            p_lo = np.percentile(valid_lum, 0.5)
-            p_hi = np.percentile(valid_lum, 99.5)
-            rng = max(p_hi - p_lo, 0.01)
-            stretched_lum = np.clip((lum - p_lo) / rng, 0, 1)
-
-            # Multiplicative: preserves channel ratios (safe for near-neutral)
-            mul_scale = np.where(lum > 1e-10, stretched_lum / lum, 0.0)
-            stretched_mul = np.clip(preview_rgb * mul_scale[:, :, np.newaxis], 0, 1)
-
-            # Subtractive: preserves absolute channel diffs (safe for saturated)
-            stretched_sub = np.clip((preview_rgb - p_lo) / rng, 0, 1)
-
-            # Blend by original saturation
-            sat = np.max(preview_rgb, axis=2) - np.min(preview_rgb, axis=2)
-            blend = np.clip((sat - 0.05) / 0.15, 0, 1)[:, :, np.newaxis]
-            preview_rgb = stretched_mul * (1 - blend) + stretched_sub * blend
-
-            # Adaptive gamma
-            result_lum = (0.299 * preview_rgb[:, :, 0] +
-                          0.587 * preview_rgb[:, :, 1] +
-                          0.114 * preview_rgb[:, :, 2])
-            valid_result_lum = result_lum[valid_mask]
-            median_lum = np.median(valid_result_lum)
-            if median_lum > 0.6:
-                gamma = np.log(0.5) / np.log(median_lum)
-                corrected_lum = np.power(np.clip(result_lum, 1e-10, 1), gamma)
-                gamma_scale = np.where(result_lum > 1e-10,
-                                       corrected_lum / result_lum, 1.0)
-                preview_rgb = preview_rgb * gamma_scale[:, :, np.newaxis]
-                preview_rgb = np.clip(preview_rgb, 0, 1)
-        return preview_rgb
-
-
-g = MockGenerator()
 passed = 0
 failed = 0
 
-# Test 1: Burnt Grey (#45444d) stays near-neutral after contrast stretch
-print("Test 1: Burnt Grey hue preservation")
-preview = np.full((10, 10, 3), [0.271, 0.267, 0.302])  # #45444d
+
+def make_generator():
+    """Create minimal STLGenerator for testing contrast methods."""
+    dummy_grey = np.zeros((10, 10))
+    dummy_filaments = __import__('pandas').DataFrame({
+        'name': ['test'], 'rgb': [(0.5, 0.5, 0.5)],
+        'transmission_distance': [2.0]
+    })
+    return STLGenerator(dummy_grey, 10.0, 0.08, 2.0, dummy_filaments)
+
+
+def test(name, condition, detail):
+    global passed, failed
+    if condition:
+        print(f"  PASS — {name}: {detail}")
+        passed += 1
+    else:
+        print(f"  FAIL — {name}: {detail}")
+        failed += 1
+
+
+g = make_generator()
+
+# --- Test 1: Near-white subtle colors (the greyscale bug case) ---
+print("Test 1: Near-white pixels preserve hue (greyscale bug regression)")
+# Simulates Beer-Lambert output with translucent filaments: subtle warm tint
+preview = np.full((20, 20, 3), [0.95, 0.90, 0.85])  # Subtle warm
+preview[10:, :] = [0.92, 0.88, 0.82]  # Slightly more absorbed
+mask = np.ones((20, 20), dtype=bool)
+result = g._auto_contrast_preview(preview, mask)
+# After contrast, the warm tint should be AMPLIFIED, not greyed out
+pixel = result[5, 5]
+sat = max(pixel) - min(pixel)
+test("warm tint saturation", sat > 0.05,
+     f"sat={sat:.3f} (want > 0.05), pixel=[{pixel[0]:.3f}, {pixel[1]:.3f}, {pixel[2]:.3f}]")
+
+# Check that R > G > B ordering preserved (warm hue)
+test("warm hue order R>G>B", pixel[0] > pixel[1] > pixel[2],
+     f"R={pixel[0]:.3f} G={pixel[1]:.3f} B={pixel[2]:.3f}")
+
+# --- Test 2: Grey pixels stay grey ---
+print("\nTest 2: Neutral grey stays neutral")
+preview = np.full((10, 10, 3), [0.5, 0.5, 0.5])
 mask = np.ones((10, 10), dtype=bool)
 result = g._auto_contrast_preview(preview, mask)
 pixel = result[5, 5]
 ratio = max(pixel) / max(min(pixel), 1e-10)
-if ratio < 1.15:
-    print(f"  PASS — channel ratio {ratio:.3f} (< 1.15)")
-    passed += 1
-else:
-    print(f"  FAIL — channel ratio {ratio:.3f} (>= 1.15), pixel={pixel}")
-    failed += 1
+test("channel ratio near 1.0", ratio < 1.02,
+     f"ratio={ratio:.4f} (want < 1.02)")
 
-# Test 2: Mixed grey palette preserves neutrality
-print("Test 2: Mixed grey palette")
-greys = [
-    [0.271, 0.267, 0.302],  # #45444d
-    [0.361, 0.361, 0.361],  # #5c5c5c
-    [0.886, 0.886, 0.886],  # #e2e2e2
-    [1.0, 1.0, 1.0],        # #ffffff
-]
-preview = np.zeros((20, 20, 3))
-for i, c in enumerate(greys):
-    preview[i*5:(i+1)*5, :] = c
-mask = np.ones((20, 20), dtype=bool)
-result = g._auto_contrast_preview(preview, mask)
-max_ratio = 0
-for i in range(20):
-    for j in range(20):
-        p = result[i, j]
-        mn = min(p)
-        if mn > 0.01:
-            r = max(p) / mn
-            max_ratio = max(max_ratio, r)
-if max_ratio < 1.15:
-    print(f"  PASS — max channel ratio {max_ratio:.3f} (< 1.15)")
-    passed += 1
-else:
-    print(f"  FAIL — max channel ratio {max_ratio:.3f} (>= 1.15)")
-    failed += 1
-
-# Test 3: Colorful pixels retain saturation (regression test for cyberpunk wash-out)
-print("Test 3: Saturated colors retain saturation")
+# --- Test 3: Saturated colors retain saturation ---
+print("\nTest 3: Saturated colors retain saturation")
 preview = np.zeros((20, 20, 3))
 preview[:5, :] = [0.0, 0.0, 0.8]    # blue
 preview[5:10, :] = [0.9, 0.5, 0.0]  # orange
@@ -99,38 +74,83 @@ preview[10:15, :] = [0.0, 0.0, 0.4] # dark blue
 preview[15:, :] = [1.0, 0.9, 0.0]   # yellow
 mask = np.ones((20, 20), dtype=bool)
 result = g._auto_contrast_preview(preview, mask)
-# Check that saturated pixels retain color (saturation > 0.1)
-test_pixels = [(2, 5), (7, 5), (12, 5), (17, 5)]
-all_saturated = True
-for r, c in test_pixels:
+for name, (r, c) in [("blue", (2, 5)), ("orange", (7, 5)),
+                       ("dark blue", (12, 5)), ("yellow", (17, 5))]:
     p = result[r, c]
     sat = max(p) - min(p)
-    if sat < 0.1:
-        print(f"  FAIL — pixel ({r},{c}) lost saturation: {p}, sat={sat:.3f}")
-        all_saturated = False
-        failed += 1
-        break
-if all_saturated:
-    avg_sat = np.mean([max(result[r, c]) - min(result[r, c]) for r, c in test_pixels])
-    print(f"  PASS — avg saturation {avg_sat:.3f} (> 0.1)")
-    passed += 1
+    test(f"{name} saturation", sat > 0.1,
+         f"sat={sat:.3f}, pixel=[{p[0]:.2f}, {p[1]:.2f}, {p[2]:.2f}]")
 
-# Test 4: Contrast stretch still works for non-grey images
-print("Test 4: Non-grey image still stretches")
-preview = np.zeros((10, 10, 3))
-preview[:5, :] = [0.2, 0.05, 0.05]  # dark red
-preview[5:, :] = [0.4, 0.1, 0.1]    # slightly brighter red
-mask = np.ones((10, 10), dtype=bool)
+# --- Test 4: Simulated Beer-Lambert output with multiple filaments ---
+print("\nTest 4: Beer-Lambert simulation preserves color variety")
+# Simulate 5 filaments being layered (dark to light)
+filament_colors_srgb = np.array([
+    [0.2, 0.1, 0.1],   # dark red
+    [0.0, 0.3, 0.0],   # green
+    [0.1, 0.1, 0.5],   # blue
+    [0.8, 0.6, 0.0],   # yellow/gold
+    [0.9, 0.9, 0.9],   # near white
+])
+filament_colors_lin = srgb_to_linear(filament_colors_srgb)
+H, W = 50, 50
+light = np.ones((H, W, 3))
+rng = np.random.RandomState(42)
+for k in range(5):
+    thickness = rng.uniform(0.0, 0.5, (H, W))
+    td = 2.0
+    transmission = np.exp(-thickness / td)[:, :, np.newaxis]
+    light = light * transmission + filament_colors_lin[k] * (1.0 - transmission)
+preview = linear_to_srgb(np.clip(light, 0, 1))
+mask = np.ones((H, W), dtype=bool)
 result = g._auto_contrast_preview(preview, mask)
-bright = result[8, 5]
-dark = result[2, 5]
-if bright[0] > dark[0] + 0.3:
-    print(f"  PASS — contrast stretched (dark={dark[0]:.2f}, bright={bright[0]:.2f})")
-    passed += 1
-else:
-    print(f"  FAIL — insufficient stretch (dark={dark[0]:.2f}, bright={bright[0]:.2f})")
-    failed += 1
 
-print(f"\n{'='*40}")
+# Check color variance across image (should NOT be greyscale)
+r_std = result[:, :, 0].std()
+g_std = result[:, :, 1].std()
+b_std = result[:, :, 2].std()
+test("red channel variance", r_std > 0.02, f"std={r_std:.4f}")
+test("green channel variance", g_std > 0.02, f"std={g_std:.4f}")
+test("blue channel variance", b_std > 0.02, f"std={b_std:.4f}")
+
+# Check that result is not greyscale (channels differ at most pixels)
+diffs = np.abs(result[:, :, 0] - result[:, :, 1]) + \
+        np.abs(result[:, :, 1] - result[:, :, 2])
+chromatic_frac = (diffs > 0.02).mean()
+test("fraction of chromatic pixels", chromatic_frac > 0.3,
+     f"{chromatic_frac:.1%} of pixels are chromatic (want > 30%)")
+
+# --- Test 5: Contrast params computed once, applied to multiple layers ---
+print("\nTest 5: Consistent params across layers")
+# Build layer previews like generate_preview_scene does
+light = np.ones((30, 30, 3))
+layer_previews = []
+for k in range(3):
+    thickness = rng.uniform(0.0, 0.3, (30, 30))
+    transmission = np.exp(-thickness / 2.0)[:, :, np.newaxis]
+    light = light * transmission + filament_colors_lin[k] * (1.0 - transmission)
+    layer_previews.append(linear_to_srgb(np.clip(light.copy(), 0, 1)))
+
+mask = np.ones((30, 30), dtype=bool)
+params = g._compute_contrast_params(layer_previews[-1], mask)
+adjusted = [g._apply_contrast_params(p, mask, params) for p in layer_previews]
+
+# Each adjusted layer should have increasing absorption (darker)
+for i in range(1, len(adjusted)):
+    prev_mean = adjusted[i-1].mean()
+    curr_mean = adjusted[i].mean()
+    test(f"layer {i} darker than {i-1}", curr_mean <= prev_mean + 0.01,
+         f"mean[{i-1}]={prev_mean:.3f}, mean[{i}]={curr_mean:.3f}")
+
+# --- Test 6: Full L-range image needs no adjustment ---
+print("\nTest 6: Full L-range image passes through unchanged")
+preview = np.zeros((20, 20, 3))
+preview[:10, :] = [0.95, 0.95, 0.90]  # near white (L≈96)
+preview[10:, :] = [0.05, 0.05, 0.10]  # near black (L≈5)
+mask = np.ones((20, 20), dtype=bool)
+params = g._compute_contrast_params(preview, mask)
+test("no adjustment needed", params is None,
+     f"params={params}")
+
+print(f"\n{'='*50}")
 print(f"Results: {passed} passed, {failed} failed")
 sys.exit(0 if failed == 0 else 1)

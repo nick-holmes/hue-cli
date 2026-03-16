@@ -17,7 +17,6 @@ import trimesh
 
 from generator import STLGenerator
 
-# Configure logging
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -545,6 +544,197 @@ class FilamentLibrary:
         result_indices = selected_indices + [transparent_idx]
         return self.df.iloc[result_indices].reset_index(drop=True)
 
+    def optimize_filament_set(self, selected_filaments, image_rgb, alpha_mask,
+                               layer_height, model_height, num_layers,
+                               mode='standard', iterations=300,
+                               sandwich_layers=1, use_fill=False):
+        """Optimize filament selection via simulated annealing.
+
+        Starts from greedy selection, iteratively swaps filaments and scores
+        the set by mean delta-E on a downsampled image using Beer-Lambert simulation.
+
+        Args:
+            selected_filaments: DataFrame of initially selected filaments
+            image_rgb: HxWx3 RGB image (0-1 range)
+            alpha_mask: HxW alpha mask
+            layer_height: Layer height in mm
+            model_height: Total model height in mm
+            num_layers: Total number of layers
+            mode: Generation mode string
+            iterations: Number of SA iterations
+            sandwich_layers: Color layers per sandwich
+            use_fill: Whether fill is enabled
+
+        Returns:
+            Optimized DataFrame of filaments
+        """
+        import random
+        from scipy.spatial import cKDTree
+
+        is_flat = mode in ('flat', 'flat-cap')
+        is_exploded = mode in ('exploded', 'exploded-multi', 'exploded-cmyk')
+        has_transparent = is_flat and mode == 'flat-cap' or is_exploded
+
+        # Downsample image for fast scoring (~50x50 = 2500 pixels)
+        H, W = image_rgb.shape[:2]
+        from math import sqrt
+        ds = max(1, int(sqrt(H * W / 2500)))
+        ds_rgb = image_rgb[::ds, ::ds]
+        ds_alpha = alpha_mask[::ds, ::ds]
+        ds_H, ds_W = ds_rgb.shape[:2]
+        ds_lab = color.rgb2lab(ds_rgb)
+        alpha_valid = ds_alpha >= 0.5
+
+        logger.info(f"Filament optimization: {iterations} SA iterations on {ds_H}x{ds_W} image")
+
+        def score_filaments(filaments_df):
+            """Score a filament set by mean delta-E via Beer-Lambert simulation."""
+            from generator import STLGenerator as _STLGen
+
+            filament_rgbs = np.array([f['rgb'] for _, f in filaments_df.iterrows()])
+            filament_tds = np.array([f['transmission_distance'] for _, f in filaments_df.iterrows()])
+
+            if is_flat or is_exploded:
+                # Use Beer-Lambert combo simulation
+                if has_transparent:
+                    color_fils = filaments_df.iloc[:-1]
+                    trans_fil = filaments_df.iloc[-1]
+                    c_rgbs = np.array([f['rgb'] for _, f in color_fils.iterrows()])
+                    c_tds = np.array([f['transmission_distance'] for _, f in color_fils.iterrows()])
+                    all_rgbs = np.vstack([c_rgbs, np.array(trans_fil['rgb']).reshape(1, 3)])
+                    all_tds = np.append(c_tds, trans_fil['transmission_distance'])
+                else:
+                    c_rgbs = filament_rgbs
+                    c_tds = filament_tds
+                    all_rgbs = filament_rgbs
+                    all_tds = filament_tds
+
+                num_c = len(c_tds)
+                # Build combos with small caps for speed
+                from itertools import product as _prod
+                caps = [min(3, num_layers) for _ in range(num_c)]
+                from math import prod as _mprod
+                while _mprod(c + 1 for c in caps) > 50000:
+                    mi = caps.index(max(caps))
+                    caps[mi] -= 1
+                ranges = [range(0, c + 1) for c in caps]
+                all_combos = np.array(list(_prod(*ranges)))
+                valid = all_combos.sum(axis=1) <= num_layers
+                combos = all_combos[valid]
+
+                # Create temporary generator for Beer-Lambert
+                ds_gray = np.mean(ds_rgb, axis=2)
+                tmp_gen = _STLGen(ds_gray, 10.0, layer_height, model_height,
+                                  filaments_df, alpha_mask=ds_alpha, image_rgb=ds_rgb)
+
+                if is_exploded and has_transparent:
+                    color_thickness = layer_height * sandwich_layers
+                    trans_per_sandwich = color_thickness if use_fill else layer_height
+                    trans_layers = num_layers - combos.sum(axis=1)
+                    thickness = np.column_stack([
+                        combos * color_thickness,
+                        (trans_layers * trans_per_sandwich).reshape(-1, 1)
+                    ])
+                else:
+                    thickness = combos * layer_height
+
+                sim_rgb = tmp_gen._vectorized_beer_lambert(all_rgbs, all_tds, thickness)
+                sim_lab = color.rgb2lab(sim_rgb.reshape(-1, 1, 3)).reshape(-1, 3)
+                tree = cKDTree(sim_lab)
+                target_lab = ds_lab.reshape(-1, 3)
+                dists, _ = tree.query(target_lab, k=1)
+                return float(np.mean(dists[alpha_valid.ravel()]))
+            else:
+                # Standard mode: simple nearest-filament delta-E
+                fil_lab = np.array([f['lab'] for _, f in filaments_df.iterrows()])
+                tree = cKDTree(fil_lab)
+                target_lab = ds_lab.reshape(-1, 3)
+                dists, _ = tree.query(target_lab, k=1)
+                return float(np.mean(dists[alpha_valid.ravel()]))
+
+        # Initial score
+        best_filaments = selected_filaments.copy()
+        best_score = score_filaments(best_filaments)
+        current_filaments = best_filaments.copy()
+        current_score = best_score
+        initial_score = best_score
+
+        # Identify which slots can be swapped (protect transparent in exploded/flat-cap)
+        num_total = len(selected_filaments)
+        if has_transparent:
+            swappable_slots = list(range(num_total - 1))  # Don't swap transparent
+        else:
+            swappable_slots = list(range(num_total))
+
+        if not swappable_slots:
+            logger.info("No swappable filament slots — skipping optimization")
+            return selected_filaments
+
+        # Get all available filament indices
+        all_indices = set(self.df.index)
+        temperature = 10.0
+        cooling = 0.97
+        no_improve_count = 0
+
+        for i in range(iterations):
+            # Pick a random slot and a random replacement
+            slot = random.choice(swappable_slots)
+            current_indices = set()
+            for _, row in current_filaments.iterrows():
+                # Find matching index in library
+                matches = self.df[self.df['name'] == row['name']].index
+                if len(matches) > 0:
+                    current_indices.add(matches[0])
+
+            available = list(all_indices - current_indices)
+            if not available:
+                continue
+
+            new_idx = random.choice(available)
+            # Build candidate by replacing one row via concat (avoids iloc assignment issues with array columns)
+            rows = []
+            for r in range(len(current_filaments)):
+                if r == slot:
+                    rows.append(self.df.iloc[new_idx])
+                else:
+                    rows.append(current_filaments.iloc[r])
+            candidate = pd.DataFrame(rows).reset_index(drop=True)
+
+            candidate_score = score_filaments(candidate)
+            delta = candidate_score - current_score
+
+            # Accept if better, or probabilistically if worse
+            if delta < 0 or random.random() < np.exp(-delta / max(temperature, 0.01)):
+                current_filaments = candidate
+                current_score = candidate_score
+
+                if current_score < best_score:
+                    best_filaments = current_filaments.copy()
+                    best_score = current_score
+                    no_improve_count = 0
+                else:
+                    no_improve_count += 1
+            else:
+                no_improve_count += 1
+
+            temperature *= cooling
+
+            # Early stopping
+            if no_improve_count >= 50:
+                logger.debug(f"  Early stopping at iteration {i+1} (no improvement for 50 iterations)")
+                break
+
+        improvement = (initial_score - best_score) / max(initial_score, 0.01) * 100
+        logger.info(f"Filament optimization: deltaE {initial_score:.2f} -> {best_score:.2f} "
+                     f"({improvement:+.1f}% improvement)")
+
+        # Log selected filaments
+        for _, row in best_filaments.iterrows():
+            logger.info(f"  Optimized: {row['name']} ({row['color_hex']})")
+
+        return best_filaments
+
+
 class ImageProcessor:
     """Handles image loading and color quantization"""
 
@@ -986,10 +1176,10 @@ import {{ GLTFLoader }} from 'three/addons/loaders/GLTFLoader.js';
 const base64 = "{b64_glb}";
 const FILAMENT_DATA = {filament_info_json};
 
-// Decode base64 → ArrayBuffer (avoids data-URL size limits)
-const bin = atob(base64);
-const buf = new Uint8Array(bin.length);
-for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+// Decode base64 → ArrayBuffer
+const raw = atob(base64);
+const buf = new Uint8Array(raw.length);
+for (let i = 0; i < raw.length; i++) buf[i] = raw.charCodeAt(i);
 
 const scene    = new THREE.Scene();
 scene.background = new THREE.Color(0x1a1a1a);
@@ -998,6 +1188,7 @@ const renderer = new THREE.WebGLRenderer({{ antialias: true }});
 renderer.setPixelRatio(window.devicePixelRatio);
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.toneMapping = THREE.NoToneMapping;
+renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
 document.body.appendChild(renderer.domElement);
 
 // Lighting — dim ambient only; mesh uses emissive material for backlit effect
@@ -1316,6 +1507,13 @@ def main():
     parser.add_argument('--flip', type=str, default=None,
                         choices=['horizontal', 'vertical', 'both'],
                         help='Flip the image before processing (horizontal, vertical, or both)')
+    parser.add_argument('--dither', type=str, default=None,
+                        choices=['none', 'floyd-steinberg', 'ordered'],
+                        help='Dithering for flat/exploded modes (default: none)')
+    parser.add_argument('--optimize-filaments', action='store_true', default=False,
+                        help='Optimize filament set via simulated annealing (slower)')
+    parser.add_argument('--optimize-iterations', type=int, default=300,
+                        help='SA iterations for --optimize-filaments (default: 300)')
 
     args = parser.parse_args()
 
@@ -1450,6 +1648,9 @@ def main():
             base_layers = 3
         else:
             base_layers = 2
+
+        # Resolve dither mode
+        dither_mode = args.dither if args.dither is not None else 'none'
 
         # Resolve max_color_sandwiches (max sandwiches per colour in exploded modes)
         if args.max_color_sandwiches is not None:
@@ -1604,7 +1805,7 @@ def main():
 
                 fil_names = [f['name'] for _, f in color_fils.iterrows()]
                 k_scores.append((try_k, mean_de, fil_names))
-                logger.info(f"  K={try_k}: mean deltaE={mean_de:.2f} ({', '.join(fil_names)})")
+                logger.debug(f"  K={try_k}: mean deltaE={mean_de:.2f} ({', '.join(fil_names)})")
 
             # Pick lowest K within 2.0 delta-E of best score
             if k_scores:
@@ -1652,6 +1853,16 @@ def main():
         for i, row in selected_filaments.iterrows():
             logger.info(f"  {i+1}. {row['name']} ({row['color_hex']}) TD={row['transmission_distance']:.1f}mm")
 
+        # 4b. Optimize filament set if requested
+        if args.optimize_filaments:
+            num_layers = int(model_height / layer_height)
+            selected_filaments = filament_lib.optimize_filament_set(
+                selected_filaments, img_processor.image, img_processor.alpha_mask,
+                layer_height, model_height, num_layers,
+                mode=mode, iterations=args.optimize_iterations,
+                sandwich_layers=sandwich_layers, use_fill=use_fill,
+            )
+
         # 5. Convert to grayscale for brightness-based thickness mapping
         logger.info("Converting to grayscale...")
 
@@ -1684,6 +1895,7 @@ def main():
                 use_fill=use_fill,
                 base_layers=base_layers,
                 max_color_sandwiches=max_color_sandwiches,
+                dither_mode=dither_mode,
             )
 
         show_3d_preview(_make_preview_gen())
@@ -1763,6 +1975,7 @@ def main():
             use_fill=use_fill,
             base_layers=base_layers,
             max_color_sandwiches=max_color_sandwiches,
+            dither_mode=dither_mode,
         )
 
         generated_files = stl_gen.generate_all(output_path)

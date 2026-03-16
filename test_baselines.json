@@ -1,0 +1,992 @@
+{
+  "standard": {
+    "mesh_count": 4,
+    "total_vertices": 25048,
+    "total_faces": 50076,
+    "meshes": [
+      {
+        "name": "S01_Navy_Blue_C0c0c4c",
+        "vertices": 9882,
+        "faces": 19760,
+        "color_mean": [
+          254.0,
+          254.0,
+          255.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S02_Dark_Red_C4c0c0c",
+        "vertices": 9882,
+        "faces": 19764,
+        "color_mean": [
+          162.9751062537948,
+          155.9828981987452,
+          161.7605747824327
+        ],
+        "color_std": [
+          29.52685288172259,
+          30.850712392915376,
+          31.300968182818618
+        ]
+      },
+      {
+        "name": "S03_Forest_Green_C0c3f0c",
+        "vertices": 2742,
+        "faces": 5472,
+        "color_mean": [
+          40.10014619883041,
+          37.74305555555556,
+          38.09978070175438
+        ],
+        "color_std": [
+          28.201464023664755,
+          27.190982875355555,
+          28.437641843797635
+        ]
+      },
+      {
+        "name": "S04_Golden_Yellow_Cccb219",
+        "vertices": 2542,
+        "faces": 5080,
+        "color_mean": [
+          29.490944881889764,
+          21.581102362204724,
+          5.690551181102363
+        ],
+        "color_std": [
+          1.1628758358313158,
+          4.182466820676217,
+          7.912582753938978
+        ]
+      }
+    ],
+    "color_stats": {
+      "r_mean": 171.925113826983,
+      "r_std": 84.13037302689942,
+      "g_mean": 168.10543973160796,
+      "g_std": 86.38598848351974,
+      "b_mean": 169.20732486620338,
+      "b_std": 89.43413914101293,
+      "is_greyscale": false,
+      "chromatic_fraction": 0.4996006070772426
+    },
+    "elapsed_seconds": 0.98
+  },
+  "flat": {
+    "mesh_count": 4,
+    "total_vertices": 37128,
+    "total_faces": 74240,
+    "meshes": [
+      {
+        "name": "S01_Navy_Blue_C0c0c4c",
+        "vertices": 9882,
+        "faces": 19760,
+        "color_mean": [
+          254.0,
+          254.0,
+          255.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S02_Dark_Red_C4c0c0c",
+        "vertices": 9882,
+        "faces": 19760,
+        "color_mean": [
+          255.0,
+          252.0,
+          255.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S03_Forest_Green_C0c3f0c",
+        "vertices": 9882,
+        "faces": 19760,
+        "color_mean": [
+          114.0,
+          113.25,
+          111.25
+        ],
+        "color_std": [
+          81.40638795573723,
+          81.83940065762945,
+          80.10734985006057
+        ]
+      },
+      {
+        "name": "S04_Golden_Yellow_Cccb219",
+        "vertices": 7482,
+        "faces": 14960,
+        "color_mean": [
+          103.66844919786097,
+          91.3663101604278,
+          60.99732620320856
+        ],
+        "color_std": [
+          107.57413670068433,
+          105.67440428319999,
+          85.37916371766526
+        ]
+      }
+    ],
+    "color_stats": {
+      "r_mean": 186.71012931034483,
+      "r_std": 96.6381059318048,
+      "g_mean": 183.23302801724137,
+      "g_std": 98.12617151558115,
+      "b_mean": 177.64574353448276,
+      "b_std": 101.37786885363549,
+      "is_greyscale": false,
+      "chromatic_fraction": 0.20070043103448276
+    },
+    "elapsed_seconds": 1.46
+  },
+  "flat-cap": {
+    "mesh_count": 4,
+    "total_vertices": 34728,
+    "total_faces": 69440,
+    "meshes": [
+      {
+        "name": "S01_Navy_Blue_C0c0c4c",
+        "vertices": 7482,
+        "faces": 14960,
+        "color_mean": [
+          254.0,
+          254.00935828877004,
+          254.99064171122996
+        ],
+        "color_std": [
+          0.0,
+          0.09628453251353421,
+          0.09628453251353421
+        ]
+      },
+      {
+        "name": "S02_Dark_Red_C4c0c0c",
+        "vertices": 9882,
+        "faces": 19760,
+        "color_mean": [
+          255.0,
+          252.25,
+          254.5
+        ],
+        "color_std": [
+          0.0,
+          0.4330127018922193,
+          0.8660254037844386
+        ]
+      },
+      {
+        "name": "S03_Forest_Green_C0c3f0c",
+        "vertices": 9882,
+        "faces": 19760,
+        "color_mean": [
+          78.75,
+          78.75,
+          75.25
+        ],
+        "color_std": [
+          101.75798494467153,
+          101.75798494467153,
+          99.15990873331822
+        ]
+      },
+      {
+        "name": "S04_Golden_Yellow_Cccb219",
+        "vertices": 7482,
+        "faces": 14960,
+        "color_mean": [
+          99.8783422459893,
+          91.55347593582887,
+          61.51604278074866
+        ],
+        "color_std": [
+          109.52818068957497,
+          106.20805470227316,
+          86.34998124693219
+        ]
+      }
+    ],
+    "color_stats": {
+      "r_mean": 171.2114055299539,
+      "r_std": 111.95714240848297,
+      "g_mean": 168.63738479262673,
+      "g_std": 111.87345301488668,
+      "b_mean": 162.02188940092165,
+      "b_std": 114.10128233921478,
+      "is_greyscale": false,
+      "chromatic_fraction": 0.2857142857142857
+    },
+    "elapsed_seconds": 1.37
+  },
+  "exploded": {
+    "mesh_count": 18,
+    "total_vertices": 216,
+    "total_faces": 324,
+    "meshes": [
+      {
+        "name": "S01_Dark_Red_L1",
+        "vertices": 16,
+        "faces": 24,
+        "color_mean": [
+          76.0,
+          12.0,
+          12.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S01_transparent",
+        "vertices": 8,
+        "faces": 12,
+        "color_mean": [
+          240.0,
+          240.0,
+          235.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S02_Dark_Red_L2",
+        "vertices": 16,
+        "faces": 24,
+        "color_mean": [
+          76.0,
+          12.0,
+          12.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S02_transparent",
+        "vertices": 8,
+        "faces": 12,
+        "color_mean": [
+          240.0,
+          240.0,
+          235.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S03_Dark_Red_L3",
+        "vertices": 16,
+        "faces": 24,
+        "color_mean": [
+          76.0,
+          12.0,
+          12.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S03_transparent",
+        "vertices": 8,
+        "faces": 12,
+        "color_mean": [
+          240.0,
+          240.0,
+          235.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S04_Forest_Green_L1",
+        "vertices": 16,
+        "faces": 24,
+        "color_mean": [
+          12.0,
+          63.0,
+          12.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S04_transparent",
+        "vertices": 8,
+        "faces": 12,
+        "color_mean": [
+          240.0,
+          240.0,
+          235.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S05_Forest_Green_L2",
+        "vertices": 16,
+        "faces": 24,
+        "color_mean": [
+          12.0,
+          63.0,
+          12.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S05_transparent",
+        "vertices": 8,
+        "faces": 12,
+        "color_mean": [
+          240.0,
+          240.0,
+          235.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S06_Forest_Green_L3",
+        "vertices": 16,
+        "faces": 24,
+        "color_mean": [
+          12.0,
+          63.0,
+          12.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S06_transparent",
+        "vertices": 8,
+        "faces": 12,
+        "color_mean": [
+          240.0,
+          240.0,
+          235.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S07_Navy_Blue_L1",
+        "vertices": 16,
+        "faces": 24,
+        "color_mean": [
+          12.0,
+          12.0,
+          76.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S07_transparent",
+        "vertices": 8,
+        "faces": 12,
+        "color_mean": [
+          240.0,
+          240.0,
+          235.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S08_Navy_Blue_L2",
+        "vertices": 16,
+        "faces": 24,
+        "color_mean": [
+          12.0,
+          12.0,
+          76.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S08_transparent",
+        "vertices": 8,
+        "faces": 12,
+        "color_mean": [
+          240.0,
+          240.0,
+          235.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S09_Navy_Blue_L3",
+        "vertices": 16,
+        "faces": 24,
+        "color_mean": [
+          12.0,
+          12.0,
+          76.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S09_transparent",
+        "vertices": 8,
+        "faces": 12,
+        "color_mean": [
+          240.0,
+          240.0,
+          235.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      }
+    ],
+    "color_stats": {
+      "r_mean": 102.22222222222223,
+      "r_std": 100.48966533682045,
+      "g_mean": 99.33333333333333,
+      "g_std": 101.38485532311465,
+      "b_mean": 100.55555555555556,
+      "b_std": 98.20625812952284,
+      "is_greyscale": false,
+      "chromatic_fraction": 0.6666666666666666
+    },
+    "elapsed_seconds": 0.01
+  },
+  "exploded-multi": {
+    "mesh_count": 30,
+    "total_vertices": 360,
+    "total_faces": 540,
+    "meshes": [
+      {
+        "name": "S01_Dark_Red_L1",
+        "vertices": 16,
+        "faces": 24,
+        "color_mean": [
+          76.0,
+          12.0,
+          12.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S01_transparent",
+        "vertices": 8,
+        "faces": 12,
+        "color_mean": [
+          240.0,
+          240.0,
+          235.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S02_Dark_Red_L2",
+        "vertices": 16,
+        "faces": 24,
+        "color_mean": [
+          76.0,
+          12.0,
+          12.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S02_transparent",
+        "vertices": 8,
+        "faces": 12,
+        "color_mean": [
+          240.0,
+          240.0,
+          235.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S03_Dark_Red_L3",
+        "vertices": 16,
+        "faces": 24,
+        "color_mean": [
+          76.0,
+          12.0,
+          12.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S03_transparent",
+        "vertices": 8,
+        "faces": 12,
+        "color_mean": [
+          240.0,
+          240.0,
+          235.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S04_Dark_Red_L4",
+        "vertices": 16,
+        "faces": 24,
+        "color_mean": [
+          76.0,
+          12.0,
+          12.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S04_transparent",
+        "vertices": 8,
+        "faces": 12,
+        "color_mean": [
+          240.0,
+          240.0,
+          235.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S05_Dark_Red_L5",
+        "vertices": 16,
+        "faces": 24,
+        "color_mean": [
+          76.0,
+          12.0,
+          12.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S05_transparent",
+        "vertices": 8,
+        "faces": 12,
+        "color_mean": [
+          240.0,
+          240.0,
+          235.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S06_Forest_Green_L1",
+        "vertices": 16,
+        "faces": 24,
+        "color_mean": [
+          12.0,
+          63.0,
+          12.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S06_transparent",
+        "vertices": 8,
+        "faces": 12,
+        "color_mean": [
+          240.0,
+          240.0,
+          235.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S07_Forest_Green_L2",
+        "vertices": 16,
+        "faces": 24,
+        "color_mean": [
+          12.0,
+          63.0,
+          12.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S07_transparent",
+        "vertices": 8,
+        "faces": 12,
+        "color_mean": [
+          240.0,
+          240.0,
+          235.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S08_Forest_Green_L3",
+        "vertices": 16,
+        "faces": 24,
+        "color_mean": [
+          12.0,
+          63.0,
+          12.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S08_transparent",
+        "vertices": 8,
+        "faces": 12,
+        "color_mean": [
+          240.0,
+          240.0,
+          235.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S09_Forest_Green_L4",
+        "vertices": 16,
+        "faces": 24,
+        "color_mean": [
+          12.0,
+          63.0,
+          12.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S09_transparent",
+        "vertices": 8,
+        "faces": 12,
+        "color_mean": [
+          240.0,
+          240.0,
+          235.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S10_Forest_Green_L5",
+        "vertices": 16,
+        "faces": 24,
+        "color_mean": [
+          12.0,
+          63.0,
+          12.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S10_transparent",
+        "vertices": 8,
+        "faces": 12,
+        "color_mean": [
+          240.0,
+          240.0,
+          235.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S11_Navy_Blue_L1",
+        "vertices": 16,
+        "faces": 24,
+        "color_mean": [
+          12.0,
+          12.0,
+          76.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S11_transparent",
+        "vertices": 8,
+        "faces": 12,
+        "color_mean": [
+          240.0,
+          240.0,
+          235.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S12_Navy_Blue_L2",
+        "vertices": 16,
+        "faces": 24,
+        "color_mean": [
+          12.0,
+          12.0,
+          76.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S12_transparent",
+        "vertices": 8,
+        "faces": 12,
+        "color_mean": [
+          240.0,
+          240.0,
+          235.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S13_Navy_Blue_L3",
+        "vertices": 16,
+        "faces": 24,
+        "color_mean": [
+          12.0,
+          12.0,
+          76.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S13_transparent",
+        "vertices": 8,
+        "faces": 12,
+        "color_mean": [
+          240.0,
+          240.0,
+          235.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S14_Navy_Blue_L4",
+        "vertices": 16,
+        "faces": 24,
+        "color_mean": [
+          12.0,
+          12.0,
+          76.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S14_transparent",
+        "vertices": 8,
+        "faces": 12,
+        "color_mean": [
+          240.0,
+          240.0,
+          235.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S15_Navy_Blue_L5",
+        "vertices": 16,
+        "faces": 24,
+        "color_mean": [
+          12.0,
+          12.0,
+          76.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      {
+        "name": "S15_transparent",
+        "vertices": 8,
+        "faces": 12,
+        "color_mean": [
+          240.0,
+          240.0,
+          235.0
+        ],
+        "color_std": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      }
+    ],
+    "color_stats": {
+      "r_mean": 102.22222222222223,
+      "r_std": 100.48966533682045,
+      "g_mean": 99.33333333333333,
+      "g_std": 101.38485532311466,
+      "b_mean": 100.55555555555556,
+      "b_std": 98.20625812952285,
+      "is_greyscale": false,
+      "chromatic_fraction": 0.6666666666666666
+    },
+    "elapsed_seconds": 0.01
+  }
+}
