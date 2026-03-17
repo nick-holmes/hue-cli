@@ -123,7 +123,7 @@ def _rank_alternatives_per_slot(filament_lib, dominant_colors, base_config):
                        (delta_e, filament_idx) sorted best-first, excluding
                        filaments already used in other slots.
     """
-    from color_science import compute_effective_color
+    from huecli.color_science import compute_effective_color
 
     count = base_config['color_count']
     estimated_thickness = base_config['model_height'] / max(count, 1)
@@ -725,8 +725,8 @@ def main():
 
     # Run 3D preview with winning filaments
     print(f"\nOpening 3D preview with winning filaments...")
-    from config import PipelineConfig, ProcessedImage
-    from preview import show_3d_preview
+    from huecli.config import PipelineConfig, ProcessedImage
+    from huecli.preview import show_3d_preview
 
     pipeline_config = PipelineConfig(
         layer_height=base_config['layer_height'],
