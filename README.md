@@ -2,9 +2,13 @@
 
 Convert images into stacked topographical STL files using Beer-Lambert colour simulation.
 
+![Example output — Charizard card](screenshot.png)
+
 ## How It Works
 
-HueCLI extracts dominant colours from an image via K-means clustering, then selects filaments using physics-aware Beer-Lambert scoring — each candidate filament is evaluated at its estimated print thickness, not just its raw colour. Selection is automatically refined via simulated annealing. One STL is generated per filament, with per-pixel thickness varying based on image brightness, creating colour through light transmission (Beer-Lambert physics). Filaments are sorted dark-to-light with layer height proportional to transmission distance.
+1. **Colour extraction** — dominant colours are pulled from your image via K-means clustering.
+2. **Filament selection** — candidates are scored using Beer-Lambert physics at their estimated print thickness, not just raw colour. Selection is automatically refined via simulated annealing.
+3. **STL generation** — one STL per filament. Per-pixel thickness varies based on image brightness, creating colour through light transmission. Filaments are sorted dark-to-light with layer height proportional to transmission distance.
 
 ## Installation
 
@@ -21,6 +25,8 @@ python3 -m huecli image.png
 # Fully non-interactive
 python3 -m huecli image.png -f data/filaments.csv -c 5 -n 0.4 -l 0.04 -m 3.0 -s 120x160 -o output.stl --mode standard
 ```
+
+Supports PNG, JPG, and WEBP input images.
 
 A 3D preview opens in your browser before generating STLs. From the preview you can generate, adjust colours (reduce delta-E), or cancel.
 
@@ -169,39 +175,6 @@ A `.txt` file with printing instructions is also generated.
 Edit `data/filaments.csv`. Required columns: `Brand`, `Type`, `Color` (hex), `Name`, `TD` (transmission distance in mm), `Tags`.
 
 TD controls material needed to show colour: low TD = opaque, high TD = translucent.
-
-## Project Structure
-
-```
-print3r/
-├── huecli/                        # Python package
-│   ├── __init__.py                # Package marker + version
-│   ├── __main__.py                # Entry point (python3 -m huecli)
-│   ├── config.py                  # Typed dataclasses, COLOR_SCHEMES
-│   ├── color_science.py           # Beer-Lambert, sRGB/linear, delta-E, dithering
-│   ├── mesh.py                    # Topographical height-fields, greedy flat layers
-│   ├── filaments.py               # FilamentLibrary: CSV, selection, SA optimization
-│   ├── image.py                   # ImageProcessor: load, resize, smooth, flip
-│   ├── preview.py                 # Three.js GLB browser preview
-│   ├── generator.py               # STLGenerator facade
-│   ├── cli.py                     # Argparse wrapper
-│   ├── interactive.py             # Interactive prompts for missing config
-│   └── modes/
-│       ├── __init__.py            # Registry + dispatcher
-│       ├── standard.py            # Brightness heightmap + TD z-bands
-│       ├── flat.py                # Flat + flat-cap (Beer-Lambert 2^N)
-│       ├── exploded.py            # Single-color sandwiches
-│       ├── exploded_multi.py      # Multi-color sandwiches
-│       └── exploded_cmyk.py       # CMYK wrapper
-├── tests/                         # Unit + regression tests
-├── scripts/                       # Dev/debug tools
-├── data/                          # Filament library CSVs
-├── examples/                      # Sample input images
-├── output/                        # Generated STLs
-├── setup.py
-├── requirements.txt
-└── CLAUDE.md
-```
 
 ## Testing
 
