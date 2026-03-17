@@ -102,11 +102,12 @@ def build_box_mesh(rects, z_bottom_val, z_top_val, pixel_size):
     return vertices, faces
 
 
-def generate_preview_surface(z_top, pixel_mask, pixel_size, preview_rgb=None):
-    """Generate top-surface-only mesh for fast preview.
+def generate_preview_surface(z_top, pixel_mask, pixel_size, preview_rgb=None,
+                              z_bottom=None):
+    """Generate preview mesh with shared grid-corner vertices.
 
-    Only creates the visible top surface (2 triangles per pixel) with shared
-    grid-corner vertices.
+    Creates the top surface (2 triangles per pixel). When z_bottom is provided,
+    also creates a bottom surface and side walls for visible layer thickness.
 
     Two modes:
     - preview_rgb provided: bakes vertex colors (for flat/exploded modes)
@@ -117,6 +118,8 @@ def generate_preview_surface(z_top, pixel_mask, pixel_size, preview_rgb=None):
         pixel_mask: 2D boolean array of active pixels
         pixel_size: pixel size in mm
         preview_rgb: HxWx3 RGB preview image (0-1 range), or None for UV mode
+        z_bottom: scalar or 2D array of bottom z-heights (mm), or None for
+            top-surface-only mode
 
     Returns:
         trimesh.Trimesh with vertex colors or UV coordinates
@@ -148,25 +151,98 @@ def generate_preview_surface(z_top, pixel_mask, pixel_size, preview_rgb=None):
     active_cy, active_cx = np.where(corner_active)
     vertex_idx[active_cy, active_cx] = np.arange(n_active)
 
-    # Top surface vertices only (no bottom vertices)
-    vertices = np.column_stack([
+    # Top surface vertices
+    top_verts = np.column_stack([
         active_cx * ps, active_cy * ps,
         zt_avg[active_cy, active_cx]
     ])
 
-    # Top surface faces only (2 triangles per active pixel, no bottom/sides)
     py, px = np.where(pixel_mask)
     v00 = vertex_idx[py, px]
     v01 = vertex_idx[py, px + 1]
     v10 = vertex_idx[py + 1, px]
     v11 = vertex_idx[py + 1, px + 1]
 
-    faces = np.vstack([
+    all_faces = [
         np.column_stack([v00, v01, v10]),
         np.column_stack([v01, v11, v10]),
-    ])
+    ]
 
+    if z_bottom is not None:
+        # Bottom vertices at z_bottom (scalar or array)
+        if np.ndim(z_bottom) == 0:
+            zb_vals = np.full(n_active, float(z_bottom))
+        else:
+            zb_sum = np.zeros((H + 1, W + 1))
+            for dy in range(2):
+                for dx in range(2):
+                    zb_sum[dy:H + dy, dx:W + dx] += z_bottom * mask_f
+            zb_vals = np.divide(zb_sum, count, where=corner_active,
+                                 out=np.zeros_like(zb_sum))[active_cy, active_cx]
+
+        bottom_verts = np.column_stack([
+            active_cx * ps, active_cy * ps, zb_vals
+        ])
+        vertices = np.vstack([top_verts, bottom_verts])
+
+        # Bottom faces (reversed winding), offset by n_active
+        b00 = v00 + n_active
+        b01 = v01 + n_active
+        b10 = v10 + n_active
+        b11 = v11 + n_active
+        all_faces.append(np.column_stack([b00, b10, b01]))
+        all_faces.append(np.column_stack([b01, b10, b11]))
+
+        # Side walls at boundary edges
+        def get_boundary(dy, dx):
+            ny, nx = py + dy, px + dx
+            oob = (ny < 0) | (ny >= H) | (nx < 0) | (nx >= W)
+            inactive = oob | ~pixel_mask[np.clip(ny, 0, H - 1),
+                                          np.clip(nx, 0, W - 1)]
+            return inactive
+
+        left = get_boundary(0, -1)
+        if left.any():
+            tl0 = vertex_idx[py[left], px[left]]
+            tl1 = vertex_idx[py[left] + 1, px[left]]
+            bl0 = tl0 + n_active
+            bl1 = tl1 + n_active
+            all_faces.append(np.column_stack([bl0, bl1, tl0]))
+            all_faces.append(np.column_stack([bl1, tl1, tl0]))
+
+        right = get_boundary(0, 1)
+        if right.any():
+            tr0 = vertex_idx[py[right], px[right] + 1]
+            tr1 = vertex_idx[py[right] + 1, px[right] + 1]
+            br0 = tr0 + n_active
+            br1 = tr1 + n_active
+            all_faces.append(np.column_stack([br0, tr0, br1]))
+            all_faces.append(np.column_stack([br1, tr0, tr1]))
+
+        front = get_boundary(-1, 0)
+        if front.any():
+            tf0 = vertex_idx[py[front], px[front]]
+            tf1 = vertex_idx[py[front], px[front] + 1]
+            bf0 = tf0 + n_active
+            bf1 = tf1 + n_active
+            all_faces.append(np.column_stack([bf0, tf0, bf1]))
+            all_faces.append(np.column_stack([bf1, tf0, tf1]))
+
+        back = get_boundary(1, 0)
+        if back.any():
+            tb0 = vertex_idx[py[back] + 1, px[back]]
+            tb1 = vertex_idx[py[back] + 1, px[back] + 1]
+            bb0 = tb0 + n_active
+            bb1 = tb1 + n_active
+            all_faces.append(np.column_stack([bb0, bb1, tb0]))
+            all_faces.append(np.column_stack([bb1, tb1, tb0]))
+    else:
+        vertices = top_verts
+
+    faces = np.vstack(all_faces)
     mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+    n_verts = len(vertices)
 
     if preview_rgb is not None:
         # Vertex colors: average preview_rgb at corners from adjacent active pixels
@@ -182,17 +258,25 @@ def generate_preview_surface(z_top, pixel_mask, pixel_size, preview_rgb=None):
                                out=np.zeros_like(color_sum))
 
         vertex_rgb = color_avg[active_cy, active_cx]
-        vertex_colors = np.zeros((n_active, 4), dtype=np.uint8)
-        vertex_colors[:, :3] = (np.clip(vertex_rgb, 0, 1) * 255).astype(np.uint8)
-        vertex_colors[:, 3] = 255
+        vertex_colors = np.zeros((n_verts, 4), dtype=np.uint8)
+        vertex_colors[:n_active, :3] = (np.clip(vertex_rgb, 0, 1) * 255).astype(np.uint8)
+        vertex_colors[:n_active, 3] = 255
+        if z_bottom is not None:
+            # Bottom + side wall vertices get same colors as corresponding top
+            vertex_colors[n_active:] = vertex_colors[:n_active]
         mesh.visual.vertex_colors = vertex_colors
     else:
         # UV coordinates for texture mapping: map grid corners to [0,1] range
-        uv = np.column_stack([active_cx / W, 1.0 - active_cy / H])
+        top_uv = np.column_stack([active_cx / W, 1.0 - active_cy / H])
+        if z_bottom is not None:
+            # Bottom + side wall vertices share same UV as top
+            uv = np.vstack([top_uv, top_uv])
+        else:
+            uv = top_uv
         mesh.visual = trimesh.visual.TextureVisuals(uv=uv)
 
     logger.info(f"  Preview surface: {pixel_mask.sum():,} pixels -> "
-                 f"{n_active} vertices, {len(faces):,} faces")
+                 f"{n_verts} vertices, {len(faces):,} faces")
 
     return mesh
 

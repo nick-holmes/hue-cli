@@ -1,13 +1,13 @@
 {
   "standard": {
     "mesh_count": 4,
-    "total_vertices": 14424,
-    "total_faces": 27718,
+    "total_vertices": 28848,
+    "total_faces": 57676,
     "meshes": [
       {
         "name": "S01_Navy_Blue_C0c0c4c",
-        "vertices": 4941,
-        "faces": 9600,
+        "vertices": 9882,
+        "faces": 19760,
         "color_mean": [
           82.02604166666667,
           77.68895833333333,
@@ -21,8 +21,8 @@
       },
       {
         "name": "S02_Dark_Red_C4c0c0c",
-        "vertices": 4941,
-        "faces": 9600,
+        "vertices": 9882,
+        "faces": 19760,
         "color_mean": [
           82.02604166666667,
           77.68895833333333,
@@ -36,8 +36,8 @@
       },
       {
         "name": "S03_Forest_Green_C0c3f0c",
-        "vertices": 3271,
-        "faces": 6118,
+        "vertices": 6542,
+        "faces": 13076,
         "color_mean": [
           82.02604166666667,
           77.68895833333333,
@@ -51,8 +51,8 @@
       },
       {
         "name": "S04_Golden_Yellow_Cccb219",
-        "vertices": 1271,
-        "faces": 2400,
+        "vertices": 2542,
+        "faces": 5080,
         "color_mean": [
           82.02604166666667,
           77.68895833333333,
@@ -75,7 +75,7 @@
       "is_greyscale": false,
       "chromatic_fraction": 1.0
     },
-    "elapsed_seconds": 0.0
+    "elapsed_seconds": 0.01
   },
   "flat": {
     "mesh_count": 4,

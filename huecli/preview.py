@@ -227,7 +227,8 @@ def generate_preview_scene(config, processed_image, selected_filaments,
 
             if pixel_mask.any():
                 mesh = generate_preview_surface(
-                    band_top, pixel_mask, geo_pixel_size)  # UV mode
+                    band_top, pixel_mask, geo_pixel_size,
+                    z_bottom=z_lo)  # UV mode with thickness
                 if len(mesh.vertices) > 0:
                     mesh.visual = TextureVisuals(
                         uv=mesh.visual.uv, material=material)
