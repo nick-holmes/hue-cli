@@ -9,17 +9,17 @@ HueCLI extracts dominant colours from an image via K-means clustering, then sele
 ## Installation
 
 ```bash
-pip install -r requirements.txt
+pip3 install -e .
 ```
 
 ## Quick Start
 
 ```bash
 # Interactive mode — prompts for anything not provided
-python3 huecli.py image.png
+python3 -m huecli image.png
 
 # Fully non-interactive
-python3 huecli.py image.png -f filaments.csv -c 5 -n 0.4 -l 0.04 -m 3.0 -s 120x160 -o output.stl --mode standard
+python3 -m huecli image.png -f data/filaments.csv -c 5 -n 0.4 -l 0.04 -m 3.0 -s 120x160 -o output.stl --mode standard
 ```
 
 A 3D preview opens in your browser before generating STLs. From the preview you can generate, adjust colours (reduce delta-E), or cancel.
@@ -31,8 +31,8 @@ The browser preview is an interactive Three.js viewer that renders a downsampled
 **Controls:**
 
 - **Drag** to rotate
-- **scroll** to zoom 
-- **right-drag** to pan
+- **Scroll** to zoom
+- **Right-drag** to pan
 
 **Toolbar (bottom of screen):**
 
@@ -40,7 +40,7 @@ The browser preview is an interactive Three.js viewer that renders a downsampled
 - **Realistic / Filaments toggle** — switches between two colour modes:
   - **Realistic** — simulates light passing through stacked filament layers using Beer-Lambert physics, showing how the print will actually look when backlit.
   - **Filaments** — shows each layer in its raw filament colour so you can see which filament is assigned where. Automatically applies a small gap so all layers are visible.
-- **ⓘ button** — click for a description of each colour mode.
+- **i button** — click for a description of each colour mode.
 
 ## Which Mode Should I Use?
 
@@ -91,7 +91,7 @@ Fixed CMYK primaries (auto-selected from your library by delta-E). Each primary 
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `-f, --filaments` | Filament library CSV | `filaments.csv` |
+| `-f, --filaments` | Filament library CSV | `data/filaments.csv` |
 | `-c, --colors` | Number of colours | `4` (exploded: auto) |
 | `-n, --nozzle` | Nozzle diameter (mm) | `0.2` |
 | `-l, --layer-height` | Layer height (mm) | `0.08` |
@@ -102,6 +102,9 @@ Fixed CMYK primaries (auto-selected from your library by delta-E). Each primary 
 | `--mode` | Generation mode | `standard` |
 | `--scheme` | Remap image to a colour scheme palette | none |
 | `--flip` | Flip image: `horizontal`, `vertical`, or `both` | none |
+| `--dither` | Dithering method for flat/exploded modes: `none`, `floyd-steinberg`, `ordered` | `none` |
+| `--enhance-detail` | Extend darkest filament through edges for sharper detail (standard mode only) | off |
+| `--use-filaments` | Comma-separated filament names to use (bypasses auto-selection and SA) | none |
 
 ### Exploded Mode Flags
 
@@ -137,7 +140,7 @@ Works with all modes.
 
 ```bash
 # Example: sunset-themed print
-python3 huecli.py photo.png --scheme sunset --mode flat -s 120x160
+python3 -m huecli photo.png --scheme sunset --mode flat -s 120x160
 ```
 
 ## Output Files
@@ -162,27 +165,52 @@ A `.txt` file with printing instructions is also generated.
 
 ## Filament Library
 
-Edit `filaments.csv`. Required columns: `Brand`, `Type`, `Color` (hex), `Name`, `TD` (transmission distance in mm), `Tags`.
+Edit `data/filaments.csv`. Required columns: `Brand`, `Type`, `Color` (hex), `Name`, `TD` (transmission distance in mm), `Tags`.
 
 TD controls material needed to show colour: low TD = opaque, high TD = translucent.
 
-## Architecture
+## Project Structure
 
-Modular design with typed dataclasses and pure functions:
+```
+print3r/
+├── huecli/                        # Python package
+│   ├── __init__.py                # Package marker + version
+│   ├── __main__.py                # Entry point (python3 -m huecli)
+│   ├── config.py                  # Typed dataclasses, COLOR_SCHEMES
+│   ├── color_science.py           # Beer-Lambert, sRGB/linear, delta-E, dithering
+│   ├── mesh.py                    # Topographical height-fields, greedy flat layers
+│   ├── filaments.py               # FilamentLibrary: CSV, selection, SA optimization
+│   ├── image.py                   # ImageProcessor: load, resize, smooth, flip
+│   ├── preview.py                 # Three.js GLB browser preview
+│   ├── generator.py               # STLGenerator facade
+│   ├── cli.py                     # Argparse wrapper
+│   ├── interactive.py             # Interactive prompts for missing config
+│   └── modes/
+│       ├── __init__.py            # Registry + dispatcher
+│       ├── standard.py            # Brightness heightmap + TD z-bands
+│       ├── flat.py                # Flat + flat-cap (Beer-Lambert 2^N)
+│       ├── exploded.py            # Single-color sandwiches
+│       ├── exploded_multi.py      # Multi-color sandwiches
+│       └── exploded_cmyk.py       # CMYK wrapper
+├── tests/                         # Unit + regression tests
+├── scripts/                       # Dev/debug tools
+├── data/                          # Filament library CSVs
+├── examples/                      # Sample input images
+├── output/                        # Generated STLs
+├── setup.py
+├── requirements.txt
+└── CLAUDE.md
+```
 
-| Module | Purpose |
-|--------|---------|
-| `config.py` | Typed dataclasses (`PipelineConfig`, `ProcessedImage`, etc.) |
-| `color_science.py` | Beer-Lambert, sRGB/linear, delta-E, contrast, dithering |
-| `mesh.py` | Topographical height-fields, greedy-meshed flat layers |
-| `filaments.py` | CSV loading, CIEDE2000 selection, SA optimization |
-| `image.py` | Load, resize, smooth, scheme remap, flip |
-| `preview.py` | Three.js GLB browser preview |
-| `cli.py` | Argparse wrapper |
-| `interactive.py` | Interactive prompt fallbacks |
-| `modes/` | One module per mode (`standard`, `flat`, `exploded`, `exploded_multi`, `exploded_cmyk`) |
-| `huecli.py` | Slim CLI orchestrator |
-| `generator.py` | Clean `STLGenerator` facade: config + image + filaments → STL files |
+## Testing
+
+```bash
+# Unit tests
+python3 -m pytest tests/
+
+# Regression tests (preview scene metrics vs baselines)
+python3 tests/test_regression.py
+```
 
 ## License
 
