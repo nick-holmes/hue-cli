@@ -22,6 +22,9 @@ from .color_science import (
     allocate_layers_td_proportional,
     compute_heightmap,
     render_standard_preview,
+    render_standard_preview_layers,
+    compute_contrast_params,
+    apply_contrast_params,
 )
 from .mesh import (
     generate_preview_surface,
@@ -167,16 +170,30 @@ def generate_preview_scene(config, processed_image, selected_filaments,
             tex_enhanced, tex_alpha_pixels, model_height, layer_height,
             min_height=float(z_boundaries[1]))
 
-        combined_preview = auto_contrast_preview(
-            render_standard_preview(tex_pixel_height, z_boundaries, sorted_filaments),
-            tex_alpha_pixels)
+        # Render per-layer cumulative composites
+        layer_rgbas = render_standard_preview_layers(
+            tex_pixel_height, z_boundaries, sorted_filaments, layer_height)
 
-        # Create shared texture material from the high-res preview
-        texture_img = PILImage.fromarray(
-            (np.clip(combined_preview, 0, 1) * 255).astype(np.uint8))
-        material = PBRMaterial(
-            baseColorTexture=texture_img,
-            metallicFactor=0.0, roughnessFactor=1.0)
+        # Compute contrast params from topmost layer, apply consistently to all
+        top_rgb = layer_rgbas[-1][:, :, :3]
+        contrast_params = compute_contrast_params(top_rgb, tex_alpha_pixels)
+
+        materials = []
+        for k, rgba in enumerate(layer_rgbas):
+            rgb_k = apply_contrast_params(rgba[:, :, :3], tex_alpha_pixels,
+                                           contrast_params)
+            # Build RGBA texture: present pixels are fully opaque (A=255),
+            # absent pixels are transparent (A=0). The RGB already contains the
+            # correct cumulative blended color — alpha is only used for clipping.
+            z_lo = z_boundaries[k]
+            band_present = (tex_pixel_height > z_lo + layer_height * 0.5) & tex_alpha_pixels
+            tex_rgba = np.zeros((tex_H, tex_W, 4), dtype=np.uint8)
+            tex_rgba[:, :, :3] = (np.clip(rgb_k, 0, 1) * 255).astype(np.uint8)
+            tex_rgba[band_present, 3] = 255
+            texture_img = PILImage.fromarray(tex_rgba, 'RGBA')
+            materials.append(PBRMaterial(
+                baseColorTexture=texture_img,
+                metallicFactor=0.0, roughnessFactor=1.0))
 
         logger.info(f"3D preview texture: {tex_W}x{tex_H} (ds_tex={ds_tex})")
 
@@ -231,7 +248,7 @@ def generate_preview_scene(config, processed_image, selected_filaments,
                     z_bottom=z_lo)  # UV mode with thickness
                 if len(mesh.vertices) > 0:
                     mesh.visual = TextureVisuals(
-                        uv=mesh.visual.uv, material=material)
+                        uv=mesh.visual.uv, material=materials[k])
                     name = filament['name'].replace(' ', '_')
                     hex_color = '%02x%02x%02x' % tuple(
                         (np.array(filament['rgb']) * 255).astype(int))
@@ -640,6 +657,18 @@ def _build_viewer_html(b64_glb, use_transparency=False, use_slider=False,
     background: rgba(255,255,255,0.3); color: #fff;
     cursor: default;
   }}
+  #bg-picker {{
+    display: flex; align-items: center; gap: 4px;
+    margin-left: 4px;
+  }}
+  #bg-picker label {{ color: #888; font: 11px system-ui; margin-right: 2px; }}
+  .bg-dot {{
+    width: 16px; height: 16px; border-radius: 50%; cursor: pointer;
+    border: 2px solid transparent; transition: border-color 0.15s;
+    box-sizing: border-box;
+  }}
+  .bg-dot:hover {{ border-color: rgba(255,255,255,0.5); }}
+  .bg-dot.active {{ border-color: #fff; }}
   #info-btn {{
     width: 22px; height: 22px; border-radius: 50%; border: 1px solid rgba(255,255,255,0.3);
     background: rgba(255,255,255,0.08); color: rgba(255,255,255,0.5);
@@ -713,16 +742,24 @@ def _build_viewer_html(b64_glb, use_transparency=False, use_slider=False,
 <div id="error"></div>
 <div id="controls">
   <label for="gap-slider">Gap:</label>
-  <input type="range" id="gap-slider" min="0" max="5" value="{default_gap:.1f}" step="0.1">
+  <input type="range" id="gap-slider" min="0" max="10" value="{default_gap:.1f}" step="0.1">
   <span id="gap-value">{default_gap:.1f}mm</span>
   <div id="color-mode">
     <button id="btn-realistic" class="active">Realistic</button>
     <button id="btn-filaments">Filaments</button>
   </div>
+  <div id="bg-picker">
+    <label>BG:</label>
+    <div class="bg-dot active" data-bg="0x1a1a1a" style="background:#1a1a1a;border-color:#fff" title="Dark gray"></div>
+    <div class="bg-dot" data-bg="0xffffff" style="background:#fff" title="White"></div>
+    <div class="bg-dot" data-bg="0x808080" style="background:#808080" title="Mid gray"></div>
+    <div class="bg-dot" data-bg="0xf5e6d3" style="background:#f5e6d3" title="Warm beige"></div>
+    <div class="bg-dot" data-bg="0x3d4f5f" style="background:#3d4f5f" title="Slate"></div>
+  </div>
   <button id="info-btn">i</button>
 </div>
 <div id="info-tooltip">
-  <strong>Realistic</strong> &mdash; Simulates light passing through stacked filament layers (Beer-Lambert), showing how the print will actually look when backlit.<br><br>
+  <strong>Realistic</strong> &mdash; Each layer shows the cumulative front-lit appearance of all layers beneath it. Separate layers with the gap slider to see how colour builds up from bottom to top.<br><br>
   <strong>Filaments</strong> &mdash; Shows the raw filament colour for each layer, so you can see which filament is assigned where. Layers separate slightly for visibility.
 </div>
 
@@ -814,6 +851,8 @@ loader.parse(buf.buffer, '', (gltf) => {{
         // Textured mesh (standard mode): use MeshBasicMaterial with texture
         child.material = new THREE.MeshBasicMaterial({{
           map: origMaterial.map,
+          alphaTest: 0.5,
+          transparent: true,
           side: THREE.FrontSide,
           polygonOffset: true,
           polygonOffsetFactor: -layerIdx,
@@ -1109,6 +1148,15 @@ if (infoBtn && infoTip) {{
   }});
   document.addEventListener('click', () => infoTip.classList.remove('visible'));
 }}
+
+// Background color picker
+document.querySelectorAll('.bg-dot').forEach(dot => {{
+  dot.addEventListener('click', () => {{
+    document.querySelectorAll('.bg-dot').forEach(d => d.classList.remove('active'));
+    dot.classList.add('active');
+    scene.background = new THREE.Color(parseInt(dot.dataset.bg));
+  }});
+}});
 
 window.addEventListener('resize', () => {{
   camera.aspect = window.innerWidth / window.innerHeight;

@@ -615,6 +615,80 @@ def render_standard_preview(pixel_height, z_boundaries, sorted_filaments):
     return np.clip(color.lab2rgb(result_lab.reshape(H, W, 3)), 0, 1)
 
 
+def render_standard_preview_layers(pixel_height, z_boundaries, sorted_filaments,
+                                    layer_height):
+    """Render per-layer cumulative front-lit alpha-over composites for standard mode.
+
+    For each layer k (0=bottom/darkest to N-1=top/lightest), computes the
+    cumulative front-lit appearance by alpha-over compositing all layers from
+    the bottom up. Each layer's opacity is derived from its thickness and TD
+    via Beer-Lambert: opacity = 1 - exp(-thickness / td).
+
+    Args:
+        pixel_height: 2D array of per-pixel heights (mm)
+        z_boundaries: 1D array of color band boundaries (mm)
+        sorted_filaments: DataFrame of filaments (dark to light)
+        layer_height: layer height in mm
+
+    Returns:
+        List of N RGBA images (HxWx4, 0-1 float sRGB).
+        Present pixels: RGB = cumulative composite, A = cumulative opacity.
+        Absent pixels: A = 0.
+    """
+    H, W = pixel_height.shape
+    num_colors = len(sorted_filaments)
+
+    filament_rgbs_lin = np.array([srgb_to_linear(np.array(f['rgb']))
+                                   for _, f in sorted_filaments.iterrows()])
+    filament_tds = np.array([max(f['transmission_distance'], 0.1)
+                              for _, f in sorted_filaments.iterrows()])
+
+    # Accumulate composite in linear light: RGB premultiplied, alpha
+    accum_rgb = np.zeros((H, W, 3))  # premultiplied linear RGB
+    accum_alpha = np.zeros((H, W))
+
+    layer_images = []
+    for k in range(num_colors):
+        z_lo = z_boundaries[k]
+        z_hi = z_boundaries[k + 1]
+
+        # Which pixels are present in this band
+        present = (pixel_height > z_lo + layer_height * 0.5)
+
+        # Thickness of this layer per pixel (clipped to band range)
+        thickness = np.clip(pixel_height, z_lo, z_hi) - z_lo
+        thickness[~present] = 0.0
+
+        # Beer-Lambert opacity
+        opacity = np.where(present, 1.0 - np.exp(-thickness / filament_tds[k]), 0.0)
+
+        # Alpha-over composite (premultiplied): over existing accumulation
+        layer_rgb_lin = filament_rgbs_lin[k]  # (3,)
+        src_rgb = opacity[:, :, np.newaxis] * layer_rgb_lin  # premultiplied
+        src_a = opacity
+
+        # out = src + dst * (1 - src_a)
+        accum_rgb = src_rgb + accum_rgb * (1.0 - src_a[:, :, np.newaxis])
+        accum_alpha = src_a + accum_alpha * (1.0 - src_a)
+
+        # Convert accumulated premultiplied linear to sRGB for this layer's image
+        safe_alpha = np.maximum(accum_alpha, 1e-6)
+        straight_rgb = accum_rgb / safe_alpha[:, :, np.newaxis]
+        straight_rgb = np.clip(straight_rgb, 0, 1)
+        srgb = linear_to_srgb(straight_rgb)
+
+        rgba = np.zeros((H, W, 4))
+        rgba[:, :, :3] = srgb
+        rgba[:, :, 3] = accum_alpha
+        # Zero out absent pixels (no contribution from any layer yet)
+        no_coverage = accum_alpha < 1e-6
+        rgba[no_coverage] = 0.0
+
+        layer_images.append(rgba)
+
+    return layer_images
+
+
 # ---------------------------------------------------------------------------
 # Preview contrast helpers
 # ---------------------------------------------------------------------------

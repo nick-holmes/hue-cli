@@ -38,8 +38,9 @@ The browser preview is an interactive Three.js viewer that renders a downsampled
 
 - **Gap slider** — separates layers along the Z axis so you can inspect individual colour bands. Defaults to 0 for standard/flat modes (showing the finished product) and 2mm for exploded modes.
 - **Realistic / Filaments toggle** — switches between two colour modes:
-  - **Realistic** — simulates light passing through stacked filament layers using Beer-Lambert physics, showing how the print will actually look when backlit.
+  - **Realistic** — each layer shows the cumulative front-lit appearance of all layers beneath it. Separate layers with the gap slider to see how colour builds up from bottom to top.
   - **Filaments** — shows each layer in its raw filament colour so you can see which filament is assigned where. Automatically applies a small gap so all layers are visible.
+- **Background picker** — row of colour dots next to the toggle. Changes the scene background colour (dark gray, white, mid-gray, warm beige, slate) so transparent regions and edges are easier to inspect.
 - **i button** — click for a description of each colour mode.
 
 ## Which Mode Should I Use?
