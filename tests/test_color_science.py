@@ -1,6 +1,6 @@
 import numpy as np
 import pytest
-from color_science import (
+from huecli.color_science import (
     srgb_to_linear, linear_to_srgb, vectorized_beer_lambert,
     sort_filaments_by_luminosity, allocate_layers_td_proportional,
     apply_contrast_enhancement, compute_heightmap, apply_unsharp_mask,

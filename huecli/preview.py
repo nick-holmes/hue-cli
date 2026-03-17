@@ -12,7 +12,7 @@ import json
 import tempfile
 import webbrowser
 
-from color_science import (
+from .color_science import (
     sort_filaments_by_luminosity,
     compute_flat_layer_counts,
     compute_exploded_layer_counts,
@@ -26,7 +26,7 @@ from color_science import (
     compute_heightmap,
     render_standard_preview,
 )
-from mesh import (
+from .mesh import (
     generate_topographical_stl,
     greedy_mesh_rects,
     build_box_mesh,

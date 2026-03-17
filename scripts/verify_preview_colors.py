@@ -9,8 +9,7 @@ Run: python3 verify_preview_colors.py
 """
 import numpy as np
 import sys
-sys.path.insert(0, '.')
-import color_science
+from huecli import color_science
 
 srgb_to_linear = color_science.srgb_to_linear
 linear_to_srgb = color_science.linear_to_srgb

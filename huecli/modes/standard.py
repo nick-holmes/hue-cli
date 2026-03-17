@@ -8,14 +8,14 @@ with fixed z-bands per filament color.
 import numpy as np
 import logging
 
-from color_science import (
+from ..color_science import (
     sort_filaments_by_luminosity,
     apply_contrast_enhancement,
     apply_unsharp_mask,
     allocate_layers_td_proportional,
     compute_heightmap,
 )
-from mesh import generate_color_band_stls
+from ..mesh import generate_color_band_stls
 
 logger = logging.getLogger(__name__)
 

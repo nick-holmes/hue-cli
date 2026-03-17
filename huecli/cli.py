@@ -1,7 +1,7 @@
 """Argparse CLI configuration for HueCLI."""
 
 import argparse
-from config import COLOR_SCHEMES
+from .config import COLOR_SCHEMES
 
 
 def parse_args():
@@ -9,12 +9,12 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description='HueCLI - Generate multi-color 3D print STLs from images',
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='Example: python3 huecli.py image.png --colors 5 --size 120x160'
+        epilog='Example: python3 -m huecli image.png --colors 5 --size 120x160'
     )
 
     parser.add_argument('image', help='Input image path (PNG/JPG/WEBP)')
     parser.add_argument('-f', '--filaments', type=str, default=None,
-                        help='Filament library CSV path (default: filaments.csv)')
+                        help='Filament library CSV path (default: data/filaments.csv)')
     parser.add_argument('-c', '--colors', type=int, default=None,
                         help='Number of colors/filaments (default: 4)')
     parser.add_argument('-n', '--nozzle', type=float, default=None,

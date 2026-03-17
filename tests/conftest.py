@@ -1,5 +1,1 @@
-"""Add project root to sys.path so test modules can import project code."""
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
+"""Test configuration for HueCLI tests."""

@@ -19,7 +19,7 @@ setup(
     author="HueCLI Contributors",
     url="https://github.com/yourusername/huecli",  # Update with actual repo
     license="MIT",
-    py_modules=["huecli", "generator"],
+    packages=find_packages(),
     python_requires=">=3.8",
     install_requires=[
         "numpy>=1.24.0",
@@ -32,7 +32,7 @@ setup(
     ],
     entry_points={
         "console_scripts": [
-            "huecli=huecli:main",
+            "huecli=huecli.__main__:main",
         ],
     },
     classifiers=[

@@ -3,7 +3,7 @@ import pandas as pd
 import pytest
 from pathlib import Path
 from skimage import color as skcolor
-from config import PipelineConfig, ProcessedImage
+from huecli.config import PipelineConfig, ProcessedImage
 
 
 def _make_test_data():
@@ -50,7 +50,7 @@ def output_dir(tmp_path):
 
 class TestStandardMode:
     def test_generates_files(self, test_data, output_dir):
-        import modes
+        from huecli import modes
         img, gray, alpha, filaments = test_data
         config = PipelineConfig(
             layer_height=0.08, model_height=1.5, width_mm=40.0,
@@ -67,7 +67,7 @@ class TestStandardMode:
 
 class TestFlatMode:
     def test_generates_files(self, test_data, output_dir):
-        import modes
+        from huecli import modes
         img, gray, alpha, filaments = test_data
         config = PipelineConfig(
             layer_height=0.08, model_height=1.5, width_mm=40.0,
@@ -84,7 +84,7 @@ class TestFlatMode:
 
 class TestExplodedMode:
     def test_generates_files(self, test_data, output_dir):
-        import modes
+        from huecli import modes
         img, gray, alpha, filaments = test_data
         config = PipelineConfig(
             layer_height=0.08, model_height=1.5, width_mm=40.0,
@@ -102,7 +102,7 @@ class TestExplodedMode:
 
 class TestExplodedMultiMode:
     def test_generates_files(self, test_data, output_dir):
-        import modes
+        from huecli import modes
         img, gray, alpha, filaments = test_data
         config = PipelineConfig(
             layer_height=0.08, model_height=1.5, width_mm=40.0,

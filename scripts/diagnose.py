@@ -21,9 +21,9 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from filaments import FilamentLibrary
-from image import ImageProcessor
-from color_science import (
+from huecli.filaments import FilamentLibrary
+from huecli.image import ImageProcessor
+from huecli.color_science import (
     sort_filaments_by_luminosity,
     apply_contrast_enhancement,
     apply_unsharp_mask,
@@ -68,7 +68,7 @@ def heightmap_to_heatmap(height, max_h):
 def main():
     parser = argparse.ArgumentParser(description='Diagnose color pipeline')
     parser.add_argument('image', help='Input image path')
-    parser.add_argument('-f', '--filaments', default='filaments.csv')
+    parser.add_argument('-f', '--filaments', default='data/filaments.csv')
     parser.add_argument('-c', '--colors', type=int, default=4)
     parser.add_argument('-n', '--nozzle', type=float, default=0.2)
     parser.add_argument('-l', '--layer-height', type=float, default=0.12)

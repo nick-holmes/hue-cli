@@ -45,7 +45,7 @@ def fill_interactive(args):
     """
     filaments_csv = args.filaments if args.filaments is not None else prompt_with_default(
         "Filament library CSV path",
-        "filaments.csv",
+        "data/filaments.csv",
         str
     )
 

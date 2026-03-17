@@ -12,11 +12,11 @@ import numpy as np
 import trimesh
 import logging
 
-from color_science import (
+from ..color_science import (
     sort_filaments_by_luminosity,
     compute_flat_layer_counts,
 )
-from mesh import generate_quantized_stl
+from ..mesh import generate_quantized_stl
 
 logger = logging.getLogger(__name__)
 

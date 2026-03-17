@@ -8,8 +8,8 @@ delegates to modes.generate() for STL output.
 
 import logging
 
-from config import PipelineConfig, ProcessedImage
-import modes
+from .config import PipelineConfig, ProcessedImage
+from . import modes
 
 logger = logging.getLogger(__name__)
 

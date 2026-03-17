@@ -1,5 +1,5 @@
 import pytest
-from config import PipelineConfig, ProcessedImage, GeneratedFile
+from huecli.config import PipelineConfig, ProcessedImage, GeneratedFile
 import numpy as np
 from pathlib import Path
 

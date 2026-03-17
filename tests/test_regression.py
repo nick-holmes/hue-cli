@@ -23,8 +23,8 @@ import pandas as pd
 from PIL import Image
 from skimage import color as skcolor
 
-from config import PipelineConfig, ProcessedImage
-import preview as preview_mod
+from huecli.config import PipelineConfig, ProcessedImage
+from huecli import preview as preview_mod
 
 logging.basicConfig(level=logging.WARNING)
 

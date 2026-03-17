@@ -1,6 +1,6 @@
 import numpy as np
 import pytest
-from mesh import (
+from huecli.mesh import (
     greedy_mesh_rects, build_box_mesh, generate_topographical_stl,
     generate_flat_layer_stl, generate_quantized_stl,
 )

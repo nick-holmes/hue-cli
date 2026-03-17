@@ -11,8 +11,8 @@ import numpy as np
 import trimesh
 import logging
 
-from color_science import compute_exploded_layer_counts
-from mesh import generate_flat_layer_stl
+from ..color_science import compute_exploded_layer_counts
+from ..mesh import generate_flat_layer_stl
 
 logger = logging.getLogger(__name__)
 

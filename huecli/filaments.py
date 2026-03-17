@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import logging
 from skimage import color
-from color_science import compute_effective_color, allocate_layers_td_proportional
+from .color_science import compute_effective_color, allocate_layers_td_proportional
 
 logger = logging.getLogger(__name__)
 
@@ -647,7 +647,7 @@ class FilamentLibrary:
         """
         import random
         from scipy.spatial import cKDTree
-        from color_science import vectorized_beer_lambert
+        from .color_science import vectorized_beer_lambert
 
         iterations = 150
 

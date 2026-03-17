@@ -13,14 +13,14 @@ import numpy as np
 import pandas as pd
 from skimage import color
 
-from config import PipelineConfig, ProcessedImage, COLOR_SCHEMES
-from filaments import FilamentLibrary
-from image import ImageProcessor
-from cli import parse_args
-from interactive import fill_interactive
-from preview import show_3d_preview
-import color_science
-import modes
+from .config import PipelineConfig, ProcessedImage, COLOR_SCHEMES
+from .filaments import FilamentLibrary
+from .image import ImageProcessor
+from .cli import parse_args
+from .interactive import fill_interactive
+from .preview import show_3d_preview
+from . import color_science
+from . import modes
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
@@ -264,8 +264,8 @@ def main():
 
         # 4c. Gamut coverage report (skip when filaments explicitly specified)
         if not args.use_filaments:
-            from color_science import compute_effective_color as _eff_color
-            from color_science import allocate_layers_td_proportional as _alloc
+            from .color_science import compute_effective_color as _eff_color
+            from .color_science import allocate_layers_td_proportional as _alloc
             sorted_tds = np.array([f['transmission_distance'] for _, f in selected_filaments.iterrows()])
             layer_counts_report, _, _ = _alloc(sorted_tds, num_layers, layer_height)
             logger.info("Gamut coverage report:")

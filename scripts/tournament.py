@@ -28,9 +28,9 @@ import pandas as pd
 from PIL import Image
 from skimage import color
 
-from filaments import FilamentLibrary
-from image import ImageProcessor
-from color_science import (
+from huecli.filaments import FilamentLibrary
+from huecli.image import ImageProcessor
+from huecli.color_science import (
     sort_filaments_by_luminosity,
     apply_contrast_enhancement,
     apply_unsharp_mask,
@@ -548,7 +548,7 @@ panels.forEach(p => {{
 def parse_tournament_args():
     parser = argparse.ArgumentParser(description='HueCLI Tournament — iterate on color fidelity')
     parser.add_argument('image', help='Input image path')
-    parser.add_argument('-f', '--filaments', default='filaments.csv', help='Filament CSV')
+    parser.add_argument('-f', '--filaments', default='data/filaments.csv', help='Filament CSV')
     parser.add_argument('-c', '--colors', type=int, default=4, help='Number of colors')
     parser.add_argument('-n', '--nozzle', type=float, default=0.2, help='Nozzle diameter (mm)')
     parser.add_argument('-l', '--layer-height', type=float, default=0.12, help='Layer height (mm)')

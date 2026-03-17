@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 from pathlib import Path
-from image import ImageProcessor
+from huecli.image import ImageProcessor
 
 
 @pytest.fixture

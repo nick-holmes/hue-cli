@@ -2,13 +2,13 @@ import pytest
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from filaments import FilamentLibrary
+from huecli.filaments import FilamentLibrary
 from skimage import color as skcolor
 
 
 @pytest.fixture
 def filament_lib():
-    csv_path = Path(__file__).parent.parent / 'filaments.csv'
+    csv_path = Path(__file__).parent.parent / 'data' / 'filaments.csv'
     if not csv_path.exists():
         pytest.skip("filaments.csv not found")
     return FilamentLibrary(str(csv_path))
@@ -84,7 +84,7 @@ class TestPhysicsAwareSelection:
 class TestRefinementPass:
     def test_refinement_maintains_or_improves(self, filament_lib):
         """Verify _refine_selection doesn't make things worse."""
-        from color_science import compute_effective_color, allocate_layers_td_proportional
+        from huecli.color_science import compute_effective_color, allocate_layers_td_proportional
         targets = np.array([
             skcolor.rgb2lab([[[0.8, 0.1, 0.1]]])[0][0],
             skcolor.rgb2lab([[[0.1, 0.1, 0.8]]])[0][0],
