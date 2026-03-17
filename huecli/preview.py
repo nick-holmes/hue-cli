@@ -180,19 +180,22 @@ def generate_preview_scene(config, processed_image, selected_filaments,
 
         logger.info(f"3D preview texture: {tex_W}x{tex_H} (ds_tex={ds_tex})")
 
-        # Build filament color map at texture resolution — each pixel gets
-        # the filament RGB of the topmost band that owns it.  Used by the
-        # JS filament-mode toggle for smooth band boundaries when stacked.
+        # Build per-layer filament color textures at texture resolution.
+        # Each layer gets its own texture showing its filament color where
+        # that band has pixels, dark elsewhere.  Used by the JS filament-mode
+        # toggle for crisp band rendering at any gap setting.
         # (Completely separate from realistic rendering.)
         filament_rgbs = np.array(
             [f['rgb'] for _, f in sorted_filaments.iterrows()])
-        fil_map = np.full((tex_H, tex_W, 3), 0.1)
+        per_layer_fil_maps = []
         for k in range(num_colors):
             z_lo = z_boundaries[k]
-            mask = (tex_pixel_height > z_lo + layer_height * 0.5) & tex_alpha_pixels
-            fil_map[mask] = filament_rgbs[k]
-        scene_fil_map = PILImage.fromarray(
-            (np.clip(fil_map, 0, 1) * 255).astype(np.uint8))
+            band_mask = (tex_pixel_height > z_lo + layer_height * 0.5) & tex_alpha_pixels
+            layer_map = np.zeros((tex_H, tex_W, 4), dtype=np.uint8)
+            rgb_bytes = (np.clip(filament_rgbs[k], 0, 1) * 255).astype(np.uint8)
+            layer_map[band_mask, :3] = rgb_bytes
+            layer_map[band_mask, 3] = 255
+            per_layer_fil_maps.append(PILImage.fromarray(layer_map, 'RGBA'))
 
         # Compute geometry at lower resolution
         geo_gray = processed_image.grayscale[::ds_geo, ::ds_geo]
@@ -234,9 +237,15 @@ def generate_preview_scene(config, processed_image, selected_filaments,
                     scene.add_geometry(
                         mesh, geom_name=f"S{k+1:02d}_{name}_C{hex_color}")
 
-        # Attach filament color map to scene metadata (not exported in GLB,
-        # only used by show_3d_preview to build the HTML viewer).
-        scene.metadata['filament_color_map'] = scene_fil_map
+        # Attach per-layer filament textures to scene metadata (not exported
+        # in GLB, only used by show_3d_preview to build the HTML viewer).
+        scene.metadata['filament_layer_maps'] = per_layer_fil_maps
+        scene.metadata['band_metadata'] = {
+            'bands': [{'z_lo': float(z_boundaries[k]), 'z_hi': float(z_boundaries[k+1])}
+                      for k in range(num_colors)],
+            'width': float(width_mm),
+            'depth': float(geo_H * geo_pixel_size),
+        }
 
     logger.info(f"3D preview scene: {len(scene.geometry)} meshes")
     return scene, sorted_filaments
@@ -528,23 +537,34 @@ def show_3d_preview(config, processed_image, selected_filaments):
         })
     filament_info_json = json.dumps(filament_info)
 
-    # Extract filament color map (standard mode only) — passed separately
-    # from the GLB so filament rendering is fully decoupled from realistic.
-    filament_texture_b64 = None
-    fil_map = scene.metadata.get('filament_color_map')
-    if fil_map is not None:
+    # Extract per-layer filament textures (standard mode only) — passed
+    # separately from the GLB so filament rendering is fully decoupled.
+    filament_layer_textures_json = None
+    layer_maps = scene.metadata.get('filament_layer_maps')
+    if layer_maps is not None:
         import io
-        buf = io.BytesIO()
-        fil_map.save(buf, format='PNG')
-        filament_texture_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
-        logger.info(f"Filament color map: {len(buf.getvalue())/1024:.0f} KB PNG")
+        layer_tex_list = []
+        total_bytes = 0
+        for k, img in enumerate(layer_maps):
+            buf = io.BytesIO()
+            img.save(buf, format='PNG')
+            total_bytes += len(buf.getvalue())
+            layer_tex_list.append(base64.b64encode(buf.getvalue()).decode('utf-8'))
+        filament_layer_textures_json = json.dumps(layer_tex_list)
+        logger.info(f"Filament layer textures: {len(layer_tex_list)} layers, "
+                     f"{total_bytes/1024:.0f} KB total")
+
+    # Extract band metadata (standard mode only) for JS-side box slabs
+    band_metadata = scene.metadata.get('band_metadata')
+    band_metadata_json = json.dumps(band_metadata) if band_metadata else None
 
     is_exploded = (config.use_exploded or config.use_exploded_multi
                    or config.use_exploded_cmyk)
     html = _build_viewer_html(b64, use_transparency=is_exploded, use_slider=True,
                                default_gap=2.0 if is_exploded else 0.0,
                                filament_info_json=filament_info_json,
-                               filament_texture_b64=filament_texture_b64)
+                               filament_layer_textures_json=filament_layer_textures_json,
+                               band_metadata_json=band_metadata_json)
 
     with tempfile.NamedTemporaryFile('w', suffix='.html', delete=False) as f:
         f.write(html)
@@ -556,7 +576,8 @@ def show_3d_preview(config, processed_image, selected_filaments):
 
 def _build_viewer_html(b64_glb, use_transparency=False, use_slider=False,
                         default_gap=2.0, filament_info_json='[]',
-                        filament_texture_b64=None):
+                        filament_layer_textures_json=None,
+                        band_metadata_json=None):
     """Build a self-contained HTML page with an embedded Three.js GLB viewer.
 
     Uses CDN-loaded Three.js with GLTFLoader.parse() to decode the base64
@@ -568,9 +589,11 @@ def _build_viewer_html(b64_glb, use_transparency=False, use_slider=False,
         use_slider: if True, show layer gap slider and parse S## mesh names
         default_gap: initial gap value for the slider (0.0 for standard/flat)
         filament_info_json: JSON string of filament metadata for sidebar
-        filament_texture_b64: base64-encoded PNG of filament color map (standard
-            mode only). Loaded separately from the GLB — filament-mode rendering
-            is fully decoupled from realistic-mode rendering.
+        filament_layer_textures_json: JSON array of base64-encoded PNGs, one
+            per layer (standard mode only). Each texture shows that layer's
+            filament color where it has pixels. Fully decoupled from realistic.
+        band_metadata_json: JSON string with band z-boundaries and model
+            dimensions for JS-side box slab generation (standard mode only).
 
     Returns:
         Complete HTML string
@@ -726,6 +749,7 @@ import {{ GLTFLoader }} from 'three/addons/loaders/GLTFLoader.js';
 
 const base64 = "{b64_glb}";
 const FILAMENT_DATA = {filament_info_json};
+const BAND_META = {band_metadata_json or 'null'};
 
 // Decode base64 → ArrayBuffer
 const raw = atob(base64);
@@ -762,6 +786,7 @@ const useSlider = {'true' if use_slider else 'false'};
 
 // Track meshes for slider + color toggle
 const layerMeshes = [];  // {{mesh, idx, filamentColor, ...}}
+const filamentSlabs = [];  // JS-generated box slabs for filament mode
 let showFilamentColors = false;
 let gapBeforeFilamentMode = null;  // stored gap when entering filament mode
 
@@ -815,7 +840,6 @@ loader.parse(buf.buffer, '', (gltf) => {{
           const entry = {{ mesh: child, idx: parseInt(m[1], 10) - 1,
                           filamentColor: null, filamentColorF: null,
                           realisticColors: null, realisticMaterial: null,
-                          filamentSolidMat: null, filamentMapMat: null,
                           isTextured: hasTexture }};
 
           // Extract filament hex color from name (e.g. "_Cff6f4f")
@@ -846,49 +870,90 @@ loader.parse(buf.buffer, '', (gltf) => {{
   }});
   scene.add(gltf.scene);
 
-  // Build filament-mode materials (fully separate from GLB realistic textures).
-  // Two variants per band:
-  //   filamentSolidMat — solid band color (used when layers are separated)
-  //   filamentMapMat  — combined color-map texture (used when layers are stacked,
-  //                     gives texture-resolution band boundaries)
-  for (const entry of layerMeshes) {{
-    if (entry.isTextured && entry.filamentColorF) {{
-      const [r, g, b] = entry.filamentColorF;
-      const rm = entry.realisticMaterial;
-      entry.filamentSolidMat = new THREE.MeshBasicMaterial({{
-        color: new THREE.Color(r, g, b),
-        side: THREE.FrontSide,
-        polygonOffset: rm.polygonOffset,
-        polygonOffsetFactor: rm.polygonOffsetFactor,
-        polygonOffsetUnits: rm.polygonOffsetUnits,
-      }});
-    }}
-  }}
-  // Load filament color map texture (standard mode only).
-  const filTexB64 = {f"'{filament_texture_b64}'" if filament_texture_b64 else 'null'};
-  if (filTexB64) {{
-    const img = new Image();
-    img.onload = () => {{
-      const tex = new THREE.Texture(img);
-      tex.flipY = false;  // match GLB UV convention
-      tex.colorSpace = THREE.SRGBColorSpace;
-      tex.needsUpdate = true;
-      for (const entry of layerMeshes) {{
-        if (entry.isTextured && entry.realisticMaterial) {{
-          const rm = entry.realisticMaterial;
-          entry.filamentMapMat = new THREE.MeshBasicMaterial({{
-            map: tex,
-            side: THREE.FrontSide,
-            polygonOffset: rm.polygonOffset,
-            polygonOffsetFactor: rm.polygonOffsetFactor,
-            polygonOffsetUnits: rm.polygonOffsetUnits,
-          }});
-          // If already in filament mode with gap ≈ 0, apply immediately
-          if (showFilamentColors) applyColorMode();
+  // (Filament-mode box slabs are built below when textures load.)
+  // Load per-layer filament textures and build JS-side box slabs
+  // (standard mode only). Slabs are completely independent geometry from the
+  // GLB heightfield meshes — they provide crisp filament-color rendering at
+  // texture resolution with visible z-thickness.
+  const filLayerTexB64 = {filament_layer_textures_json if filament_layer_textures_json else 'null'};
+  if (filLayerTexB64 && BAND_META) {{
+    filLayerTexB64.forEach((b64, layerIdx) => {{
+      const img = new Image();
+      img.onload = () => {{
+        const tex = new THREE.Texture(img);
+        tex.colorSpace = THREE.SRGBColorSpace;
+        tex.needsUpdate = true;
+
+        const band = BAND_META.bands[layerIdx];
+        if (!band) return;
+        const w = BAND_META.width;
+        const d = BAND_META.depth;
+        const zThick = band.z_hi - band.z_lo;
+        if (zThick <= 0) return;
+
+        // Build box slab with single RGBA texture on all faces.
+        // BoxGeometry groups: 0=+x, 1=-x, 2=+y, 3=-y, 4=+z(top), 5=-z(bottom)
+        // Side face UVs are remapped to sample the nearest edge row/column
+        // of the texture, so alphaTest clips them at the image boundary
+        // (no rectangular border on rounded/irregular shapes).
+        const geo = new THREE.BoxGeometry(w, d, zThick);
+        const uvAttr = geo.attributes.uv;
+        const posAttr = geo.attributes.position;
+
+        // Remap side face UVs to sample edge strips from the texture.
+        // 4 vertices per face, 24 total. We read vertex positions to
+        // determine where along the edge each vertex falls.
+        // Group 0 (+X): verts 0-3, sample right column (u=1, v from y)
+        for (let vi = 0; vi < 4; vi++) {{
+          const y = posAttr.getY(vi);
+          uvAttr.setXY(vi, 1.0, 1.0 - (y / d + 0.5));
         }}
-      }}
-    }};
-    img.src = 'data:image/png;base64,' + filTexB64;
+        // Group 1 (-X): verts 4-7, sample left column (u=0, v from y)
+        for (let vi = 4; vi < 8; vi++) {{
+          const y = posAttr.getY(vi);
+          uvAttr.setXY(vi, 0.0, 1.0 - (y / d + 0.5));
+        }}
+        // Group 2 (+Y): verts 8-11, sample top row (v=0, u from x)
+        for (let vi = 8; vi < 12; vi++) {{
+          const x = posAttr.getX(vi);
+          uvAttr.setXY(vi, x / w + 0.5, 0.0);
+        }}
+        // Group 3 (-Y): verts 12-15, sample bottom row (v=1, u from x)
+        for (let vi = 12; vi < 16; vi++) {{
+          const x = posAttr.getX(vi);
+          uvAttr.setXY(vi, x / w + 0.5, 1.0);
+        }}
+        // Group 4 (+Z top): verts 16-19, flip V for image convention
+        for (let vi = 16; vi < 20; vi++) {{
+          uvAttr.setY(vi, 1.0 - uvAttr.getY(vi));
+        }}
+        // Group 5 (-Z bottom): verts 20-23, default UVs are fine
+        uvAttr.needsUpdate = true;
+
+        const texMat = new THREE.MeshBasicMaterial({{
+          map: tex, alphaTest: 0.5, transparent: true,
+          side: THREE.FrontSide,
+        }});
+        const slab = new THREE.Mesh(geo, texMat);
+
+        // Position: BoxGeometry is centered, so offset to align with GLB origin
+        const zMid = (band.z_lo + band.z_hi) / 2;
+        slab.position.set(w / 2, d / 2, zMid);
+        slab.visible = false;  // hidden until filament mode activated
+        scene.add(slab);
+
+        filamentSlabs.push({{
+          slab: slab,
+          idx: layerIdx,
+          originalZ: zMid,
+          band: band,
+        }});
+
+        // If already in filament mode, show immediately
+        if (showFilamentColors) applyColorMode();
+      }};
+      img.src = 'data:image/png;base64,' + b64;
+    }});
   }}
 
   // Apply initial gap from slider
@@ -926,8 +991,11 @@ function updateGap() {{
   for (const entry of layerMeshes) {{
     entry.mesh.position.z = entry.idx * gap;
   }}
-  // Re-apply filament materials when gap changes (switches between
-  // color-map texture for stacked view and solid color for separated).
+  // Reposition filament slabs with gap offset
+  for (const s of filamentSlabs) {{
+    s.slab.position.z = s.originalZ + s.idx * gap;
+  }}
+  // Re-apply filament mode visibility when gap changes
   if (showFilamentColors) applyColorMode();
 }}
 
@@ -940,25 +1008,32 @@ function applyColorMode() {{
     btnF.classList.toggle('active', showFilamentColors);
   }}
 
+  // Check which layers are hidden via sidebar
+  const hiddenLayers = new Set();
+  document.querySelectorAll('.swatch-item.hidden').forEach(item => {{
+    const prefix = item.dataset.prefix;
+    const m = prefix && prefix.match(/^S(\\d+)/);
+    if (m) hiddenLayers.add(parseInt(m[1], 10) - 1);
+  }});
+
   for (const entry of layerMeshes) {{
     if (!entry.filamentColorF) continue;
+    const layerHidden = hiddenLayers.has(entry.idx);
 
     if (entry.isTextured) {{
-      // Textured mesh: swap between realistic texture and filament materials.
-      // Filament materials are built independently from the GLB — changes here
-      // cannot affect realistic rendering.
+      // Textured mesh (standard mode): toggle between GLB heightfield
+      // (realistic) and JS box slabs (filament mode).
       if (showFilamentColors) {{
-        // Use color-map texture when stacked (smooth boundaries at texture
-        // resolution), solid color when separated (correct per-band identity).
-        const slider = document.getElementById('gap-slider');
-        const gap = slider ? parseFloat(slider.value) : 0;
-        if (gap < 0.1 && entry.filamentMapMat) {{
-          entry.mesh.material = entry.filamentMapMat;
-        }} else if (entry.filamentSolidMat) {{
-          entry.mesh.material = entry.filamentSolidMat;
-        }}
-      }} else if (entry.realisticMaterial) {{
-        entry.mesh.material = entry.realisticMaterial;
+        // Hide GLB mesh, show corresponding slab
+        entry.mesh.visible = false;
+        const slab = filamentSlabs.find(s => s.idx === entry.idx);
+        if (slab) slab.slab.visible = !layerHidden;
+      }} else {{
+        // Show GLB mesh, hide slab
+        if (entry.realisticMaterial) entry.mesh.material = entry.realisticMaterial;
+        entry.mesh.visible = !layerHidden;
+        const slab = filamentSlabs.find(s => s.idx === entry.idx);
+        if (slab) slab.slab.visible = false;
       }}
     }} else {{
       // Vertex-colored mesh: swap color arrays
@@ -1006,12 +1081,8 @@ function setColorMode(filaments) {{
   const slider = document.getElementById('gap-slider');
 
   if (filaments && slider) {{
-    // Entering filament mode: save current gap, apply minimum gap so layers are visible
+    // Save current gap when entering filament mode
     gapBeforeFilamentMode = parseFloat(slider.value);
-    if (gapBeforeFilamentMode < 0.5) {{
-      slider.value = '0.5';
-      updateGap();
-    }}
   }} else if (!filaments && slider && gapBeforeFilamentMode !== null) {{
     // Leaving filament mode: restore previous gap
     slider.value = String(gapBeforeFilamentMode);
@@ -1078,8 +1149,20 @@ FILAMENT_DATA.forEach((f, i) => {{
     const targetIdx = f.layer - 1;
     for (const entry of layerMeshes) {{
       if (entry.idx === targetIdx) {{
-        entry.mesh.visible = !isHidden;
+        // In filament mode with slabs, hide GLB mesh; toggle slab instead
+        if (showFilamentColors && entry.isTextured) {{
+          entry.mesh.visible = false;
+          const slab = filamentSlabs.find(s => s.idx === targetIdx);
+          if (slab) slab.slab.visible = !isHidden;
+        }} else {{
+          entry.mesh.visible = !isHidden;
+        }}
       }}
+    }}
+    // Also toggle slab if no layerMesh entry matched (shouldn't happen, but safe)
+    if (showFilamentColors) {{
+      const slab = filamentSlabs.find(s => s.idx === targetIdx);
+      if (slab) slab.slab.visible = !isHidden;
     }}
   }});
 
