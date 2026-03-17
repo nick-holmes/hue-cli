@@ -184,7 +184,8 @@ def allocate_layers_td_proportional(filament_tds, total_layers, layer_height):
 # Heightmap / contrast
 # ---------------------------------------------------------------------------
 
-def compute_heightmap(enhanced_grayscale, alpha_pixels, max_height, layer_height):
+def compute_heightmap(enhanced_grayscale, alpha_pixels, max_height, layer_height,
+                      min_height=None):
     """Compute per-pixel height from contrast-enhanced grayscale.
 
     Args:
@@ -192,12 +193,16 @@ def compute_heightmap(enhanced_grayscale, alpha_pixels, max_height, layer_height
         alpha_pixels: 2D boolean mask
         max_height: Maximum height in mm
         layer_height: Layer height in mm
+        min_height: Minimum pixel height in mm. When set to z_boundaries[1],
+            ensures the bottom filament band always has full coverage.
+            Defaults to layer_height if not provided.
 
     Returns:
         2D array of per-pixel heights in mm
     """
+    if min_height is None:
+        min_height = layer_height
     global_brightness_max = np.max(enhanced_grayscale[alpha_pixels]) if np.any(alpha_pixels) else 1.0
-    min_height = 2 * layer_height
     normalized = enhanced_grayscale / max(global_brightness_max, 1e-6)
 
     pixel_height = min_height + normalized * (max_height - min_height)

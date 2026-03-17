@@ -119,7 +119,7 @@ class TestHeightmap:
         gray = np.random.rand(10, 10)
         alpha = np.ones((10, 10), dtype=bool)
         result = compute_heightmap(gray, alpha, 2.0, 0.08)
-        assert result.min() >= 2 * 0.08  # min_height
+        assert result.min() >= 0.08  # min_height = 1 layer
         assert result.max() <= 2.0
 
 

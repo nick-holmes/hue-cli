@@ -14,17 +14,17 @@ import webbrowser
 
 from color_science import (
     sort_filaments_by_luminosity,
-    apply_contrast_enhancement,
-    apply_unsharp_mask,
-    allocate_layers_td_proportional,
-    compute_heightmap,
     compute_flat_layer_counts,
     compute_exploded_layer_counts,
     srgb_to_linear,
     linear_to_srgb,
     auto_contrast_preview,
     apply_preview_face_colors,
-    vectorized_beer_lambert,
+    apply_contrast_enhancement,
+    apply_unsharp_mask,
+    allocate_layers_td_proportional,
+    compute_heightmap,
+    render_standard_preview,
 )
 from mesh import (
     generate_topographical_stl,
@@ -36,11 +36,12 @@ from mesh import (
 logger = logging.getLogger(__name__)
 
 
-def generate_preview_scene(config, processed_image, selected_filaments):
+def generate_preview_scene(config, processed_image, selected_filaments,
+                           max_pixels=500000):
     """Generate a trimesh.Scene with colored meshes for interactive 3D preview.
 
     Mirrors the heightmap pipeline from generate_all() and returns a Scene
-    instead of exporting STLs. Downsamples to ~500K pixels for browser-renderable
+    instead of exporting STLs. Downsamples to max_pixels for browser-renderable
     mesh size while preserving good detail.
 
     Args:
@@ -50,6 +51,7 @@ def generate_preview_scene(config, processed_image, selected_filaments):
                 dither_mode, contrast_strength
         processed_image: needs image_rgb, grayscale, alpha_mask, width_px, height_px
         selected_filaments: DataFrame
+        max_pixels: target pixel count for downsampling (default 500K)
 
     Returns:
         (trimesh.Scene, sorted_filaments_df)
@@ -65,8 +67,8 @@ def generate_preview_scene(config, processed_image, selected_filaments):
     H, W = processed_image.grayscale.shape
     width_mm = config.width_mm
 
-    # Downsample for browser rendering (~500K pixels target)
-    ds = max(1, int(sqrt(H * W / 500000)))
+    # Downsample for browser rendering
+    ds = max(1, int(sqrt(H * W / max_pixels)))
     ds_grayscale = processed_image.grayscale[::ds, ::ds]
     ds_alpha = processed_image.alpha_mask[::ds, ::ds]
     ds_image_rgb = (processed_image.image_rgb[::ds, ::ds]
@@ -153,51 +155,39 @@ def generate_preview_scene(config, processed_image, selected_filaments):
             z_cursor = z_top_k
 
     else:
-        # Standard mode: one mesh per color band
-        enhanced = apply_contrast_enhancement(
+        # Standard mode: heightmap + TD-proportional z-bands
+        enhanced_grayscale = apply_contrast_enhancement(
             ds_grayscale.copy(), ds_alpha, config.contrast_strength)
-        enhanced = apply_unsharp_mask(enhanced, ds_alpha)
+        enhanced_grayscale = apply_unsharp_mask(enhanced_grayscale, ds_alpha)
 
+        num_colors = len(sorted_filaments)
         filament_tds = np.array([f['transmission_distance']
                                   for _, f in sorted_filaments.iterrows()])
-        _, _, z_boundaries = allocate_layers_td_proportional(
+        layer_counts_arr, layer_boundaries, z_boundaries = allocate_layers_td_proportional(
             filament_tds, num_layers, layer_height)
-        pixel_height = compute_heightmap(enhanced, alpha_pixels, model_height,
-                                          layer_height)
-        min_thickness = layer_height * 0.5
-        combined_mask = alpha_pixels & (pixel_height > min_thickness)
 
-        # Compute single combined Beer-Lambert preview through ALL layers.
-        num_colors = len(sorted_filaments)
-        filament_rgbs = np.array([f['rgb'] for _, f in sorted_filaments.iterrows()])
-        filament_rgbs_lin = srgb_to_linear(filament_rgbs)
-        filament_tds_arr = np.array([f['transmission_distance']
-                                      for _, f in sorted_filaments.iterrows()])
-        light = np.ones((ds_H, ds_W, 3))  # Linear light
-        for i in range(num_colors):
-            z_lo = z_boundaries[i]
-            z_hi = z_boundaries[i + 1]
-            thickness = np.clip(pixel_height, z_lo, z_hi) - z_lo
-            td = max(filament_tds_arr[i], 0.1)
-            transmission = np.exp(-thickness / td)[:, :, np.newaxis]
-            light = light * transmission + filament_rgbs_lin[i] * (1.0 - transmission)
+        pixel_height = compute_heightmap(
+            enhanced_grayscale, alpha_pixels, model_height, layer_height,
+            min_height=float(z_boundaries[1]))
 
+        # Beer-Lambert preview via heightmap + z-bands
         combined_preview = auto_contrast_preview(
-            linear_to_srgb(np.clip(light, 0, 1)), combined_mask)
+            render_standard_preview(pixel_height, z_boundaries, sorted_filaments),
+            alpha_pixels)
 
+        # Build one mesh per color band
         for k in range(num_colors):
             filament = sorted_filaments.iloc[k]
             z_lo = z_boundaries[k]
             z_hi = z_boundaries[k + 1]
 
-            # Clip pixel height to this band
-            band_bottom = np.full_like(pixel_height, z_lo)
+            band_bottom = np.full((ds_H, ds_W), z_lo)
             band_top = np.clip(pixel_height, z_lo, z_hi)
-            band_mask = combined_mask & (band_top > band_bottom + min_thickness)
+            pixel_mask = (pixel_height > z_lo + layer_height * 0.5) & alpha_pixels
 
-            if band_mask.any():
+            if pixel_mask.any():
                 mesh = generate_topographical_stl(
-                    band_bottom, band_top, band_mask, ds_pixel_size,
+                    band_bottom, band_top, pixel_mask, ds_pixel_size,
                     layer_height, preview=True)
                 if len(mesh.vertices) > 0:
                     apply_preview_face_colors(

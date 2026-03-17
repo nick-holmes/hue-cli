@@ -1,0 +1,66 @@
+{
+  "timestamp": "2026-03-17T09:59:11.119931",
+  "image": "charizard.png.webp",
+  "base_config": {
+    "layer_height": 0.12,
+    "model_height": 1.44,
+    "width_mm": 100.0,
+    "height_mm": 140.0,
+    "color_count": 4,
+    "num_layers": 12,
+    "min_color_difference": 5.0,
+    "nozzle_diameter": 0.2
+  },
+  "rounds": [
+    {
+      "round": 1,
+      "type": "filaments",
+      "winner": 1,
+      "winner_params": {
+        "filaments": [
+          "Black",
+          "Burnt Grey",
+          "Peanut",
+          "Matte Yellow"
+        ],
+        "filament_tds": [
+          0.1,
+          0.4,
+          1.8,
+          9.1
+        ]
+      }
+    },
+    {
+      "round": 2,
+      "type": "contrast",
+      "winner": 4,
+      "winner_params": {
+        "contrast_strength": 4.5,
+        "unsharp_strength": 1.5,
+        "unsharp_radius": 1.5
+      }
+    },
+    {
+      "round": 3,
+      "type": "sharpness",
+      "winner": 1,
+      "winner_params": {
+        "contrast_strength": 4.5,
+        "unsharp_strength": 0.5,
+        "unsharp_radius": 2.5
+      }
+    },
+    {
+      "round": 4,
+      "type": "finetune",
+      "winner": 3,
+      "winner_params": {
+        "contrast_strength": 3.8249999999999997,
+        "unsharp_strength": 0.4,
+        "unsharp_radius": 2.875
+      }
+    }
+  ],
+  "cli_command": "python3 huecli.py charizard.png.webp -f filaments.csv --use-filaments \"Black,Burnt Grey,Peanut,Matte Yellow\" -c 4 -n 0.2 -l 0.12 -m 1.44 -s 100x140"
+}

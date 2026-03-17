@@ -122,6 +122,15 @@ class FilamentLibrary:
                         np.array([[target_lab]]),
                         np.array([[rendered_lab]])
                     )[0][0]
+
+                    # Penalize near-invisible filaments: if opacity at print
+                    # thickness is very low, the filament contributes almost
+                    # nothing to the output regardless of its color match.
+                    td = row['transmission_distance']
+                    opacity = 1.0 - np.exp(-estimated_thickness / max(td, 0.1))
+                    if opacity < 0.15:
+                        # Nearly invisible at this thickness — heavy penalty
+                        delta_e += 30.0 * (1.0 - opacity / 0.15)
                 else:
                     delta_e = color.deltaE_ciede2000(
                         np.array([[target_lab]]),
@@ -638,7 +647,7 @@ class FilamentLibrary:
         """
         import random
         from scipy.spatial import cKDTree
-        from color_science import vectorized_beer_lambert, render_standard_preview
+        from color_science import vectorized_beer_lambert
 
         iterations = 150
 
@@ -708,27 +717,12 @@ class FilamentLibrary:
                 dists, _ = tree.query(target_lab, k=1)
                 return float(np.mean(dists[alpha_valid.ravel()]))
             else:
-                # Standard mode: simulate actual Z-band rendering via Beer-Lambert
-                from color_science import sort_filaments_by_luminosity
-                sorted_fils = sort_filaments_by_luminosity(filaments_df)
-                sorted_tds = np.array([f['transmission_distance'] for _, f in sorted_fils.iterrows()])
-                _, _, z_bounds = allocate_layers_td_proportional(sorted_tds, num_layers, layer_height)
-
-                # Compute a simple heightmap for downsampled image
-                ds_gray = np.mean(ds_rgb, axis=2)
-                if ds_gray.max() > ds_gray.min():
-                    ds_gray = (ds_gray - ds_gray.min()) / (ds_gray.max() - ds_gray.min())
-                min_h = 2 * layer_height
-                pixel_height = min_h + ds_gray * (model_height - min_h)
-                pixel_height = np.where(alpha_valid, pixel_height, 0)
-
-                preview_rgb = render_standard_preview(pixel_height, z_bounds, sorted_fils)
-                preview_lab = color.rgb2lab(np.clip(preview_rgb, 0, 1))
-                target_lab = ds_lab
-
-                diff = preview_lab[alpha_valid] - target_lab[alpha_valid]
-                dists = np.sqrt(np.sum(diff ** 2, axis=1))
-                return float(np.mean(dists))
+                # Standard mode: simple nearest-filament delta-E
+                fil_lab = np.array([f['lab'] for _, f in filaments_df.iterrows()])
+                tree = cKDTree(fil_lab)
+                target_lab = ds_lab.reshape(-1, 3)
+                dists, _ = tree.query(target_lab, k=1)
+                return float(np.mean(dists[alpha_valid.ravel()]))
 
         # Initial score
         best_filaments = selected_filaments.copy()

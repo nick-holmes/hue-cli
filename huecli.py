@@ -10,6 +10,7 @@ import sys
 import logging
 from pathlib import Path
 import numpy as np
+import pandas as pd
 from skimage import color
 
 from config import PipelineConfig, ProcessedImage, COLOR_SCHEMES
@@ -204,63 +205,79 @@ def main():
         elif exploded_any:
             img_processor.color_count = color_count
 
-        # 3. Quantize colors
-        dominant_colors_lab, kmeans, sorted_indices = img_processor.quantize_colors()
-
-        # 4. Select best filaments
-        if use_exploded_cmyk:
-            selected_filaments = filament_lib.select_for_exploded_cmyk(
-                layer_height=layer_height,
-                model_height=model_height,
-                sandwich_layers=sandwich_layers,
-                max_color_sandwiches=max_color_sandwiches,
-            )
-        elif exploded_any:
-            selected_filaments = filament_lib.select_for_exploded(
-                dominant_colors_lab,
-                min_color_difference=min_color_difference,
-                layer_height=layer_height,
-                model_height=model_height,
-            )
-        else:
-            selected_filaments = filament_lib.select_best_filaments(
-                dominant_colors_lab, color_count,
-                layer_height=layer_height,
-                min_color_difference=min_color_difference,
-                use_flat_cap=use_flat_cap,
-                model_height=model_height,
-            )
-
-        logger.info("Selected filaments:")
-        for i, row in selected_filaments.iterrows():
-            logger.info(f"  {i+1}. {row['name']} ({row['color_hex']}) TD={row['transmission_distance']:.1f}mm")
-
-        # 4b. Always-on filament optimization via simulated annealing
+        # 3. Select filaments
         num_layers = int(model_height / layer_height)
-        selected_filaments = filament_lib.optimize_filament_set(
-            selected_filaments, img_processor.image, img_processor.alpha_mask,
-            layer_height, model_height, num_layers,
-            mode=mode, sandwich_layers=sandwich_layers, use_fill=use_fill,
-        )
 
-        # 4c. Gamut coverage report
-        from color_science import compute_effective_color as _eff_color
-        from color_science import allocate_layers_td_proportional as _alloc
-        sorted_tds = np.array([f['transmission_distance'] for _, f in selected_filaments.iterrows()])
-        layer_counts_report, _, _ = _alloc(sorted_tds, num_layers, layer_height)
-        logger.info("Gamut coverage report:")
-        for i, (_, row) in enumerate(selected_filaments.iterrows()):
-            thickness = layer_counts_report[i] * layer_height
-            rendered_lab = _eff_color(row['rgb'], row['transmission_distance'], thickness)
-            # Find nearest target
-            best_de = float('inf')
-            best_target_idx = 0
-            for t_idx, t_lab in enumerate(dominant_colors_lab):
-                de = float(np.sqrt(np.sum((np.array(rendered_lab) - np.array(t_lab)) ** 2)))
-                if de < best_de:
-                    best_de = de
-                    best_target_idx = t_idx
-            logger.info(f"  {row['name']}: {thickness:.2f}mm thick, nearest target deltaE={best_de:.1f}")
+        if args.use_filaments:
+            # Explicit filament names from CLI — bypass selection and SA
+            requested_names = [n.strip() for n in args.use_filaments.split(',')]
+            rows = []
+            for name in requested_names:
+                matches = filament_lib.df[filament_lib.df['name'] == name]
+                if len(matches) == 0:
+                    logger.error(f"Filament not found: '{name}'")
+                    logger.info("Available filaments:")
+                    for _, row in filament_lib.df.iterrows():
+                        logger.info(f"  {row['name']}")
+                    return 1
+                rows.append(matches.iloc[0])
+            selected_filaments = pd.DataFrame(rows).reset_index(drop=True)
+            color_count = len(selected_filaments)
+            logger.info(f"Using specified filaments: {', '.join(requested_names)}")
+        else:
+            # Quantize colors and select filaments
+            dominant_colors_lab, kmeans, sorted_indices = img_processor.quantize_colors()
+
+            if use_exploded_cmyk:
+                selected_filaments = filament_lib.select_for_exploded_cmyk(
+                    layer_height=layer_height,
+                    model_height=model_height,
+                    sandwich_layers=sandwich_layers,
+                    max_color_sandwiches=max_color_sandwiches,
+                )
+            elif exploded_any:
+                selected_filaments = filament_lib.select_for_exploded(
+                    dominant_colors_lab,
+                    min_color_difference=min_color_difference,
+                    layer_height=layer_height,
+                    model_height=model_height,
+                )
+            else:
+                selected_filaments = filament_lib.select_best_filaments(
+                    dominant_colors_lab, color_count,
+                    layer_height=layer_height,
+                    min_color_difference=min_color_difference,
+                    use_flat_cap=use_flat_cap,
+                    model_height=model_height,
+                )
+
+            logger.info("Selected filaments:")
+            for i, row in selected_filaments.iterrows():
+                logger.info(f"  {i+1}. {row['name']} ({row['color_hex']}) TD={row['transmission_distance']:.1f}mm")
+
+            # Always-on filament optimization via simulated annealing
+            selected_filaments = filament_lib.optimize_filament_set(
+                selected_filaments, img_processor.image, img_processor.alpha_mask,
+                layer_height, model_height, num_layers,
+                mode=mode, sandwich_layers=sandwich_layers, use_fill=use_fill,
+            )
+
+        # 4c. Gamut coverage report (skip when filaments explicitly specified)
+        if not args.use_filaments:
+            from color_science import compute_effective_color as _eff_color
+            from color_science import allocate_layers_td_proportional as _alloc
+            sorted_tds = np.array([f['transmission_distance'] for _, f in selected_filaments.iterrows()])
+            layer_counts_report, _, _ = _alloc(sorted_tds, num_layers, layer_height)
+            logger.info("Gamut coverage report:")
+            for i, (_, row) in enumerate(selected_filaments.iterrows()):
+                thickness = layer_counts_report[i] * layer_height
+                rendered_lab = _eff_color(row['rgb'], row['transmission_distance'], thickness)
+                best_de = float('inf')
+                for t_idx, t_lab in enumerate(dominant_colors_lab):
+                    de = float(np.sqrt(np.sum((np.array(rendered_lab) - np.array(t_lab)) ** 2)))
+                    if de < best_de:
+                        best_de = de
+                logger.info(f"  {row['name']}: {thickness:.2f}mm thick, nearest target deltaE={best_de:.1f}")
 
         # 5. Convert to grayscale
         logger.info("Converting to grayscale...")
