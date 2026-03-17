@@ -16,8 +16,6 @@ from .color_science import (
     sort_filaments_by_luminosity,
     compute_flat_layer_counts,
     compute_exploded_layer_counts,
-    srgb_to_linear,
-    linear_to_srgb,
     auto_contrast_preview,
     apply_preview_face_colors,
     apply_contrast_enhancement,
@@ -105,30 +103,22 @@ def generate_preview_scene(config, processed_image, selected_filaments,
             color_filaments, color_total_layers, ds_image_rgb, alpha_pixels,
             layer_height)
 
-        # Compute single combined Beer-Lambert preview through ALL layers.
+        # Front-lit preview: show topmost color filament at each pixel.
+        # Layers are stacked dark-to-light, so the highest present color
+        # filament is the visible surface color. Transparent cap (flat-cap)
+        # is ignored since you see through it to the color layers below.
         filament_rgbs = np.array([f['rgb'] for _, f in color_filaments.iterrows()])
-        filament_rgbs_lin = srgb_to_linear(filament_rgbs)
-        filament_tds = np.array([f['transmission_distance']
-                                  for _, f in color_filaments.iterrows()])
 
-        light = np.ones((ds_H, ds_W, 3))  # White backlight (linear)
+        combined_preview = np.ones((ds_H, ds_W, 3)) * 0.95  # default near-white
 
+        # Iterate dark-to-light; each present filament overwrites the preview.
+        # The last (lightest) present filament at each pixel wins.
         for k in range(len(color_filaments)):
-            td = max(filament_tds[k], 0.1)
-            thickness = pixel_counts[:, :, k] * layer_height
-            transmission = np.exp(-thickness / td)[:, :, np.newaxis]
-            light = light * transmission + filament_rgbs_lin[k] * (1.0 - transmission)
+            present = pixel_counts[:, :, k] > 0
+            if present.any():
+                combined_preview[present] = filament_rgbs[k]
 
-        # Apply transparent cap if present
-        if transparent_filament is not None and cap_layers > 0:
-            trans_td = max(transparent_filament['transmission_distance'], 0.1)
-            trans_rgb_lin = srgb_to_linear(np.array(transparent_filament['rgb']))
-            cap_thickness = cap_layers * layer_height
-            cap_trans = np.exp(-cap_thickness / trans_td)
-            light = light * cap_trans + trans_rgb_lin * (1.0 - cap_trans)
-
-        combined_preview = auto_contrast_preview(
-            linear_to_srgb(np.clip(light, 0, 1)), alpha_pixels)
+        combined_preview = auto_contrast_preview(combined_preview, alpha_pixels)
 
         # Build one mesh per color with cumulative z stacking
         z_cursor = np.zeros((ds_H, ds_W))

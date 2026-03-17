@@ -557,7 +557,12 @@ def render_flat_preview(pixel_counts, sorted_filaments, layer_height,
 
 
 def render_standard_preview(pixel_height, z_boundaries, sorted_filaments):
-    """Render Beer-Lambert preview for standard topographical mode.
+    """Render front-lit preview for standard topographical mode.
+
+    Models a front-lit view where pixel height maps to a smooth color gradient
+    through the filament stack. Each band's midpoint is the pure filament color;
+    between midpoints, colors are linearly interpolated in LAB space for
+    perceptually smooth transitions. This avoids posterization with few colors.
 
     Args:
         pixel_height: 2D array of per-pixel heights (mm)
@@ -571,23 +576,43 @@ def render_standard_preview(pixel_height, z_boundaries, sorted_filaments):
     num_colors = len(sorted_filaments)
 
     filament_rgbs = np.array([f['rgb'] for _, f in sorted_filaments.iterrows()])
-    filament_rgbs_lin = srgb_to_linear(filament_rgbs)
-    filament_tds = np.array([f['transmission_distance'] for _, f in sorted_filaments.iterrows()])
 
-    light = np.ones((H, W, 3))
+    # Build a smooth color ramp: each band midpoint gets the pure filament color,
+    # and we interpolate between midpoints in LAB for perceptual smoothness.
+    # Anchor points: band midpoints + endpoints (clamp to first/last color)
+    midpoints = np.array([(z_boundaries[i] + z_boundaries[i + 1]) / 2
+                           for i in range(num_colors)])
 
-    for i in range(num_colors):
-        z_lo = z_boundaries[i]
-        z_hi = z_boundaries[i + 1]
+    # Convert filament colors to LAB for perceptual interpolation
+    filament_labs = color.rgb2lab(filament_rgbs.reshape(-1, 1, 3)).reshape(-1, 3)
 
-        thickness = np.clip(pixel_height, z_lo, z_hi) - z_lo
-        td = max(filament_tds[i], 0.1)
-        rgb_lin = filament_rgbs_lin[i]
+    # Normalize pixel height to [0, 1] range over the full z span
+    z_min = z_boundaries[0]
+    z_max = z_boundaries[-1]
+    z_range = max(z_max - z_min, 1e-6)
 
-        transmission = np.exp(-thickness / td)[:, :, np.newaxis]
-        light = light * transmission + rgb_lin * (1.0 - transmission)
+    # Normalize midpoints to same [0, 1] range
+    mid_norm = (midpoints - z_min) / z_range
+    height_norm = np.clip((pixel_height - z_min) / z_range, 0, 1)
 
-    return linear_to_srgb(np.clip(light, 0, 1))
+    # Vectorized: find which two midpoints each pixel is between, then lerp in LAB
+    h_flat = height_norm.ravel()
+
+    # searchsorted gives the index of the midpoint AFTER each height
+    idx_right = np.searchsorted(mid_norm, h_flat).clip(1, num_colors - 1)
+    idx_left = idx_right - 1
+
+    # Interpolation parameter: 0 at left midpoint, 1 at right midpoint
+    left_z = mid_norm[idx_left]
+    right_z = mid_norm[idx_right]
+    t = np.clip((h_flat - left_z) / np.maximum(right_z - left_z, 1e-6), 0, 1)
+
+    # Interpolate in LAB
+    lab_left = filament_labs[idx_left]    # (N, 3)
+    lab_right = filament_labs[idx_right]  # (N, 3)
+    result_lab = lab_left * (1 - t[:, np.newaxis]) + lab_right * t[:, np.newaxis]
+
+    return np.clip(color.lab2rgb(result_lab.reshape(H, W, 3)), 0, 1)
 
 
 # ---------------------------------------------------------------------------
