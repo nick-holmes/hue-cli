@@ -17,7 +17,6 @@ from .color_science import (
     compute_flat_layer_counts,
     compute_exploded_layer_counts,
     auto_contrast_preview,
-    apply_preview_face_colors,
     apply_contrast_enhancement,
     apply_unsharp_mask,
     allocate_layers_td_proportional,
@@ -25,22 +24,21 @@ from .color_science import (
     render_standard_preview,
 )
 from .mesh import (
-    generate_topographical_stl,
+    generate_preview_surface,
     greedy_mesh_rects,
     build_box_mesh,
-    generate_flat_layer_stl,
 )
 
 logger = logging.getLogger(__name__)
 
 
 def generate_preview_scene(config, processed_image, selected_filaments,
-                           max_pixels=500000):
+                           max_total_faces=1_000_000):
     """Generate a trimesh.Scene with colored meshes for interactive 3D preview.
 
     Mirrors the heightmap pipeline from generate_all() and returns a Scene
-    instead of exporting STLs. Downsamples to max_pixels for browser-renderable
-    mesh size while preserving good detail.
+    instead of exporting STLs. Downsamples to fit within max_total_faces for
+    browser-renderable mesh size while preserving good detail.
 
     Args:
         config: needs mode flags (use_flat, use_flat_cap, use_exploded, use_exploded_multi,
@@ -49,7 +47,7 @@ def generate_preview_scene(config, processed_image, selected_filaments,
                 dither_mode, contrast_strength
         processed_image: needs image_rgb, grayscale, alpha_mask, width_px, height_px
         selected_filaments: DataFrame
-        max_pixels: target pixel count for downsampling (default 500K)
+        max_total_faces: target face budget across all meshes (default 1M)
 
     Returns:
         (trimesh.Scene, sorted_filaments_df)
@@ -60,34 +58,49 @@ def generate_preview_scene(config, processed_image, selected_filaments,
         return _generate_exploded_preview_scene(config, processed_image,
                                                  selected_filaments)
 
-    from math import sqrt
+    from math import sqrt, ceil
+    from PIL import Image as PILImage
+    from trimesh.visual.material import PBRMaterial
+    from trimesh.visual import TextureVisuals
 
     H, W = processed_image.grayscale.shape
     width_mm = config.width_mm
+    num_colors = len(selected_filaments)
 
-    # Downsample for browser rendering
-    ds = max(1, int(sqrt(H * W / max_pixels)))
-    ds_grayscale = processed_image.grayscale[::ds, ::ds]
-    ds_alpha = processed_image.alpha_mask[::ds, ::ds]
-    ds_image_rgb = (processed_image.image_rgb[::ds, ::ds]
-                    if processed_image.image_rgb is not None else None)
-    ds_H, ds_W = ds_grayscale.shape
-    ds_pixel_size = width_mm / ds_W
+    # Two resolutions: high-res texture for colors, low-res mesh for geometry.
+    # Texture: up to 500K pixels (independent of color count).
+    # Geometry: face-budget / (2 * num_colors) pixels.
+    max_tex_pixels = 500_000
+    max_geo_pixels = max_total_faces // (2 * num_colors)
+    ds_tex = max(1, ceil(sqrt(H * W / max_tex_pixels)))
+    ds_geo = max(1, ceil(sqrt(H * W / max_geo_pixels)))
 
-    logger.info(f"3D preview: {H}x{W} -> {ds_H}x{ds_W} (ds={ds}), "
-                 f"pixel_size={ds_pixel_size:.3f}mm")
+    # Ensure texture is at least as detailed as geometry
+    ds_tex = min(ds_tex, ds_geo)
 
     sorted_filaments = sort_filaments_by_luminosity(selected_filaments)
-
-    alpha_pixels = ds_alpha >= 0.5
-    scene = trimesh.Scene()
 
     layer_height = config.layer_height
     num_layers = config.num_layers
     model_height = config.model_height
 
     if config.use_flat or config.use_flat_cap:
-        # Flat modes: one mesh per color, cumulative stacking
+        # Flat modes: vertex colors at geometry resolution (discrete colors,
+        # texture doesn't help since each pixel is a solid filament color)
+        ds = ds_geo
+        ds_grayscale = processed_image.grayscale[::ds, ::ds]
+        ds_alpha = processed_image.alpha_mask[::ds, ::ds]
+        ds_image_rgb = (processed_image.image_rgb[::ds, ::ds]
+                        if processed_image.image_rgb is not None else None)
+        ds_H, ds_W = ds_grayscale.shape
+        ds_pixel_size = width_mm / ds_W
+
+        logger.info(f"3D preview: {H}x{W} -> {ds_H}x{ds_W} (ds={ds}), "
+                     f"pixel_size={ds_pixel_size:.3f}mm")
+
+        alpha_pixels = ds_alpha >= 0.5
+        scene = trimesh.Scene()
+
         if config.use_flat_cap:
             transparent_filament = sorted_filaments.iloc[-1]
             color_filaments = sorted_filaments.iloc[:-1].reset_index(drop=True)
@@ -103,16 +116,9 @@ def generate_preview_scene(config, processed_image, selected_filaments,
             color_filaments, color_total_layers, ds_image_rgb, alpha_pixels,
             layer_height)
 
-        # Front-lit preview: show topmost color filament at each pixel.
-        # Layers are stacked dark-to-light, so the highest present color
-        # filament is the visible surface color. Transparent cap (flat-cap)
-        # is ignored since you see through it to the color layers below.
         filament_rgbs = np.array([f['rgb'] for _, f in color_filaments.iterrows()])
+        combined_preview = np.ones((ds_H, ds_W, 3)) * 0.95
 
-        combined_preview = np.ones((ds_H, ds_W, 3)) * 0.95  # default near-white
-
-        # Iterate dark-to-light; each present filament overwrites the preview.
-        # The last (lightest) present filament at each pixel wins.
         for k in range(len(color_filaments)):
             present = pixel_counts[:, :, k] > 0
             if present.any():
@@ -120,7 +126,6 @@ def generate_preview_scene(config, processed_image, selected_filaments,
 
         combined_preview = auto_contrast_preview(combined_preview, alpha_pixels)
 
-        # Build one mesh per color with cumulative z stacking
         z_cursor = np.zeros((ds_H, ds_W))
 
         for k in range(len(color_filaments)):
@@ -130,12 +135,9 @@ def generate_preview_scene(config, processed_image, selected_filaments,
             pixel_mask = pixel_counts[:, :, k] > 0
 
             if pixel_mask.any():
-                mesh = generate_topographical_stl(
-                    z_bottom_k, z_top_k, pixel_mask, ds_pixel_size,
-                    layer_height, preview=True)
+                mesh = generate_preview_surface(
+                    z_top_k, pixel_mask, ds_pixel_size, combined_preview)
                 if len(mesh.vertices) > 0:
-                    apply_preview_face_colors(
-                        mesh, combined_preview, ds_W, ds_H, ds_pixel_size)
                     name = filament['name'].replace(' ', '_')
                     hex_color = '%02x%02x%02x' % tuple(
                         (np.array(filament['rgb']) * 255).astype(int))
@@ -145,10 +147,12 @@ def generate_preview_scene(config, processed_image, selected_filaments,
             z_cursor = z_top_k
 
     else:
-        # Standard mode: heightmap + TD-proportional z-bands
-        enhanced_grayscale = apply_contrast_enhancement(
-            ds_grayscale.copy(), ds_alpha, config.contrast_strength)
-        enhanced_grayscale = apply_unsharp_mask(enhanced_grayscale, ds_alpha)
+        # Standard mode: texture-mapped preview.
+        # Compute preview image at texture resolution (high-res colors).
+        tex_gray = processed_image.grayscale[::ds_tex, ::ds_tex]
+        tex_alpha = processed_image.alpha_mask[::ds_tex, ::ds_tex]
+        tex_H, tex_W = tex_gray.shape
+        tex_alpha_pixels = tex_alpha >= 0.5
 
         num_colors = len(sorted_filaments)
         filament_tds = np.array([f['transmission_distance']
@@ -156,37 +160,83 @@ def generate_preview_scene(config, processed_image, selected_filaments,
         layer_counts_arr, layer_boundaries, z_boundaries = allocate_layers_td_proportional(
             filament_tds, num_layers, layer_height)
 
-        pixel_height = compute_heightmap(
-            enhanced_grayscale, alpha_pixels, model_height, layer_height,
+        tex_enhanced = apply_contrast_enhancement(
+            tex_gray.copy(), tex_alpha, config.contrast_strength)
+        tex_enhanced = apply_unsharp_mask(tex_enhanced, tex_alpha)
+        tex_pixel_height = compute_heightmap(
+            tex_enhanced, tex_alpha_pixels, model_height, layer_height,
             min_height=float(z_boundaries[1]))
 
-        # Beer-Lambert preview via heightmap + z-bands
         combined_preview = auto_contrast_preview(
-            render_standard_preview(pixel_height, z_boundaries, sorted_filaments),
-            alpha_pixels)
+            render_standard_preview(tex_pixel_height, z_boundaries, sorted_filaments),
+            tex_alpha_pixels)
 
-        # Build one mesh per color band
+        # Create shared texture material from the high-res preview
+        texture_img = PILImage.fromarray(
+            (np.clip(combined_preview, 0, 1) * 255).astype(np.uint8))
+        material = PBRMaterial(
+            baseColorTexture=texture_img,
+            metallicFactor=0.0, roughnessFactor=1.0)
+
+        logger.info(f"3D preview texture: {tex_W}x{tex_H} (ds_tex={ds_tex})")
+
+        # Build filament color map at texture resolution — each pixel gets
+        # the filament RGB of the topmost band that owns it.  Used by the
+        # JS filament-mode toggle for smooth band boundaries when stacked.
+        # (Completely separate from realistic rendering.)
+        filament_rgbs = np.array(
+            [f['rgb'] for _, f in sorted_filaments.iterrows()])
+        fil_map = np.full((tex_H, tex_W, 3), 0.1)
+        for k in range(num_colors):
+            z_lo = z_boundaries[k]
+            mask = (tex_pixel_height > z_lo + layer_height * 0.5) & tex_alpha_pixels
+            fil_map[mask] = filament_rgbs[k]
+        scene_fil_map = PILImage.fromarray(
+            (np.clip(fil_map, 0, 1) * 255).astype(np.uint8))
+
+        # Compute geometry at lower resolution
+        geo_gray = processed_image.grayscale[::ds_geo, ::ds_geo]
+        geo_alpha = processed_image.alpha_mask[::ds_geo, ::ds_geo]
+        geo_H, geo_W = geo_gray.shape
+        geo_pixel_size = width_mm / geo_W
+        geo_alpha_pixels = geo_alpha >= 0.5
+
+        geo_enhanced = apply_contrast_enhancement(
+            geo_gray.copy(), geo_alpha, config.contrast_strength)
+        geo_enhanced = apply_unsharp_mask(geo_enhanced, geo_alpha)
+        geo_pixel_height = compute_heightmap(
+            geo_enhanced, geo_alpha_pixels, model_height, layer_height,
+            min_height=float(z_boundaries[1]))
+
+        logger.info(f"3D preview mesh: {geo_W}x{geo_H} (ds_geo={ds_geo}), "
+                     f"pixel_size={geo_pixel_size:.3f}mm")
+
+        scene = trimesh.Scene()
+
+        # Build one mesh per color band with UV-mapped texture
         for k in range(num_colors):
             filament = sorted_filaments.iloc[k]
             z_lo = z_boundaries[k]
             z_hi = z_boundaries[k + 1]
 
-            band_bottom = np.full((ds_H, ds_W), z_lo)
-            band_top = np.clip(pixel_height, z_lo, z_hi)
-            pixel_mask = (pixel_height > z_lo + layer_height * 0.5) & alpha_pixels
+            band_top = np.clip(geo_pixel_height, z_lo, z_hi)
+            pixel_mask = (geo_pixel_height > z_lo + layer_height * 0.5) & geo_alpha_pixels
 
             if pixel_mask.any():
-                mesh = generate_topographical_stl(
-                    band_bottom, band_top, pixel_mask, ds_pixel_size,
-                    layer_height, preview=True)
+                mesh = generate_preview_surface(
+                    band_top, pixel_mask, geo_pixel_size)  # UV mode
                 if len(mesh.vertices) > 0:
-                    apply_preview_face_colors(
-                        mesh, combined_preview, ds_W, ds_H, ds_pixel_size)
+                    mesh.visual = TextureVisuals(
+                        uv=mesh.visual.uv, material=material)
                     name = filament['name'].replace(' ', '_')
                     hex_color = '%02x%02x%02x' % tuple(
                         (np.array(filament['rgb']) * 255).astype(int))
                     scene.add_geometry(
                         mesh, geom_name=f"S{k+1:02d}_{name}_C{hex_color}")
+
+        # Attach filament color map to scene metadata (not exported in GLB,
+        # only used by show_3d_preview to build the HTML viewer).
+        scene.metadata['filament_color_map'] = scene_fil_map
 
     logger.info(f"3D preview scene: {len(scene.geometry)} meshes")
     return scene, sorted_filaments
@@ -478,11 +528,23 @@ def show_3d_preview(config, processed_image, selected_filaments):
         })
     filament_info_json = json.dumps(filament_info)
 
+    # Extract filament color map (standard mode only) — passed separately
+    # from the GLB so filament rendering is fully decoupled from realistic.
+    filament_texture_b64 = None
+    fil_map = scene.metadata.get('filament_color_map')
+    if fil_map is not None:
+        import io
+        buf = io.BytesIO()
+        fil_map.save(buf, format='PNG')
+        filament_texture_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+        logger.info(f"Filament color map: {len(buf.getvalue())/1024:.0f} KB PNG")
+
     is_exploded = (config.use_exploded or config.use_exploded_multi
                    or config.use_exploded_cmyk)
     html = _build_viewer_html(b64, use_transparency=is_exploded, use_slider=True,
                                default_gap=2.0 if is_exploded else 0.0,
-                               filament_info_json=filament_info_json)
+                               filament_info_json=filament_info_json,
+                               filament_texture_b64=filament_texture_b64)
 
     with tempfile.NamedTemporaryFile('w', suffix='.html', delete=False) as f:
         f.write(html)
@@ -493,7 +555,8 @@ def show_3d_preview(config, processed_image, selected_filaments):
 
 
 def _build_viewer_html(b64_glb, use_transparency=False, use_slider=False,
-                        default_gap=2.0, filament_info_json='[]'):
+                        default_gap=2.0, filament_info_json='[]',
+                        filament_texture_b64=None):
     """Build a self-contained HTML page with an embedded Three.js GLB viewer.
 
     Uses CDN-loaded Three.js with GLTFLoader.parse() to decode the base64
@@ -505,6 +568,9 @@ def _build_viewer_html(b64_glb, use_transparency=False, use_slider=False,
         use_slider: if True, show layer gap slider and parse S## mesh names
         default_gap: initial gap value for the slider (0.0 for standard/flat)
         filament_info_json: JSON string of filament metadata for sidebar
+        filament_texture_b64: base64-encoded PNG of filament color map (standard
+            mode only). Loaded separately from the GLB — filament-mode rendering
+            is fully decoupled from realistic-mode rendering.
 
     Returns:
         Complete HTML string
@@ -695,7 +761,7 @@ const useTransparency = {'true' if use_transparency else 'false'};
 const useSlider = {'true' if use_slider else 'false'};
 
 // Track meshes for slider + color toggle
-const layerMeshes = [];  // {{mesh, idx, filamentColor, realisticColors}}
+const layerMeshes = [];  // {{mesh, idx, filamentColor, ...}}
 let showFilamentColors = false;
 let gapBeforeFilamentMode = null;  // stored gap when entering filament mode
 
@@ -703,6 +769,8 @@ loader.parse(buf.buffer, '', (gltf) => {{
   gltf.scene.traverse((child) => {{
     if (child.isMesh) {{
       const colorAttr = child.geometry.attributes.color;
+      const origMaterial = child.material;
+      const hasTexture = origMaterial && origMaterial.map;
       const hasAlpha = useTransparency && colorAttr && colorAttr.itemSize === 4;
 
       let opacity = 1.0;
@@ -716,16 +784,28 @@ loader.parse(buf.buffer, '', (gltf) => {{
       const idxMatch = child.name.match(/^S(\\d+)/);
       if (idxMatch) layerIdx = parseInt(idxMatch[1], 10);
 
-      child.material = new THREE.MeshBasicMaterial({{
-        vertexColors: true,
-        transparent: hasAlpha,
-        opacity: opacity,
-        depthWrite: !hasAlpha,
-        side: hasAlpha ? THREE.DoubleSide : THREE.FrontSide,
-        polygonOffset: true,
-        polygonOffsetFactor: -layerIdx,
-        polygonOffsetUnits: -layerIdx,
-      }});
+      if (hasTexture) {{
+        // Textured mesh (standard mode): use MeshBasicMaterial with texture
+        child.material = new THREE.MeshBasicMaterial({{
+          map: origMaterial.map,
+          side: THREE.FrontSide,
+          polygonOffset: true,
+          polygonOffsetFactor: -layerIdx,
+          polygonOffsetUnits: -layerIdx,
+        }});
+      }} else {{
+        // Vertex-colored mesh (flat/exploded modes)
+        child.material = new THREE.MeshBasicMaterial({{
+          vertexColors: true,
+          transparent: hasAlpha,
+          opacity: opacity,
+          depthWrite: !hasAlpha,
+          side: hasAlpha ? THREE.DoubleSide : THREE.FrontSide,
+          polygonOffset: true,
+          polygonOffsetFactor: -layerIdx,
+          polygonOffsetUnits: -layerIdx,
+        }});
+      }}
       child.renderOrder = layerIdx;
 
       // Parse mesh name: "S01_Name_Crrggbb" or "S01_Name_L1"
@@ -733,20 +813,27 @@ loader.parse(buf.buffer, '', (gltf) => {{
         const m = idxMatch;
         if (m) {{
           const entry = {{ mesh: child, idx: parseInt(m[1], 10) - 1,
-                          filamentColor: null, realisticColors: null }};
+                          filamentColor: null, filamentColorF: null,
+                          realisticColors: null, realisticMaterial: null,
+                          filamentSolidMat: null, filamentMapMat: null,
+                          isTextured: hasTexture }};
 
           // Extract filament hex color from name (e.g. "_Cff6f4f")
           const cm = child.name.match(/_C([0-9a-f]{{6}})$/i);
-          if (cm && colorAttr) {{
+          if (cm) {{
             const hex = cm[1];
             const ri = parseInt(hex.slice(0,2), 16);
             const gi = parseInt(hex.slice(2,4), 16);
             const bi = parseInt(hex.slice(4,6), 16);
-            // Store both int (0-255) and float (0-1) for different array types
             entry.filamentColor = [ri, gi, bi];
             entry.filamentColorF = [ri / 255, gi / 255, bi / 255];
+          }}
 
-            // Save realistic (Beer-Lambert) vertex colors
+          if (hasTexture) {{
+            // Save textured material for realistic/filament toggle
+            entry.realisticMaterial = child.material;
+          }} else if (cm && colorAttr) {{
+            // Save vertex colors for realistic/filament toggle
             const arr = colorAttr.array;
             entry.realisticColors = new Float32Array(arr.length);
             entry.realisticColors.set(arr);
@@ -758,6 +845,51 @@ loader.parse(buf.buffer, '', (gltf) => {{
     }}
   }});
   scene.add(gltf.scene);
+
+  // Build filament-mode materials (fully separate from GLB realistic textures).
+  // Two variants per band:
+  //   filamentSolidMat — solid band color (used when layers are separated)
+  //   filamentMapMat  — combined color-map texture (used when layers are stacked,
+  //                     gives texture-resolution band boundaries)
+  for (const entry of layerMeshes) {{
+    if (entry.isTextured && entry.filamentColorF) {{
+      const [r, g, b] = entry.filamentColorF;
+      const rm = entry.realisticMaterial;
+      entry.filamentSolidMat = new THREE.MeshBasicMaterial({{
+        color: new THREE.Color(r, g, b),
+        side: THREE.FrontSide,
+        polygonOffset: rm.polygonOffset,
+        polygonOffsetFactor: rm.polygonOffsetFactor,
+        polygonOffsetUnits: rm.polygonOffsetUnits,
+      }});
+    }}
+  }}
+  // Load filament color map texture (standard mode only).
+  const filTexB64 = {f"'{filament_texture_b64}'" if filament_texture_b64 else 'null'};
+  if (filTexB64) {{
+    const img = new Image();
+    img.onload = () => {{
+      const tex = new THREE.Texture(img);
+      tex.flipY = false;  // match GLB UV convention
+      tex.colorSpace = THREE.SRGBColorSpace;
+      tex.needsUpdate = true;
+      for (const entry of layerMeshes) {{
+        if (entry.isTextured && entry.realisticMaterial) {{
+          const rm = entry.realisticMaterial;
+          entry.filamentMapMat = new THREE.MeshBasicMaterial({{
+            map: tex,
+            side: THREE.FrontSide,
+            polygonOffset: rm.polygonOffset,
+            polygonOffsetFactor: rm.polygonOffsetFactor,
+            polygonOffsetUnits: rm.polygonOffsetUnits,
+          }});
+          // If already in filament mode with gap ≈ 0, apply immediately
+          if (showFilamentColors) applyColorMode();
+        }}
+      }}
+    }};
+    img.src = 'data:image/png;base64,' + filTexB64;
+  }}
 
   // Apply initial gap from slider
   updateGap();
@@ -794,6 +926,9 @@ function updateGap() {{
   for (const entry of layerMeshes) {{
     entry.mesh.position.z = entry.idx * gap;
   }}
+  // Re-apply filament materials when gap changes (switches between
+  // color-map texture for stacked view and solid color for separated).
+  if (showFilamentColors) applyColorMode();
 }}
 
 // Color toggle: switch between realistic (Beer-Lambert) and solid filament colors
@@ -806,27 +941,48 @@ function applyColorMode() {{
   }}
 
   for (const entry of layerMeshes) {{
-    if (!entry.filamentColor || !entry.realisticColors) continue;
-    const colorAttr = entry.mesh.geometry.attributes.color;
-    if (!colorAttr) continue;
-    const arr = colorAttr.array;
-    const itemSize = colorAttr.itemSize;
-    const count = colorAttr.count;
+    if (!entry.filamentColorF) continue;
 
-    if (showFilamentColors) {{
-      // Use int (0-255) for Uint8/Uint16 arrays, float (0-1) for Float arrays
-      const useInt = arr instanceof Uint8Array || arr instanceof Uint16Array
-                     || arr instanceof Uint8ClampedArray;
-      const [r, g, b] = useInt ? entry.filamentColor : entry.filamentColorF;
-      for (let i = 0; i < count; i++) {{
-        arr[i * itemSize] = r;
-        arr[i * itemSize + 1] = g;
-        arr[i * itemSize + 2] = b;
+    if (entry.isTextured) {{
+      // Textured mesh: swap between realistic texture and filament materials.
+      // Filament materials are built independently from the GLB — changes here
+      // cannot affect realistic rendering.
+      if (showFilamentColors) {{
+        // Use color-map texture when stacked (smooth boundaries at texture
+        // resolution), solid color when separated (correct per-band identity).
+        const slider = document.getElementById('gap-slider');
+        const gap = slider ? parseFloat(slider.value) : 0;
+        if (gap < 0.1 && entry.filamentMapMat) {{
+          entry.mesh.material = entry.filamentMapMat;
+        }} else if (entry.filamentSolidMat) {{
+          entry.mesh.material = entry.filamentSolidMat;
+        }}
+      }} else if (entry.realisticMaterial) {{
+        entry.mesh.material = entry.realisticMaterial;
       }}
     }} else {{
-      arr.set(entry.realisticColors);
+      // Vertex-colored mesh: swap color arrays
+      if (!entry.realisticColors) continue;
+      const colorAttr = entry.mesh.geometry.attributes.color;
+      if (!colorAttr) continue;
+      const arr = colorAttr.array;
+      const itemSize = colorAttr.itemSize;
+      const count = colorAttr.count;
+
+      if (showFilamentColors) {{
+        const useInt = arr instanceof Uint8Array || arr instanceof Uint16Array
+                       || arr instanceof Uint8ClampedArray;
+        const [r, g, b] = useInt ? entry.filamentColor : entry.filamentColorF;
+        for (let i = 0; i < count; i++) {{
+          arr[i * itemSize] = r;
+          arr[i * itemSize + 1] = g;
+          arr[i * itemSize + 2] = b;
+        }}
+      }} else {{
+        arr.set(entry.realisticColors);
+      }}
+      colorAttr.needsUpdate = true;
     }}
-    colorAttr.needsUpdate = true;
   }}
 }}
 

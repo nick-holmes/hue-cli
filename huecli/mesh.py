@@ -102,6 +102,101 @@ def build_box_mesh(rects, z_bottom_val, z_top_val, pixel_size):
     return vertices, faces
 
 
+def generate_preview_surface(z_top, pixel_mask, pixel_size, preview_rgb=None):
+    """Generate top-surface-only mesh for fast preview.
+
+    Only creates the visible top surface (2 triangles per pixel) with shared
+    grid-corner vertices.
+
+    Two modes:
+    - preview_rgb provided: bakes vertex colors (for flat/exploded modes)
+    - preview_rgb=None: sets UV coordinates for texture mapping (standard mode)
+
+    Args:
+        z_top: 2D array of top z-heights (mm)
+        pixel_mask: 2D boolean array of active pixels
+        pixel_size: pixel size in mm
+        preview_rgb: HxWx3 RGB preview image (0-1 range), or None for UV mode
+
+    Returns:
+        trimesh.Trimesh with vertex colors or UV coordinates
+    """
+    if not pixel_mask.any():
+        return trimesh.Trimesh()
+
+    H, W = pixel_mask.shape
+    ps = pixel_size
+    mask_f = pixel_mask.astype(np.float64)
+
+    # Average z_top at grid corners from adjacent active pixels
+    count = np.zeros((H + 1, W + 1))
+    zt_sum = np.zeros((H + 1, W + 1))
+    for dy in range(2):
+        for dx in range(2):
+            count[dy:H + dy, dx:W + dx] += mask_f
+            zt_sum[dy:H + dy, dx:W + dx] += z_top * mask_f
+
+    corner_active = count > 0
+    zt_avg = np.divide(zt_sum, count, where=corner_active,
+                        out=np.zeros_like(zt_sum))
+
+    n_active = int(corner_active.sum())
+    if n_active == 0:
+        return trimesh.Trimesh()
+
+    vertex_idx = np.full((H + 1, W + 1), -1, dtype=np.int64)
+    active_cy, active_cx = np.where(corner_active)
+    vertex_idx[active_cy, active_cx] = np.arange(n_active)
+
+    # Top surface vertices only (no bottom vertices)
+    vertices = np.column_stack([
+        active_cx * ps, active_cy * ps,
+        zt_avg[active_cy, active_cx]
+    ])
+
+    # Top surface faces only (2 triangles per active pixel, no bottom/sides)
+    py, px = np.where(pixel_mask)
+    v00 = vertex_idx[py, px]
+    v01 = vertex_idx[py, px + 1]
+    v10 = vertex_idx[py + 1, px]
+    v11 = vertex_idx[py + 1, px + 1]
+
+    faces = np.vstack([
+        np.column_stack([v00, v01, v10]),
+        np.column_stack([v01, v11, v10]),
+    ])
+
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+    if preview_rgb is not None:
+        # Vertex colors: average preview_rgb at corners from adjacent active pixels
+        rgb_weighted = preview_rgb * mask_f[:, :, np.newaxis]
+        color_sum = np.zeros((H + 1, W + 1, 3))
+        for dy in range(2):
+            for dx in range(2):
+                color_sum[dy:H + dy, dx:W + dx] += rgb_weighted
+
+        count_3d = count[:, :, np.newaxis]
+        corner_active_3d = corner_active[:, :, np.newaxis]
+        color_avg = np.divide(color_sum, count_3d, where=corner_active_3d,
+                               out=np.zeros_like(color_sum))
+
+        vertex_rgb = color_avg[active_cy, active_cx]
+        vertex_colors = np.zeros((n_active, 4), dtype=np.uint8)
+        vertex_colors[:, :3] = (np.clip(vertex_rgb, 0, 1) * 255).astype(np.uint8)
+        vertex_colors[:, 3] = 255
+        mesh.visual.vertex_colors = vertex_colors
+    else:
+        # UV coordinates for texture mapping: map grid corners to [0,1] range
+        uv = np.column_stack([active_cx / W, 1.0 - active_cy / H])
+        mesh.visual = trimesh.visual.TextureVisuals(uv=uv)
+
+    logger.info(f"  Preview surface: {pixel_mask.sum():,} pixels -> "
+                 f"{n_active} vertices, {len(faces):,} faces")
+
+    return mesh
+
+
 def generate_topographical_stl(z_bottom, z_top, pixel_mask, pixel_size,
                                 layer_height, preview=False):
     """Generate topographical STL using shared-vertex grid.

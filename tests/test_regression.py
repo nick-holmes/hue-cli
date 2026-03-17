@@ -93,15 +93,31 @@ def extract_metrics(scene, sorted_filaments):
             'faces': len(geom.faces),
         }
 
-        if hasattr(geom.visual, 'face_colors') and geom.visual.face_colors is not None:
+        # Extract colors from vertex colors, face colors, or texture
+        rgb = None
+        if hasattr(geom.visual, 'kind') and geom.visual.kind == 'texture':
+            # Textured mesh: sample colors from the texture image
+            mat = geom.visual.material
+            tex = getattr(mat, 'baseColorTexture', None) or getattr(mat, 'image', None)
+            if tex is not None:
+                tex_arr = np.array(tex)[:, :, :3].astype(float)
+                # Sample a grid of pixels from the texture
+                rgb = tex_arr.reshape(-1, 3)
+        elif hasattr(geom.visual, 'vertex_colors') and geom.visual.vertex_colors is not None:
+            vc = geom.visual.vertex_colors
+            if len(vc) > 0:
+                rgb = vc[:, :3].astype(float)
+        elif hasattr(geom.visual, 'face_colors') and geom.visual.face_colors is not None:
             fc = geom.visual.face_colors
             if len(fc) > 0:
                 rgb = fc[:, :3].astype(float)
-                mesh_info['color_mean'] = rgb.mean(axis=0).tolist()
-                mesh_info['color_std'] = rgb.std(axis=0).tolist()
-                all_r.extend(rgb[:, 0].tolist())
-                all_g.extend(rgb[:, 1].tolist())
-                all_b.extend(rgb[:, 2].tolist())
+
+        if rgb is not None and len(rgb) > 0:
+            mesh_info['color_mean'] = rgb.mean(axis=0).tolist()
+            mesh_info['color_std'] = rgb.std(axis=0).tolist()
+            all_r.extend(rgb[:, 0].tolist())
+            all_g.extend(rgb[:, 1].tolist())
+            all_b.extend(rgb[:, 2].tolist())
 
         metrics['total_vertices'] += mesh_info['vertices']
         metrics['total_faces'] += mesh_info['faces']
