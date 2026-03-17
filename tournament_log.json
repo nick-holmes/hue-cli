@@ -1,0 +1,74 @@
+{
+  "timestamp": "2026-03-17T14:46:03.747375",
+  "image": "examples/charizard.png.webp",
+  "base_config": {
+    "layer_height": 0.1,
+    "model_height": 2.4,
+    "width_mm": 171.0,
+    "height_mm": 240.0,
+    "color_count": 8,
+    "num_layers": 23,
+    "min_color_difference": 5.0,
+    "nozzle_diameter": 0.2
+  },
+  "rounds": [
+    {
+      "round": 1,
+      "type": "filaments",
+      "winner": 1,
+      "winner_params": {
+        "filaments": [
+          "Translucent Purple",
+          "Light Brown",
+          "Translucent Orange",
+          "Peanut",
+          "Light Orange",
+          "Translucent Yellow",
+          "Matte Yellow",
+          "Pastel Yellow"
+        ],
+        "filament_tds": [
+          25.5,
+          2.7,
+          98.6,
+          1.8,
+          4.3,
+          100.0,
+          9.1,
+          4.1
+        ]
+      }
+    },
+    {
+      "round": 2,
+      "type": "contrast",
+      "winner": 3,
+      "winner_params": {
+        "contrast_strength": 3.0,
+        "unsharp_strength": 1.5,
+        "unsharp_radius": 1.5
+      }
+    },
+    {
+      "round": 3,
+      "type": "sharpness",
+      "winner": 4,
+      "winner_params": {
+        "contrast_strength": 3.0,
+        "unsharp_strength": 4.0,
+        "unsharp_radius": 0.7
+      }
+    },
+    {
+      "round": 4,
+      "type": "finetune",
+      "winner": 2,
+      "winner_params": {
+        "contrast_strength": 3.4499999999999997,
+        "unsharp_strength": 4.8,
+        "unsharp_radius": 0.63
+      }
+    }
+  ],
+  "cli_command": "python3 -m huecli examples/charizard.png.webp -f data/filaments.csv --use-filaments \"Translucent Purple,Light Brown,Translucent Orange,Peanut,Light Orange,Translucent Yellow,Matte Yellow,Pastel Yellow\" -c 8 -n 0.2 -l 0.1 -m 2.4 -s 171x240"
+}

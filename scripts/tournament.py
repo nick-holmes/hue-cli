@@ -279,7 +279,10 @@ def run_contrast_round(img_processor, base_config, sorted_filaments, n_candidate
         preview = render_beer_lambert_image(
             img_processor.image, img_processor.alpha_mask, sorted_filaments,
             base_config['layer_height'], base_config['model_height'],
-            base_config['num_layers'])
+            base_config['num_layers'],
+            contrast_strength=cs,
+            unsharp_strength=unsharp_strength,
+            unsharp_radius=unsharp_radius)
 
         elapsed = time.time() - t0
         label = f"{chr(65+i)} — Contrast {cs:.1f}"
@@ -316,7 +319,10 @@ def run_sharpness_round(img_processor, base_config, sorted_filaments,
         preview = render_beer_lambert_image(
             img_processor.image, img_processor.alpha_mask, sorted_filaments,
             base_config['layer_height'], base_config['model_height'],
-            base_config['num_layers'])
+            base_config['num_layers'],
+            contrast_strength=contrast_strength,
+            unsharp_strength=us,
+            unsharp_radius=ur)
 
         elapsed = time.time() - t0
         label = f"{chr(65+i)} — {name} ({us:.1f}/{ur:.1f})"
@@ -358,7 +364,10 @@ def run_finetune_round(img_processor, base_config, sorted_filaments,
         preview = render_beer_lambert_image(
             img_processor.image, img_processor.alpha_mask, sorted_filaments,
             base_config['layer_height'], base_config['model_height'],
-            base_config['num_layers'])
+            base_config['num_layers'],
+            contrast_strength=cs,
+            unsharp_strength=us,
+            unsharp_radius=ur)
 
         elapsed = time.time() - t0
         label = f"{chr(65+i)} — {name}"
@@ -706,7 +715,7 @@ def main():
 
     # Build CLI command
     filaments_arg = ','.join(fil_names)
-    cli_cmd = (f"python3 huecli.py {args.image}"
+    cli_cmd = (f"python3 -m huecli {args.image}"
                f" -f {args.filaments}"
                f" --use-filaments \"{filaments_arg}\""
                f" -c {base_config['color_count']}"
