@@ -25,6 +25,7 @@ from .color_science import (
     render_standard_preview_layers,
     compute_contrast_params,
     apply_contrast_params,
+    apply_edge_inset,
 )
 from .mesh import (
     generate_preview_surface,
@@ -71,9 +72,11 @@ def generate_preview_scene(config, processed_image, selected_filaments,
     num_colors = len(selected_filaments)
 
     # Two resolutions: high-res texture for colors, low-res mesh for geometry.
-    # Texture: up to 500K pixels (independent of color count).
+    # Texture: up to 2M pixels (independent of color count). Textures are
+    # lightweight PNGs that don't affect render performance — only mesh
+    # face count matters for load time.
     # Geometry: face-budget / (2 * num_colors) pixels.
-    max_tex_pixels = 500_000
+    max_tex_pixels = 2_000_000
     max_geo_pixels = max_total_faces // (2 * num_colors)
     ds_tex = max(1, ceil(sqrt(H * W / max_tex_pixels)))
     ds_geo = max(1, ceil(sqrt(H * W / max_geo_pixels)))
@@ -169,6 +172,10 @@ def generate_preview_scene(config, processed_image, selected_filaments,
         tex_pixel_height = compute_heightmap(
             tex_enhanced, tex_alpha_pixels, model_height, layer_height,
             min_height=float(z_boundaries[1]))
+        if config.nozzle_diameter is not None:
+            tex_pixel_size = width_mm / tex_W
+            tex_pixel_height = apply_edge_inset(
+                tex_pixel_height, z_boundaries, config.nozzle_diameter, tex_pixel_size)
 
         # Render per-layer cumulative composites
         layer_rgbas = render_standard_preview_layers(
@@ -227,6 +234,9 @@ def generate_preview_scene(config, processed_image, selected_filaments,
         geo_pixel_height = compute_heightmap(
             geo_enhanced, geo_alpha_pixels, model_height, layer_height,
             min_height=float(z_boundaries[1]))
+        if config.nozzle_diameter is not None:
+            geo_pixel_height = apply_edge_inset(
+                geo_pixel_height, z_boundaries, config.nozzle_diameter, geo_pixel_size)
 
         logger.info(f"3D preview mesh: {geo_W}x{geo_H} (ds_geo={ds_geo}), "
                      f"pixel_size={geo_pixel_size:.3f}mm")

@@ -50,8 +50,6 @@ def parse_args():
     parser.add_argument('--dither', type=str, default=None,
                         choices=['none', 'floyd-steinberg', 'ordered'],
                         help='Dithering for flat/exploded modes (default: none)')
-    parser.add_argument('--enhance-detail', action='store_true', default=False,
-                        help='Extend darkest filament through edges for sharper detail (standard mode only)')
     parser.add_argument('--use-filaments', type=str, default=None,
                         help='Comma-separated filament names to use (bypasses selection)')
 

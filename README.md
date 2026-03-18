@@ -110,7 +110,6 @@ Fixed CMYK primaries (auto-selected from your library by delta-E). Each primary 
 | `--scheme` | Remap image to a colour scheme palette | none |
 | `--flip` | Flip image: `horizontal`, `vertical`, or `both` | none |
 | `--dither` | Dithering method for flat/exploded modes: `none`, `floyd-steinberg`, `ordered` | `none` |
-| `--enhance-detail` | Extend darkest filament through edges for sharper detail (standard mode only) | off |
 | `--use-filaments` | Comma-separated filament names to use (bypasses auto-selection and SA) | none |
 
 ### Exploded Mode Flags

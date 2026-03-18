@@ -297,6 +297,7 @@ def main():
             layer_height=layer_height,
             model_height=model_height,
             width_mm=width,
+            nozzle_diameter=nozzle_diameter,
             mode=mode,
             sandwich_layers=sandwich_layers,
             use_fill=use_fill,

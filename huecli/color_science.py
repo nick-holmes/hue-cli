@@ -211,6 +211,60 @@ def compute_heightmap(enhanced_grayscale, alpha_pixels, max_height, layer_height
     return pixel_height
 
 
+def apply_edge_inset(pixel_height, z_boundaries, nozzle_diameter, pixel_size):
+    """Pull back upper layer edges to prevent filament squish from filling fine detail.
+
+    For each layer boundary above the base, pixels at the edge of that layer's
+    presence mask have their height lowered to just below the boundary. The inset
+    grows cumulatively with each layer: layer k above base erodes by
+    k * 0.25 * nozzle_diameter (in mm), converted to pixels.
+
+    Args:
+        pixel_height: 2D array of per-pixel heights (mm), modified in place
+        z_boundaries: 1D array of color band z-boundaries (mm)
+        nozzle_diameter: nozzle diameter in mm
+        pixel_size: size of one pixel in mm
+
+    Returns:
+        Modified pixel_height array
+    """
+    from scipy.ndimage import binary_erosion
+
+    inset_mm_per_layer = 0.25 * nozzle_diameter
+    min_thickness = z_boundaries[1] - z_boundaries[0] if len(z_boundaries) > 1 else 0.1
+
+    for k in range(1, len(z_boundaries) - 1):
+        z_lo = z_boundaries[k]
+        inset_mm = k * inset_mm_per_layer
+        inset_px = inset_mm / pixel_size
+
+        if inset_px < 0.5:
+            continue
+
+        # Build circular structuring element sized to the inset
+        radius = int(np.ceil(inset_px))
+        size = 2 * radius + 1
+        y, x = np.ogrid[-radius:radius + 1, -radius:radius + 1]
+        struct = (x * x + y * y) <= inset_px * inset_px
+
+        # Pixels present in this layer
+        present = pixel_height > z_lo + min_thickness * 0.5
+        if not present.any():
+            continue
+
+        # Erode the presence mask
+        eroded = binary_erosion(present, structure=struct)
+
+        # Pixels that were present but got eroded — lower their height
+        edge_pixels = present & ~eroded
+        if edge_pixels.any():
+            # Set height to just below this boundary so upper layers don't cover them
+            pixel_height[edge_pixels] = np.minimum(
+                pixel_height[edge_pixels], z_lo - min_thickness * 0.1)
+
+    return pixel_height
+
+
 def apply_contrast_enhancement(brightness, alpha_mask, contrast_strength):
     """Apply adaptive S-curve contrast boost.
 

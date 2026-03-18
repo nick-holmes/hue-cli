@@ -14,6 +14,7 @@ from ..color_science import (
     apply_unsharp_mask,
     allocate_layers_td_proportional,
     compute_heightmap,
+    apply_edge_inset,
 )
 from ..mesh import generate_color_band_stls
 
@@ -47,6 +48,10 @@ def generate(output_base_path, config, processed_image, selected_filaments):
 
     pixel_height = compute_heightmap(enhanced_grayscale, alpha_pixels, config.model_height, config.layer_height,
                                      min_height=float(z_boundaries[1]))
+
+    if config.nozzle_diameter is not None:
+        pixel_height = apply_edge_inset(pixel_height, z_boundaries,
+                                         config.nozzle_diameter, pixel_size)
 
     return generate_color_band_stls(
         sorted_filaments, pixel_height, z_boundaries, layer_boundaries,
