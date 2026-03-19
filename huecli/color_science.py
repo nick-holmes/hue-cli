@@ -713,8 +713,9 @@ def render_standard_preview_layers(pixel_height, z_boundaries, sorted_filaments,
         thickness = np.clip(pixel_height, z_lo, z_hi) - z_lo
         thickness[~present] = 0.0
 
-        # Beer-Lambert opacity
-        opacity = np.where(present, 1.0 - np.exp(-thickness / filament_tds[k]), 0.0)
+        # Front-lit opacity: multiply thickness by 4x to account for
+        # double-pass (light in + out) and pigment scattering in real FDM layers
+        opacity = np.where(present, 1.0 - np.exp(-4.0 * thickness / filament_tds[k]), 0.0)
 
         # Alpha-over composite (premultiplied): over existing accumulation
         layer_rgb_lin = filament_rgbs_lin[k]  # (3,)

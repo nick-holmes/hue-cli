@@ -197,6 +197,19 @@ def generate_preview_scene(config, processed_image, selected_filaments,
             tex_rgba = np.zeros((tex_H, tex_W, 4), dtype=np.uint8)
             tex_rgba[:, :, :3] = (np.clip(rgb_k, 0, 1) * 255).astype(np.uint8)
             tex_rgba[band_present, 3] = 255
+            # Dilate alpha by 1px so side wall fragments at the boundary
+            # always sample opaque texels even with bilinear filtering.
+            # Dilated pixels copy RGB from nearest present neighbor.
+            from scipy.ndimage import binary_dilation, distance_transform_edt
+            dilated = binary_dilation(band_present, iterations=1)
+            fringe = dilated & ~band_present
+            if fringe.any():
+                _, nearest_idx = distance_transform_edt(~band_present,
+                                                         return_distances=True,
+                                                         return_indices=True)
+                tex_rgba[fringe, :3] = tex_rgba[nearest_idx[0][fringe],
+                                                 nearest_idx[1][fringe], :3]
+                tex_rgba[fringe, 3] = 255
             texture_img = PILImage.fromarray(tex_rgba, 'RGBA')
             materials.append(PBRMaterial(
                 baseColorTexture=texture_img,
@@ -858,12 +871,17 @@ loader.parse(buf.buffer, '', (gltf) => {{
       if (idxMatch) layerIdx = parseInt(idxMatch[1], 10);
 
       if (hasTexture) {{
-        // Textured mesh (standard mode): use MeshBasicMaterial with texture
+        // Textured mesh (standard mode): clamp texture to prevent wrap-around
+        // sampling at boundary UVs, and use DoubleSide for visible side walls
+        if (origMaterial.map) {{
+          origMaterial.map.wrapS = THREE.ClampToEdgeWrapping;
+          origMaterial.map.wrapT = THREE.ClampToEdgeWrapping;
+        }}
         child.material = new THREE.MeshBasicMaterial({{
           map: origMaterial.map,
           alphaTest: 0.5,
-          transparent: true,
-          side: THREE.FrontSide,
+          transparent: false,
+          side: THREE.DoubleSide,
           polygonOffset: true,
           polygonOffsetFactor: -layerIdx,
           polygonOffsetUnits: -layerIdx,

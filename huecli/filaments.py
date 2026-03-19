@@ -649,6 +649,7 @@ class FilamentLibrary:
         from scipy.spatial import cKDTree
         from .color_science import vectorized_beer_lambert
 
+        random.seed(42)
         iterations = 150
 
         is_flat = mode in ('flat', 'flat-cap')
@@ -717,8 +718,16 @@ class FilamentLibrary:
                 dists, _ = tree.query(target_lab, k=1)
                 return float(np.mean(dists[alpha_valid.ravel()]))
             else:
-                # Standard mode: simple nearest-filament delta-E
-                fil_lab = np.array([f['lab'] for _, f in filaments_df.iterrows()])
+                # Standard mode: score by Beer-Lambert rendered color at allocated thickness
+                layer_counts, _, _ = allocate_layers_td_proportional(
+                    filament_tds, num_layers, layer_height)
+                rendered_labs = []
+                for i, (_, f) in enumerate(filaments_df.iterrows()):
+                    thickness = layer_counts[i] * layer_height
+                    rendered_lab = compute_effective_color(
+                        f['rgb'], f['transmission_distance'], thickness)
+                    rendered_labs.append(rendered_lab)
+                fil_lab = np.array(rendered_labs)
                 tree = cKDTree(fil_lab)
                 target_lab = ds_lab.reshape(-1, 3)
                 dists, _ = tree.query(target_lab, k=1)

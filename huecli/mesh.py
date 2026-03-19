@@ -207,8 +207,8 @@ def generate_preview_surface(z_top, pixel_mask, pixel_size, preview_rgb=None,
             tl1 = vertex_idx[py[left] + 1, px[left]]
             bl0 = tl0 + n_active
             bl1 = tl1 + n_active
-            all_faces.append(np.column_stack([bl0, bl1, tl0]))
-            all_faces.append(np.column_stack([bl1, tl1, tl0]))
+            all_faces.append(np.column_stack([bl0, tl0, bl1]))
+            all_faces.append(np.column_stack([bl1, tl0, tl1]))
 
         right = get_boundary(0, 1)
         if right.any():
@@ -216,8 +216,8 @@ def generate_preview_surface(z_top, pixel_mask, pixel_size, preview_rgb=None,
             tr1 = vertex_idx[py[right] + 1, px[right] + 1]
             br0 = tr0 + n_active
             br1 = tr1 + n_active
-            all_faces.append(np.column_stack([br0, tr0, br1]))
-            all_faces.append(np.column_stack([br1, tr0, tr1]))
+            all_faces.append(np.column_stack([br0, br1, tr0]))
+            all_faces.append(np.column_stack([br1, tr1, tr0]))
 
         front = get_boundary(-1, 0)
         if front.any():
@@ -225,8 +225,8 @@ def generate_preview_surface(z_top, pixel_mask, pixel_size, preview_rgb=None,
             tf1 = vertex_idx[py[front], px[front] + 1]
             bf0 = tf0 + n_active
             bf1 = tf1 + n_active
-            all_faces.append(np.column_stack([bf0, tf0, bf1]))
-            all_faces.append(np.column_stack([bf1, tf0, tf1]))
+            all_faces.append(np.column_stack([bf0, bf1, tf0]))
+            all_faces.append(np.column_stack([bf1, tf1, tf0]))
 
         back = get_boundary(1, 0)
         if back.any():
@@ -234,8 +234,8 @@ def generate_preview_surface(z_top, pixel_mask, pixel_size, preview_rgb=None,
             tb1 = vertex_idx[py[back] + 1, px[back] + 1]
             bb0 = tb0 + n_active
             bb1 = tb1 + n_active
-            all_faces.append(np.column_stack([bb0, bb1, tb0]))
-            all_faces.append(np.column_stack([bb1, tb1, tb0]))
+            all_faces.append(np.column_stack([bb0, tb0, bb1]))
+            all_faces.append(np.column_stack([bb1, tb0, tb1]))
     else:
         vertices = top_verts
 
