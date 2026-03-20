@@ -180,6 +180,48 @@ def allocate_layers_td_proportional(filament_tds, total_layers, layer_height):
     return layer_counts, layer_boundaries, z_boundaries
 
 
+def allocate_layers_standard(filament_tds, total_layers, layer_height):
+    """Allocate near-uniform z-bands for standard mode.
+
+    Standard mode detail comes from the heightmap, not band thickness.
+    Equal z-bands give the most evenly-distributed color transitions.
+    Only physical constraint: base needs >= 2 layers for bed adhesion.
+
+    Args:
+        filament_tds: 1D array of transmission distances (dark-to-light order)
+        total_layers: Total number of layers to allocate
+        layer_height: Layer height in mm
+
+    Returns:
+        (layer_counts, layer_boundaries, z_boundaries)
+    """
+    n = len(filament_tds)
+    base_count = total_layers // n
+    layer_counts = np.full(n, base_count, dtype=int)
+
+    # Distribute remainder evenly from first color onward
+    remainder = total_layers - int(layer_counts.sum())
+    for i in range(remainder):
+        layer_counts[i % n] += 1
+
+    # Ensure base has at least 2 layers for bed adhesion
+    if layer_counts[0] < 2 and n > 1:
+        deficit = 2 - layer_counts[0]
+        layer_counts[0] = 2
+        # Steal from the last colors that have more than 1
+        for i in range(n - 1, 0, -1):
+            if deficit <= 0:
+                break
+            give = min(deficit, layer_counts[i] - 1)
+            if give > 0:
+                layer_counts[i] -= give
+                deficit -= give
+
+    layer_boundaries = np.concatenate([[0], np.cumsum(layer_counts)]).astype(int)
+    z_boundaries = layer_boundaries * layer_height
+    return layer_counts, layer_boundaries, z_boundaries
+
+
 # ---------------------------------------------------------------------------
 # Heightmap / contrast
 # ---------------------------------------------------------------------------

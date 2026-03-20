@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import logging
 from skimage import color
-from .color_science import compute_effective_color, allocate_layers_td_proportional
+from .color_science import compute_effective_color, allocate_layers_td_proportional, allocate_layers_standard
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +62,7 @@ class FilamentLibrary:
             hex_color = hex_color[:6]  # Ignore alpha for now
         return tuple(int(hex_color[i:i+2], 16) / 255.0 for i in (0, 2, 4))
 
-    def select_best_filaments(self, target_colors_lab, count, layer_height=0.08, min_color_difference=15.0, randomize=False, use_flat_cap=False, model_height=2.0, physics_aware=True):
+    def select_best_filaments(self, target_colors_lab, count, layer_height=0.08, min_color_difference=15.0, randomize=False, use_flat_cap=False, model_height=2.0, physics_aware=True, mode='standard'):
         """
         Select best matching filaments using Beer-Lambert physics-aware scoring.
 
@@ -164,7 +164,7 @@ class FilamentLibrary:
 
         # Phase 2: Refine selection using actual allocated thicknesses
         if physics_aware and len(result) > 1:
-            result = self._refine_selection(result, target_colors_lab, model_height, layer_height)
+            result = self._refine_selection(result, target_colors_lab, model_height, layer_height, mode=mode)
 
         return result
 
@@ -523,7 +523,7 @@ class FilamentLibrary:
         result_indices = selected_indices + [transparent_idx]
         return self.df.iloc[result_indices].reset_index(drop=True)
 
-    def _refine_selection(self, selected_df, target_colors_lab, model_height, layer_height):
+    def _refine_selection(self, selected_df, target_colors_lab, model_height, layer_height, mode='standard'):
         """Refine filament selection using actual allocated thicknesses.
 
         After greedy selection, runs layer allocation to get real Z-bands,
@@ -535,17 +535,19 @@ class FilamentLibrary:
             target_colors_lab: Array of target LAB colors
             model_height: Total model height in mm
             layer_height: Layer height in mm
+            mode: Generation mode string (uses standard allocation for 'standard')
 
         Returns:
             Refined DataFrame of filaments
         """
+        alloc_fn = allocate_layers_standard if mode == 'standard' else allocate_layers_td_proportional
         num_layers = int(model_height / layer_height)
         result = selected_df.copy()
 
         for pass_num in range(3):  # Max 3 passes
             improved = False
             filament_tds = np.array([f['transmission_distance'] for _, f in result.iterrows()])
-            layer_counts, _, z_boundaries = allocate_layers_td_proportional(
+            layer_counts, _, z_boundaries = alloc_fn(
                 filament_tds, num_layers, layer_height)
 
             # Compute effective colour at actual allocated thickness per slot
@@ -719,7 +721,7 @@ class FilamentLibrary:
                 return float(np.mean(dists[alpha_valid.ravel()]))
             else:
                 # Standard mode: score by Beer-Lambert rendered color at allocated thickness
-                layer_counts, _, _ = allocate_layers_td_proportional(
+                layer_counts, _, _ = allocate_layers_standard(
                     filament_tds, num_layers, layer_height)
                 rendered_labs = []
                 for i, (_, f) in enumerate(filaments_df.iterrows()):

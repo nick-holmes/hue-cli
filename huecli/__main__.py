@@ -249,6 +249,7 @@ def main():
                     min_color_difference=min_color_difference,
                     use_flat_cap=use_flat_cap,
                     model_height=model_height,
+                    mode=mode,
                 )
 
             logger.info("Selected filaments:")
@@ -265,7 +266,9 @@ def main():
         # 4c. Gamut coverage report (skip when filaments explicitly specified)
         if not args.use_filaments:
             from .color_science import compute_effective_color as _eff_color
-            from .color_science import allocate_layers_td_proportional as _alloc
+            from .color_science import allocate_layers_td_proportional as _alloc_td
+            from .color_science import allocate_layers_standard as _alloc_std
+            _alloc = _alloc_std if mode == 'standard' else _alloc_td
             sorted_tds = np.array([f['transmission_distance'] for _, f in selected_filaments.iterrows()])
             layer_counts_report, _, _ = _alloc(sorted_tds, num_layers, layer_height)
             logger.info("Gamut coverage report:")
@@ -344,7 +347,7 @@ def main():
                     selected_filaments = filament_lib.select_best_filaments(
                         dominant_colors_lab, color_count, layer_height=layer_height,
                         min_color_difference=min_color_difference, use_flat_cap=use_flat_cap,
-                        randomize=False, model_height=model_height,
+                        randomize=False, model_height=model_height, mode=mode,
                     )
                 logger.info("New filaments selected:")
                 for i, row in selected_filaments.iterrows():

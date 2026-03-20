@@ -12,7 +12,7 @@ from ..color_science import (
     sort_filaments_by_luminosity,
     apply_contrast_enhancement,
     apply_unsharp_mask,
-    allocate_layers_td_proportional,
+    allocate_layers_standard,
     compute_heightmap,
     apply_edge_inset,
 )
@@ -43,7 +43,7 @@ def generate(output_base_path, config, processed_image, selected_filaments):
     alpha_pixels = processed_image.alpha_mask >= 0.5
 
     filament_tds = np.array([f['transmission_distance'] for _, f in sorted_filaments.iterrows()])
-    layer_counts, layer_boundaries, z_boundaries = allocate_layers_td_proportional(
+    layer_counts, layer_boundaries, z_boundaries = allocate_layers_standard(
         filament_tds, num_layers, config.layer_height)
 
     pixel_height = compute_heightmap(enhanced_grayscale, alpha_pixels, config.model_height, config.layer_height,

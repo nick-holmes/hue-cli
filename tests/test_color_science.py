@@ -3,6 +3,7 @@ import pytest
 from huecli.color_science import (
     srgb_to_linear, linear_to_srgb, vectorized_beer_lambert,
     sort_filaments_by_luminosity, allocate_layers_td_proportional,
+    allocate_layers_standard,
     apply_contrast_enhancement, compute_heightmap, apply_unsharp_mask,
     compute_effective_color, compute_achievable_gamut_sample,
     compute_achievable_gamut,
@@ -89,6 +90,42 @@ class TestAllocateLayers:
     def test_boundaries_monotonic(self):
         tds = np.array([2.0, 5.0])
         _, boundaries, z_bounds = allocate_layers_td_proportional(tds, 20, 0.08)
+        assert all(boundaries[i] <= boundaries[i+1] for i in range(len(boundaries)-1))
+        assert all(z_bounds[i] <= z_bounds[i+1] for i in range(len(z_bounds)-1))
+
+
+class TestAllocateLayersStandard:
+    def test_sum_equals_total(self):
+        tds = np.array([1.0, 3.0, 8.0])
+        counts, boundaries, z_bounds = allocate_layers_standard(tds, 25, 0.08)
+        assert counts.sum() == 25
+
+    def test_base_gets_at_least_two(self):
+        tds = np.array([1.5, 3.0, 9.0])
+        counts, _, _ = allocate_layers_standard(tds, 10, 0.08)
+        assert counts[0] >= 2
+
+    def test_min_one_per_color(self):
+        tds = np.array([1.0, 3.0, 5.0, 8.0])
+        counts, _, _ = allocate_layers_standard(tds, 10, 0.08)
+        assert all(c >= 1 for c in counts)
+
+    def test_near_uniform(self):
+        # All bands should be within 1 layer of each other
+        tds = np.array([1.0, 3.0, 9.0])
+        counts, _, _ = allocate_layers_standard(tds, 25, 0.08)
+        assert max(counts) - min(counts) <= 1
+
+    def test_base_gets_two_even_when_tight(self):
+        # With very few layers, base still gets 2
+        tds = np.array([1.0, 3.0, 5.0])
+        counts, _, _ = allocate_layers_standard(tds, 4, 0.08)
+        assert counts[0] >= 2
+        assert all(c >= 1 for c in counts)
+
+    def test_boundaries_monotonic(self):
+        tds = np.array([2.0, 5.0])
+        _, boundaries, z_bounds = allocate_layers_standard(tds, 20, 0.08)
         assert all(boundaries[i] <= boundaries[i+1] for i in range(len(boundaries)-1))
         assert all(z_bounds[i] <= z_bounds[i+1] for i in range(len(z_bounds)-1))
 

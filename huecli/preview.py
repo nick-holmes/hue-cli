@@ -20,6 +20,7 @@ from .color_science import (
     apply_contrast_enhancement,
     apply_unsharp_mask,
     allocate_layers_td_proportional,
+    allocate_layers_standard,
     compute_heightmap,
     render_standard_preview,
     render_standard_preview_layers,
@@ -163,7 +164,7 @@ def generate_preview_scene(config, processed_image, selected_filaments,
         num_colors = len(sorted_filaments)
         filament_tds = np.array([f['transmission_distance']
                                   for _, f in sorted_filaments.iterrows()])
-        layer_counts_arr, layer_boundaries, z_boundaries = allocate_layers_td_proportional(
+        layer_counts_arr, layer_boundaries, z_boundaries = allocate_layers_standard(
             filament_tds, num_layers, layer_height)
 
         tex_enhanced = apply_contrast_enhancement(

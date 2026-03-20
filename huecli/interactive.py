@@ -68,11 +68,15 @@ def fill_interactive(args):
         float
     )
 
-    model_height = args.model_height if args.model_height is not None else prompt_with_default(
-        "Total model height (mm)",
-        2.0,
-        float
-    )
+    # Model height — compute recommended default for standard mode when color count is known
+    if args.model_height is not None:
+        model_height = args.model_height
+    else:
+        model_height = prompt_with_default(
+            "Total model height (mm)",
+            2.0,
+            float
+        )
 
     size_input = args.size if args.size is not None else prompt_with_default(
         "Print size - width x height (mm)",
@@ -144,6 +148,13 @@ def fill_interactive(args):
     if not exploded_any and use_flat_cap and color_count < 2:
         logger.warning("Flat-cap requires at least 2 colors. Setting to 2.")
         color_count = 2
+
+    # Log recommended model height for standard mode
+    if mode == 'standard' and color_count is not None:
+        recommended_layers = 2 + (color_count - 1)  # base=2, rest=1 each minimum
+        recommended_height = recommended_layers * layer_height
+        logger.info(f"Standard mode: minimum {recommended_layers} layers ({recommended_height:.2f}mm) "
+                    f"for {color_count} colors (2 base + {color_count - 1} glaze)")
 
     # Resolve sandwich_layers (color layers per sandwich in exploded modes)
     if args.sandwich_layers is not None:
