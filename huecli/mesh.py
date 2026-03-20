@@ -444,8 +444,6 @@ def generate_topographical_stl(z_bottom, z_top, pixel_mask, pixel_size,
 
     combined_faces = np.vstack(all_faces)
     mesh = trimesh.Trimesh(vertices=vertices, faces=combined_faces, process=False)
-    if not preview:
-        mesh.fix_normals()
 
     logger.info(f"  Shared-vertex grid: {effective_mask.sum():,} pixels, "
                  f"{n_active} corners -> {len(mesh.faces):,} faces")
@@ -598,7 +596,8 @@ def generate_color_band_stls(sorted_filaments, pixel_height, z_boundaries,
         pixel_count = int(np.sum(pixel_mask))
 
         labeled, num_regions = ndimage.label(pixel_mask)
-        min_region_size = 8
+        # Minimum printable region: ~0.8mm² (roughly 4x4 nozzle widths for typical 0.2mm nozzle)
+        min_region_size = max(8, int(0.8 / (pixel_size * pixel_size)))
 
         if num_regions > 1 and i > 0:
             region_sizes = np.bincount(labeled.ravel())
@@ -628,8 +627,8 @@ def generate_color_band_stls(sorted_filaments, pixel_height, z_boundaries,
                 logger.debug(f"    z: {z_bottom_flat:.2f} - {z_top_max:.2f}mm")
 
                 output_path = output_base_path.parent / f"{output_base_path.stem}_{color_name}.stl"
-                mesh = generate_quantized_stl(z_bottom_color, z_top_color,
-                                               color_effective_mask, pixel_size, layer_height)
+                mesh = generate_topographical_stl(z_bottom_color, z_top_color,
+                                                   color_effective_mask, pixel_size, layer_height)
 
                 if len(mesh.vertices) > 0:
                     if collect_meshes:

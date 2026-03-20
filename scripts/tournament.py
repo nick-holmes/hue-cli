@@ -33,11 +33,11 @@ from huecli.image import ImageProcessor
 from huecli.color_science import (
     sort_filaments_by_luminosity,
     apply_contrast_enhancement,
-    apply_unsharp_mask,
-    allocate_layers_td_proportional,
+    allocate_layers_standard,
     compute_heightmap,
     render_standard_preview,
     auto_contrast_preview,
+    score_standard_filament_set,
 )
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
@@ -52,9 +52,11 @@ def render_beer_lambert_image(image_rgb, alpha_mask, sorted_filaments,
                               layer_height, model_height, num_layers,
                               contrast_strength=None, unsharp_strength=None,
                               unsharp_radius=None):
-    """Render a full-resolution Beer-Lambert color simulation image.
+    """Render a full-resolution standard mode preview image.
 
-    Uses heightmap + TD-proportional z-bands for standard topographical rendering.
+    Uses heightmap + near-uniform z-bands with the same pipeline as
+    modes/standard.py: contrast → unsharp → median smooth → heightmap →
+    LAB-interpolated preview.
 
     Returns (H, W, 3) sRGB float array.
     """
@@ -67,19 +69,17 @@ def render_beer_lambert_image(image_rgb, alpha_mask, sorted_filaments,
     if grayscale.max() > grayscale.min():
         grayscale = (grayscale - grayscale.min()) / (grayscale.max() - grayscale.min())
 
-    # Apply contrast enhancement + unsharp mask
+    # Apply contrast enhancement
     cs = contrast_strength if contrast_strength is not None else 2.0
     enhanced = apply_contrast_enhancement(grayscale.copy(), alpha_mask, cs)
-    enhanced = apply_unsharp_mask(enhanced, alpha_mask,
-                                  strength=unsharp_strength or 1.5,
-                                  radius=unsharp_radius or 1.5)
 
-    # Allocate z-bands and compute heightmap
+    # Allocate near-uniform z-bands (matches standard mode pipeline)
     filament_tds = np.array([f['transmission_distance'] for _, f in sorted_filaments.iterrows()])
-    _, _, z_boundaries = allocate_layers_td_proportional(filament_tds, num_layers, layer_height)
-    pixel_height = compute_heightmap(enhanced, alpha_pixels, model_height, layer_height)
+    _, _, z_boundaries = allocate_layers_standard(filament_tds, num_layers, layer_height)
+    pixel_height = compute_heightmap(enhanced, alpha_pixels, model_height, layer_height,
+                                      min_height=float(z_boundaries[1]))
 
-    # Render via Beer-Lambert + auto-contrast
+    # Render via LAB-interpolated preview + auto-contrast
     preview = render_standard_preview(pixel_height, z_boundaries, sorted_filaments)
     result = auto_contrast_preview(preview, alpha_pixels)
     result[~alpha_pixels] = 0.1
@@ -225,6 +225,13 @@ def run_filament_round(filament_lib, img_processor, base_config, n_candidates=4)
         candidate_df = pd.DataFrame(rows).reset_index(drop=True)
         candidate_sets.append(candidate_df)
 
+    # Compute grayscale for stack-aware SA scoring
+    grayscale = (0.2126 * img_processor.image[:, :, 0] +
+                 0.7152 * img_processor.image[:, :, 1] +
+                 0.0722 * img_processor.image[:, :, 2])
+    if grayscale.max() > grayscale.min():
+        grayscale = (grayscale - grayscale.min()) / (grayscale.max() - grayscale.min())
+
     # Now render each candidate (with SA optimization)
     candidates = []
     for i, selected in enumerate(candidate_sets):
@@ -238,6 +245,7 @@ def run_filament_round(filament_lib, img_processor, base_config, n_candidates=4)
             base_config['model_height'],
             base_config['num_layers'],
             mode='standard',
+            grayscale=grayscale,
         )
 
         sorted_fils = sort_filaments_by_luminosity(optimized)

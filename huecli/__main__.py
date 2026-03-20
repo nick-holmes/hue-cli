@@ -205,7 +205,19 @@ def main():
         elif exploded_any:
             img_processor.color_count = color_count
 
-        # 3. Select filaments
+        # 3. Convert to grayscale (needed for standard mode SA scoring)
+        logger.info("Converting to grayscale...")
+        grayscale = (0.2126 * img_processor.image[:, :, 0] +
+                     0.7152 * img_processor.image[:, :, 1] +
+                     0.0722 * img_processor.image[:, :, 2])
+        if grayscale.max() > grayscale.min():
+            grayscale = (grayscale - grayscale.min()) / (grayscale.max() - grayscale.min())
+        else:
+            logger.warning("WARNING: Image has no brightness variation!")
+            grayscale = np.ones_like(grayscale) * 0.5
+        logger.info(f"Grayscale range: {grayscale.min():.3f} to {grayscale.max():.3f}")
+
+        # 4. Select filaments
         num_layers = int(model_height / layer_height)
 
         if args.use_filaments:
@@ -261,6 +273,7 @@ def main():
                 selected_filaments, img_processor.image, img_processor.alpha_mask,
                 layer_height, model_height, num_layers,
                 mode=mode, sandwich_layers=sandwich_layers, use_fill=use_fill,
+                grayscale=grayscale if mode == 'standard' else None,
             )
 
         # 4c. Gamut coverage report (skip when filaments explicitly specified)
@@ -282,19 +295,7 @@ def main():
                         best_de = de
                 logger.info(f"  {row['name']}: {thickness:.2f}mm thick, nearest target deltaE={best_de:.1f}")
 
-        # 5. Convert to grayscale
-        logger.info("Converting to grayscale...")
-        grayscale = (0.2126 * img_processor.image[:, :, 0] +
-                     0.7152 * img_processor.image[:, :, 1] +
-                     0.0722 * img_processor.image[:, :, 2])
-        if grayscale.max() > grayscale.min():
-            grayscale = (grayscale - grayscale.min()) / (grayscale.max() - grayscale.min())
-        else:
-            logger.warning("WARNING: Image has no brightness variation!")
-            grayscale = np.ones_like(grayscale) * 0.5
-        logger.info(f"Grayscale range: {grayscale.min():.3f} to {grayscale.max():.3f}")
-
-        # Build config + processed image for new module API
+        # 5. Build config + processed image for new module API
         pipeline_config = PipelineConfig(
             image_path=args.image,
             layer_height=layer_height,

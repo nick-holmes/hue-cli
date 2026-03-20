@@ -11,7 +11,6 @@ import logging
 from ..color_science import (
     sort_filaments_by_luminosity,
     apply_contrast_enhancement,
-    apply_unsharp_mask,
     allocate_layers_standard,
     compute_heightmap,
     apply_edge_inset,
@@ -39,7 +38,6 @@ def generate(output_base_path, config, processed_image, selected_filaments):
     sorted_filaments = sort_filaments_by_luminosity(selected_filaments)
     enhanced_grayscale = apply_contrast_enhancement(
         processed_image.grayscale.copy(), processed_image.alpha_mask, config.contrast_strength)
-    enhanced_grayscale = apply_unsharp_mask(enhanced_grayscale, processed_image.alpha_mask)
     alpha_pixels = processed_image.alpha_mask >= 0.5
 
     filament_tds = np.array([f['transmission_distance'] for _, f in sorted_filaments.iterrows()])

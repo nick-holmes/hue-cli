@@ -18,7 +18,6 @@ from .color_science import (
     compute_exploded_layer_counts,
     auto_contrast_preview,
     apply_contrast_enhancement,
-    apply_unsharp_mask,
     allocate_layers_td_proportional,
     allocate_layers_standard,
     compute_heightmap,
@@ -169,7 +168,6 @@ def generate_preview_scene(config, processed_image, selected_filaments,
 
         tex_enhanced = apply_contrast_enhancement(
             tex_gray.copy(), tex_alpha, config.contrast_strength)
-        tex_enhanced = apply_unsharp_mask(tex_enhanced, tex_alpha)
         tex_pixel_height = compute_heightmap(
             tex_enhanced, tex_alpha_pixels, model_height, layer_height,
             min_height=float(z_boundaries[1]))
@@ -244,7 +242,6 @@ def generate_preview_scene(config, processed_image, selected_filaments,
 
         geo_enhanced = apply_contrast_enhancement(
             geo_gray.copy(), geo_alpha, config.contrast_strength)
-        geo_enhanced = apply_unsharp_mask(geo_enhanced, geo_alpha)
         geo_pixel_height = compute_heightmap(
             geo_enhanced, geo_alpha_pixels, model_height, layer_height,
             min_height=float(z_boundaries[1]))

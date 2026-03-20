@@ -324,10 +324,10 @@ def apply_contrast_enhancement(brightness, alpha_mask, contrast_strength):
     mean_brightness = np.mean(brightness[alpha_mask >= 0.5])
 
     if mean_brightness > 0.65:
-        gamma = 1.5
+        gamma = 1.8
         enhanced = np.power(brightness, gamma)
         center = np.mean(enhanced)
-        strength = 4.0
+        strength = 6.0
         enhanced = 1.0 / (1.0 + np.exp(-strength * (enhanced - center)))
         enhanced = (enhanced - enhanced.min()) / (enhanced.max() - enhanced.min())
         logger.info(f"Contrast: bright image (mean={mean_brightness:.3f}), gamma={gamma:.2f} + S-curve")
@@ -381,6 +381,137 @@ def apply_unsharp_mask(grayscale, alpha_mask, strength=1.5, radius=1.5):
     logger.info(f"Unsharp mask: strength={strength:.1f}, radius={radius:.1f}px, "
                  f"{spike_count:,} pixels sharpened")
     return sharpened
+
+
+def median_smooth(grayscale, alpha_mask, radius=2):
+    """Edge-preserving median filter for heightmap grayscale.
+
+    Unifies locally-uniform regions (e.g. a card border that looks solid
+    yellow) while preserving sharp edges and text detail. Applied after
+    contrast enhancement and unsharp mask, before heightmap computation.
+
+    Args:
+        grayscale: 2D array (0-1)
+        alpha_mask: 2D array (0-1)
+        radius: Filter radius in pixels (window size = 2*radius + 1)
+
+    Returns:
+        Median-filtered grayscale (0-1)
+    """
+    from scipy.ndimage import median_filter
+
+    alpha_pixels = alpha_mask >= 0.5
+    size = 2 * radius + 1
+    filtered = median_filter(grayscale, size=size)
+    filtered = np.where(alpha_pixels, filtered, 0)
+
+    logger.info(f"Median smooth: {size}x{size} window (radius={radius}px)")
+    return filtered
+
+
+def limit_height_gradient(pixel_height, alpha_pixels, max_slope_per_pixel):
+    """Limit height gradient between adjacent pixels for printability.
+
+    Each pixel's height cannot exceed any neighbor's height by more than
+    max_slope_per_pixel. Iteratively pulls down spikes until convergence.
+    Prevents unprintable vertical walls and travel-heavy isolated peaks.
+
+    Args:
+        pixel_height: 2D array of per-pixel heights (mm)
+        alpha_pixels: 2D boolean mask
+        max_slope_per_pixel: maximum height change per pixel step (mm)
+
+    Returns:
+        Gradient-limited pixel_height (copy)
+    """
+    h = pixel_height.copy()
+
+    for iteration in range(50):
+        max_from_neighbors = np.full_like(h, np.inf)
+
+        # Right neighbor limits current pixel
+        max_from_neighbors[:, :-1] = np.minimum(
+            max_from_neighbors[:, :-1], h[:, 1:] + max_slope_per_pixel)
+        # Left neighbor
+        max_from_neighbors[:, 1:] = np.minimum(
+            max_from_neighbors[:, 1:], h[:, :-1] + max_slope_per_pixel)
+        # Down neighbor
+        max_from_neighbors[:-1, :] = np.minimum(
+            max_from_neighbors[:-1, :], h[1:, :] + max_slope_per_pixel)
+        # Up neighbor
+        max_from_neighbors[1:, :] = np.minimum(
+            max_from_neighbors[1:, :], h[:-1, :] + max_slope_per_pixel)
+
+        h_new = np.minimum(h, max_from_neighbors)
+        h_new = np.where(alpha_pixels, h_new, 0)
+
+        if np.max(np.abs(h - h_new)) < 1e-6:
+            if iteration > 0:
+                logger.debug(f"Gradient limiting converged in {iteration + 1} iterations")
+            break
+        h = h_new
+
+    return h
+
+
+def score_standard_filament_set(filaments_df, ds_enhanced, ds_alpha_pixels,
+                                 ds_lab, model_height, layer_height, num_layers):
+    """Score a filament set for standard mode using stack-aware rendering.
+
+    Renders the front-lit LAB-interpolated preview and compares to the
+    original image in LAB space. This scores the *cumulative appearance*
+    of the filament stack, not individual filaments in isolation.
+
+    Args:
+        filaments_df: DataFrame of candidate filaments
+        ds_enhanced: 2D downsampled enhanced grayscale (0-1)
+        ds_alpha_pixels: 2D boolean mask (downsampled)
+        ds_lab: HxWx3 LAB of original downsampled image
+        model_height: total model height in mm
+        layer_height: layer height in mm
+        num_layers: total layer count
+
+    Returns:
+        float mean delta-E (Euclidean in LAB)
+    """
+    sorted_fils = sort_filaments_by_luminosity(filaments_df)
+    filament_tds = np.array([f['transmission_distance']
+                              for _, f in sorted_fils.iterrows()])
+    _, _, z_bounds = allocate_layers_standard(
+        filament_tds, num_layers, layer_height)
+
+    heightmap = compute_heightmap(
+        ds_enhanced, ds_alpha_pixels, model_height, layer_height,
+        min_height=float(z_bounds[1]))
+
+    preview_rgb = render_standard_preview(heightmap, z_bounds, sorted_fils)
+    preview_lab = color.rgb2lab(np.clip(preview_rgb, 0, 1))
+
+    diff = np.sqrt(np.sum((preview_lab - ds_lab) ** 2, axis=2))
+    return float(np.mean(diff[ds_alpha_pixels]))
+
+
+def recommend_model_height(filament_tds, color_count, layer_height):
+    """Recommend model height for standard mode.
+
+    Targets enough layers per band for smooth color transitions while
+    keeping material usage reasonable. Each band gets at least 3 layers,
+    with a practical floor of 1.5mm.
+
+    Args:
+        filament_tds: array of transmission distances
+        color_count: number of filament colors
+        layer_height: layer height in mm
+
+    Returns:
+        recommended height in mm (rounded to layer_height)
+    """
+    min_layers_per_band = 3
+    ideal_height = color_count * min_layers_per_band * layer_height
+    recommended = max(ideal_height, 1.5)
+    recommended = min(recommended, 5.0)
+    recommended = round(recommended / layer_height) * layer_height
+    return recommended
 
 
 # ---------------------------------------------------------------------------

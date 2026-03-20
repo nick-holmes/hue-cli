@@ -4,7 +4,14 @@ import numpy as np
 import pandas as pd
 import logging
 from skimage import color
-from .color_science import compute_effective_color, allocate_layers_td_proportional, allocate_layers_standard
+from .color_science import (
+    compute_effective_color,
+    allocate_layers_td_proportional,
+    allocate_layers_standard,
+    sort_filaments_by_luminosity,
+    score_standard_filament_set,
+    apply_contrast_enhancement,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -114,8 +121,8 @@ class FilamentLibrary:
                 if too_similar:
                     continue
 
-                if physics_aware:
-                    # Score by rendered colour at estimated thickness
+                if physics_aware and mode != 'standard':
+                    # Non-standard modes: score by Beer-Lambert rendered colour
                     rendered_lab = compute_effective_color(
                         row['rgb'], row['transmission_distance'], estimated_thickness)
                     delta_e = color.deltaE_ciede2000(
@@ -123,14 +130,19 @@ class FilamentLibrary:
                         np.array([[rendered_lab]])
                     )[0][0]
 
-                    # Penalize near-invisible filaments: if opacity at print
-                    # thickness is very low, the filament contributes almost
-                    # nothing to the output regardless of its color match.
                     td = row['transmission_distance']
                     opacity = 1.0 - np.exp(-estimated_thickness / max(td, 0.1))
                     if opacity < 0.15:
-                        # Nearly invisible at this thickness — heavy penalty
                         delta_e += 30.0 * (1.0 - opacity / 0.15)
+                elif physics_aware:
+                    # Standard mode: use raw filament LAB colour.
+                    # Standard mode renders via LAB interpolation between
+                    # band midpoints, not Beer-Lambert, so raw LAB is the
+                    # correct comparison target.
+                    delta_e = color.deltaE_ciede2000(
+                        np.array([[target_lab]]),
+                        np.array([[filament_lab]])
+                    )[0][0]
                 else:
                     delta_e = color.deltaE_ciede2000(
                         np.array([[target_lab]]),
@@ -625,11 +637,13 @@ class FilamentLibrary:
     def optimize_filament_set(self, selected_filaments, image_rgb, alpha_mask,
                                layer_height, model_height, num_layers,
                                mode='standard',
-                               sandwich_layers=1, use_fill=False):
+                               sandwich_layers=1, use_fill=False,
+                               grayscale=None, contrast_strength=2.0):
         """Optimize filament selection via simulated annealing.
 
-        Starts from greedy selection, iteratively swaps filaments and scores
-        the set by mean delta-E on a downsampled image using Beer-Lambert simulation.
+        Standard mode uses stack-aware scoring: renders the cumulative front-lit
+        appearance and compares to the original image. Other modes use Beer-Lambert
+        combo simulation.
 
         Always runs 150 iterations with early stopping (50 no-improvement cutoff).
 
@@ -643,6 +657,8 @@ class FilamentLibrary:
             mode: Generation mode string
             sandwich_layers: Color layers per sandwich
             use_fill: Whether fill is enabled
+            grayscale: HxW grayscale (0-1) for standard mode stack-aware scoring
+            contrast_strength: Contrast enhancement strength for standard mode
 
         Returns:
             Optimized DataFrame of filaments
@@ -668,10 +684,18 @@ class FilamentLibrary:
         ds_lab = color.rgb2lab(ds_rgb)
         alpha_valid = ds_alpha >= 0.5
 
-        logger.info(f"Filament optimization: {iterations} SA iterations on {ds_H}x{ds_W} image")
+        # Precompute enhanced grayscale for standard mode stack-aware scoring
+        ds_enhanced = None
+        if mode == 'standard' and grayscale is not None:
+            ds_gray = grayscale[::ds, ::ds]
+            ds_enhanced = apply_contrast_enhancement(
+                ds_gray.copy(), ds_alpha, contrast_strength)
+
+        logger.info(f"Filament optimization: {iterations} SA iterations on "
+                     f"{ds_H}x{ds_W} image (stack-aware={ds_enhanced is not None})")
 
         def score_filaments(filaments_df):
-            """Score a filament set by mean delta-E via Beer-Lambert simulation."""
+            """Score a filament set by mean delta-E."""
             filament_rgbs = np.array([f['rgb'] for _, f in filaments_df.iterrows()])
             filament_tds = np.array([f['transmission_distance'] for _, f in filaments_df.iterrows()])
 
@@ -719,8 +743,13 @@ class FilamentLibrary:
                 target_lab = ds_lab.reshape(-1, 3)
                 dists, _ = tree.query(target_lab, k=1)
                 return float(np.mean(dists[alpha_valid.ravel()]))
+            elif ds_enhanced is not None:
+                # Standard mode: stack-aware scoring
+                return score_standard_filament_set(
+                    filaments_df, ds_enhanced, alpha_valid,
+                    ds_lab, model_height, layer_height, num_layers)
             else:
-                # Standard mode: score by Beer-Lambert rendered color at allocated thickness
+                # Standard mode fallback (no grayscale provided)
                 layer_counts, _, _ = allocate_layers_standard(
                     filament_tds, num_layers, layer_height)
                 rendered_labs = []

@@ -7,6 +7,8 @@ from huecli.color_science import (
     apply_contrast_enhancement, compute_heightmap, apply_unsharp_mask,
     compute_effective_color, compute_achievable_gamut_sample,
     compute_achievable_gamut,
+    limit_height_gradient, score_standard_filament_set,
+    recommend_model_height, median_smooth, render_standard_preview,
 )
 import pandas as pd
 from skimage import color as skcolor
@@ -201,3 +203,127 @@ class TestAchievableGamut:
         white_lab = skcolor.rgb2lab([[[1.0, 1.0, 1.0]]])[0][0]
         min_dist_to_white = np.min(np.sqrt(np.sum((cloud - white_lab) ** 2, axis=1)))
         assert min_dist_to_white < 1.0
+
+
+class TestLimitHeightGradient:
+    def test_no_change_on_flat(self):
+        h = np.ones((10, 10)) * 0.5
+        alpha = np.ones((10, 10), dtype=bool)
+        result = limit_height_gradient(h, alpha, 0.5)
+        np.testing.assert_array_equal(result, h)
+
+    def test_spike_gets_reduced(self):
+        h = np.zeros((10, 10))
+        alpha = np.ones((10, 10), dtype=bool)
+        h[5, 5] = 10.0  # Tall spike
+        result = limit_height_gradient(h, alpha, 0.5)
+        # Spike should be pulled down significantly
+        assert result[5, 5] < 5.0
+
+    def test_preserves_gradual_slope(self):
+        h = np.zeros((10, 10))
+        alpha = np.ones((10, 10), dtype=bool)
+        for i in range(10):
+            h[i, :] = i * 0.1  # Gradual slope of 0.1 per pixel
+        result = limit_height_gradient(h, alpha, 0.5)  # Max slope 0.5
+        np.testing.assert_allclose(result, h, atol=1e-6)
+
+    def test_respects_alpha_mask(self):
+        h = np.ones((10, 10)) * 0.5
+        alpha = np.zeros((10, 10), dtype=bool)
+        alpha[3:7, 3:7] = True
+        h[5, 5] = 10.0
+        result = limit_height_gradient(h, alpha, 0.5)
+        # Non-alpha pixels should remain 0
+        assert result[0, 0] == 0.0
+
+    def test_symmetric_spike_reduction(self):
+        h = np.zeros((11, 11))
+        alpha = np.ones((11, 11), dtype=bool)
+        h[5, 5] = 5.0
+        result = limit_height_gradient(h, alpha, 1.0)
+        # Peak should be reduced; neighbors should form a cone
+        assert result[5, 5] < 5.0
+        assert result[5, 5] >= result[4, 5]
+
+
+class TestScoreStandardFilamentSet:
+    def test_better_match_scores_lower(self):
+        # Create a simple grayscale gradient image
+        gray = np.linspace(0, 1, 100).reshape(10, 10)
+        alpha = np.ones((10, 10), dtype=bool)
+        # Create image LAB from grayscale
+        rgb = np.stack([gray]*3, axis=-1)
+        lab = skcolor.rgb2lab(rgb)
+
+        # Good match: dark to light filaments
+        good_df = _make_filaments(3)
+        score_good = score_standard_filament_set(
+            good_df, gray, alpha, lab, 2.0, 0.08, 25)
+
+        # Bad match: use only mid-tone filaments
+        bad_df = pd.DataFrame({
+            'name': ['A', 'B', 'C'],
+            'rgb': [(0.5, 0.5, 0.5), (0.55, 0.55, 0.55), (0.6, 0.6, 0.6)],
+            'transmission_distance': [2.0, 3.0, 4.0],
+        })
+        bad_df['lab'] = bad_df['rgb'].apply(lambda rgb: skcolor.rgb2lab([[rgb]])[0][0])
+        score_bad = score_standard_filament_set(
+            bad_df, gray, alpha, lab, 2.0, 0.08, 25)
+
+        # Good set should score lower (less error)
+        assert score_good < score_bad
+
+    def test_returns_finite(self):
+        gray = np.random.rand(10, 10)
+        alpha = np.ones((10, 10), dtype=bool)
+        rgb = np.stack([gray]*3, axis=-1)
+        lab = skcolor.rgb2lab(rgb)
+        df = _make_filaments(3)
+        score = score_standard_filament_set(df, gray, alpha, lab, 2.0, 0.08, 25)
+        assert np.isfinite(score)
+        assert score >= 0
+
+
+class TestRecommendModelHeight:
+    def test_min_floor(self):
+        tds = np.array([1.0, 2.0, 3.0])
+        h = recommend_model_height(tds, 3, 0.08)
+        assert h >= 1.5
+
+    def test_max_ceiling(self):
+        tds = np.array([10.0, 20.0, 30.0])
+        h = recommend_model_height(tds, 10, 0.08)
+        assert h <= 5.0
+
+    def test_rounds_to_layer_height(self):
+        tds = np.array([2.0, 4.0])
+        h = recommend_model_height(tds, 4, 0.08)
+        # Should be a multiple of layer_height
+        assert abs(h / 0.08 - round(h / 0.08)) < 1e-6
+
+    def test_more_colors_more_height(self):
+        tds = np.array([2.0, 4.0, 6.0])
+        h3 = recommend_model_height(tds[:2], 2, 0.08)
+        h5 = recommend_model_height(np.append(tds, [8.0, 10.0]), 5, 0.08)
+        assert h5 >= h3
+
+
+class TestMedianSmooth:
+    def test_preserves_shape(self):
+        gray = np.random.rand(20, 20)
+        alpha = np.ones((20, 20))
+        result = median_smooth(gray, alpha, radius=2)
+        assert result.shape == gray.shape
+
+    def test_zeros_outside_alpha(self):
+        gray = np.ones((10, 10)) * 0.5
+        alpha = np.zeros((10, 10))
+        result = median_smooth(gray, alpha, radius=1)
+        assert result.max() == 0.0
+
+    def test_uniform_region_unchanged(self):
+        gray = np.ones((10, 10)) * 0.7
+        alpha = np.ones((10, 10))
+        result = median_smooth(gray, alpha, radius=2)
+        np.testing.assert_allclose(result, gray, atol=1e-10)

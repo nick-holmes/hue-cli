@@ -7,8 +7,8 @@ Convert images into stacked topographical STL files using Beer-Lambert colour si
 ## How It Works
 
 1. **Colour extraction** — dominant colours are pulled from your image via K-means clustering.
-2. **Filament selection** — candidates are scored using Beer-Lambert physics at their estimated print thickness, not just raw colour. Selection is automatically refined via simulated annealing.
-3. **STL generation** — one STL per filament. Per-pixel thickness varies based on image brightness, creating colour through light transmission. Filaments are sorted dark-to-light with layer height proportional to transmission distance.
+2. **Filament selection** — standard mode uses stack-aware scoring: the SA optimizer renders the full front-lit appearance of the filament stack and compares to the original image. Other modes score via Beer-Lambert physics at estimated print thickness.
+3. **STL generation** — one STL per filament. Per-pixel thickness varies based on image brightness, creating colour through light transmission. Filaments are sorted dark-to-light with near-uniform z-bands.
 
 ## Installation
 
@@ -64,6 +64,8 @@ The browser preview is an interactive Three.js viewer that renders a downsampled
 ### Standard (default)
 
 Stacked topographical STLs — one per colour. Load all into your slicer and assign filaments.
+
+Pipeline: contrast enhancement (adaptive gamma + S-curve) → heightmap → edge inset → topographical mesh. No unsharp mask or median smoothing — these blur text detail.
 
 ### Flat (`--mode flat`)
 
@@ -174,6 +176,16 @@ A `.txt` file with printing instructions is also generated.
 Edit `data/filaments.csv`. Required columns: `Brand`, `Type`, `Color` (hex), `Name`, `TD` (transmission distance in mm), `Tags`.
 
 TD controls material needed to show colour: low TD = opaque, high TD = translucent.
+
+## Tournament Mode
+
+Interactive A/B comparison tool for iterating on colour fidelity. Each round isolates one variable while keeping everything else identical.
+
+```bash
+python3 scripts/tournament.py image.png -f data/filaments.csv -c 8 -n 0.2 -l 0.10 -m 2.40 -s 171x240
+```
+
+4 rounds: Filaments → Contrast → Sharpness → Fine-tune. Each round shows 4 candidates in a browser-based 2×2 grid. Uses the same pipeline as standard mode (near-uniform z-bands, median smoothing, LAB-interpolated preview).
 
 ## Testing
 
