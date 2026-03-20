@@ -74,12 +74,6 @@ class ImageProcessor:
             self.image = np.flipud(self.image)
             self.alpha_mask = np.flipud(self.alpha_mask)
 
-            # DISABLED: Smoothing can reduce detail in high-res images
-            # The continuous heightmap creates smooth slopes naturally
-            # For maximum detail (Pokemon cards), skip smoothing entirely
-            # if self.preserve_details:
-            #     self.image = self._apply_selective_smoothing(self.image)
-
             # Convert to LAB color space
             self.image_lab = color.rgb2lab(self.image)
 
@@ -88,6 +82,32 @@ class ImageProcessor:
         except Exception as e:
             logger.error(f"Failed to load image: {e}")
             raise
+
+    def denoise(self, bilateral_sigma_color=0.03, bilateral_sigma_spatial=1):
+        """Denoise the image using bilateral filtering.
+
+        Bilateral filter smooths flat color regions while preserving edges
+        (keeps text sharp). Applied to self.image in-place; LAB is
+        recomputed from the denoised RGB.
+
+        Args:
+            bilateral_sigma_color: color similarity threshold (0.03 = light)
+            bilateral_sigma_spatial: spatial radius in pixels (1 = tight)
+        """
+        from skimage.restoration import denoise_bilateral
+
+        alpha_pixels = self.alpha_mask >= 0.5
+
+        denoised = denoise_bilateral(
+            self.image, sigma_color=bilateral_sigma_color,
+            sigma_spatial=bilateral_sigma_spatial, channel_axis=-1)
+        denoised = np.where(alpha_pixels[:, :, np.newaxis], denoised, 0)
+
+        self.image = denoised
+        self.image_lab = color.rgb2lab(self.image)
+
+        logger.info(f"Denoised: bilateral "
+                     f"(sc={bilateral_sigma_color}, ss={bilateral_sigma_spatial})")
 
     def quantize_colors(self):
         """Extract dominant colors using K-means clustering

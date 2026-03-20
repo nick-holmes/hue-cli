@@ -170,7 +170,7 @@ def generate_preview_scene(config, processed_image, selected_filaments,
             tex_gray.copy(), tex_alpha, config.contrast_strength)
         tex_pixel_height = compute_heightmap(
             tex_enhanced, tex_alpha_pixels, model_height, layer_height,
-            min_height=float(z_boundaries[1]))
+            min_height=layer_height)
         if config.nozzle_diameter is not None:
             tex_pixel_size = width_mm / tex_W
             tex_pixel_height = apply_edge_inset(
@@ -244,7 +244,7 @@ def generate_preview_scene(config, processed_image, selected_filaments,
             geo_gray.copy(), geo_alpha, config.contrast_strength)
         geo_pixel_height = compute_heightmap(
             geo_enhanced, geo_alpha_pixels, model_height, layer_height,
-            min_height=float(z_boundaries[1]))
+            min_height=layer_height)
         if config.nozzle_diameter is not None:
             geo_pixel_height = apply_edge_inset(
                 geo_pixel_height, z_boundaries, config.nozzle_diameter, geo_pixel_size)

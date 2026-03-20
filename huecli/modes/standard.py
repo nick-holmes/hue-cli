@@ -45,7 +45,7 @@ def generate(output_base_path, config, processed_image, selected_filaments):
         filament_tds, num_layers, config.layer_height)
 
     pixel_height = compute_heightmap(enhanced_grayscale, alpha_pixels, config.model_height, config.layer_height,
-                                     min_height=float(z_boundaries[1]))
+                                     min_height=config.layer_height)
 
     if config.nozzle_diameter is not None:
         pixel_height = apply_edge_inset(pixel_height, z_boundaries,

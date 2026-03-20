@@ -205,19 +205,7 @@ def main():
         elif exploded_any:
             img_processor.color_count = color_count
 
-        # 3. Convert to grayscale (needed for standard mode SA scoring)
-        logger.info("Converting to grayscale...")
-        grayscale = (0.2126 * img_processor.image[:, :, 0] +
-                     0.7152 * img_processor.image[:, :, 1] +
-                     0.0722 * img_processor.image[:, :, 2])
-        if grayscale.max() > grayscale.min():
-            grayscale = (grayscale - grayscale.min()) / (grayscale.max() - grayscale.min())
-        else:
-            logger.warning("WARNING: Image has no brightness variation!")
-            grayscale = np.ones_like(grayscale) * 0.5
-        logger.info(f"Grayscale range: {grayscale.min():.3f} to {grayscale.max():.3f}")
-
-        # 4. Select filaments
+        # 3. Select filaments (on raw image — raw colors give better K-means clusters)
         num_layers = int(model_height / layer_height)
 
         if args.use_filaments:
@@ -236,6 +224,17 @@ def main():
             selected_filaments = pd.DataFrame(rows).reset_index(drop=True)
             color_count = len(selected_filaments)
             logger.info(f"Using specified filaments: {', '.join(requested_names)}")
+
+            # Denoise + grayscale for explicit filaments too
+            if mode == 'standard':
+                img_processor.denoise()
+            grayscale = (0.2126 * img_processor.image[:, :, 0] +
+                         0.7152 * img_processor.image[:, :, 1] +
+                         0.0722 * img_processor.image[:, :, 2])
+            if grayscale.max() > grayscale.min():
+                grayscale = (grayscale - grayscale.min()) / (grayscale.max() - grayscale.min())
+            else:
+                grayscale = np.ones_like(grayscale) * 0.5
         else:
             # Quantize colors and select filaments
             dominant_colors_lab, kmeans, sorted_indices = img_processor.quantize_colors()
@@ -267,6 +266,22 @@ def main():
             logger.info("Selected filaments:")
             for i, row in selected_filaments.iterrows():
                 logger.info(f"  {i+1}. {row['name']} ({row['color_hex']}) TD={row['transmission_distance']:.1f}mm")
+
+            # 3b. Denoise image for heightmap (after filament selection uses raw colors)
+            if mode == 'standard':
+                img_processor.denoise()
+
+            # Convert to grayscale from (possibly denoised) image
+            logger.info("Converting to grayscale...")
+            grayscale = (0.2126 * img_processor.image[:, :, 0] +
+                         0.7152 * img_processor.image[:, :, 1] +
+                         0.0722 * img_processor.image[:, :, 2])
+            if grayscale.max() > grayscale.min():
+                grayscale = (grayscale - grayscale.min()) / (grayscale.max() - grayscale.min())
+            else:
+                logger.warning("WARNING: Image has no brightness variation!")
+                grayscale = np.ones_like(grayscale) * 0.5
+            logger.info(f"Grayscale range: {grayscale.min():.3f} to {grayscale.max():.3f}")
 
             # Always-on filament optimization via simulated annealing
             selected_filaments = filament_lib.optimize_filament_set(

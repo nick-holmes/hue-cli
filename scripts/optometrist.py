@@ -45,34 +45,126 @@ logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
 
+def preprocess_image(image_rgb, alpha_mask,
+                     rgb_denoise='none', rgb_denoise_strength=0.05,
+                     rgb_denoise_spatial=2,
+                     gray_smooth='none', gray_smooth_sigma=1.5,
+                     edge_threshold=0.03):
+    """Preprocess image before the standard pipeline.
+
+    rgb_denoise: 'none', 'bilateral', 'tv', 'gaussian'
+    gray_smooth: 'none', 'bilateral', 'edge_aware', 'gaussian'
+    """
+    from scipy.ndimage import gaussian_filter, sobel
+
+    processed_rgb = image_rgb.copy()
+    alpha_pixels = alpha_mask >= 0.5
+
+    # RGB denoising (smooths colors while preserving edges)
+    if rgb_denoise == 'bilateral':
+        from skimage.restoration import denoise_bilateral
+        processed_rgb = denoise_bilateral(
+            processed_rgb, sigma_color=rgb_denoise_strength,
+            sigma_spatial=rgb_denoise_spatial, channel_axis=-1)
+        processed_rgb = np.where(alpha_pixels[:,:,np.newaxis], processed_rgb, 0)
+    elif rgb_denoise == 'tv':
+        from skimage.restoration import denoise_tv_chambolle
+        processed_rgb = denoise_tv_chambolle(
+            processed_rgb, weight=rgb_denoise_strength, channel_axis=-1)
+        processed_rgb = np.where(alpha_pixels[:,:,np.newaxis], processed_rgb, 0)
+    elif rgb_denoise == 'gaussian':
+        for c in range(3):
+            processed_rgb[:,:,c] = gaussian_filter(processed_rgb[:,:,c], sigma=rgb_denoise_spatial)
+        processed_rgb = np.where(alpha_pixels[:,:,np.newaxis], processed_rgb, 0)
+
+    # Compute grayscale from (possibly denoised) RGB
+    grayscale = (0.2126 * processed_rgb[:, :, 0] +
+                 0.7152 * processed_rgb[:, :, 1] +
+                 0.0722 * processed_rgb[:, :, 2])
+    if grayscale[alpha_pixels].max() > grayscale[alpha_pixels].min():
+        gmin = grayscale[alpha_pixels].min()
+        gmax = grayscale[alpha_pixels].max()
+        grayscale = np.where(alpha_pixels, (grayscale - gmin) / (gmax - gmin), 0)
+
+    # Grayscale smoothing (affects heightmap directly)
+    if gray_smooth == 'bilateral':
+        from skimage.restoration import denoise_bilateral
+        grayscale = denoise_bilateral(
+            grayscale, sigma_color=rgb_denoise_strength,
+            sigma_spatial=rgb_denoise_spatial)
+        grayscale = np.where(alpha_pixels, grayscale, 0)
+    elif gray_smooth == 'edge_aware':
+        edges = np.hypot(sobel(grayscale, axis=0), sobel(grayscale, axis=1))
+        smoothed = gaussian_filter(grayscale, sigma=gray_smooth_sigma)
+        grayscale = np.where(edges > edge_threshold, grayscale, smoothed)
+        grayscale = np.where(alpha_pixels, grayscale, 0)
+    elif gray_smooth == 'gaussian':
+        grayscale = gaussian_filter(grayscale, sigma=gray_smooth_sigma)
+        grayscale = np.where(alpha_pixels, grayscale, 0)
+
+    return processed_rgb, grayscale
+
+
 def render_standard_image(image_rgb, alpha_mask, sorted_filaments,
                           layer_height, model_height, num_layers,
                           contrast_strength=2.0,
-                          unsharp_strength=1.5, unsharp_radius=1.5,
-                          median_radius=2, spike_tolerance=0.15,
+                          unsharp_strength=0, unsharp_radius=1.5,
+                          median_radius=0, spike_tolerance=0.15,
                           edge_inset_rate=0.25, nozzle_diameter=0.2,
                           min_region_mm2=0.8,
-                          contrast_mode='auto', bright_gamma=1.5,
-                          bright_scurve=4.0):
+                          contrast_mode='auto', bright_gamma=1.8,
+                          bright_scurve=6.0,
+                          grayscale_method='bt601',
+                          heightmap_mode='linear',
+                          preview_mode='interp',
+                          contrast_algorithm='global',
+                          min_height_mode='layer',
+                          heightmap_gamma=1.0,
+                          rgb_denoise='none', rgb_denoise_strength=0.05,
+                          rgb_denoise_spatial=2,
+                          gray_smooth='none', gray_smooth_sigma=1.5,
+                          edge_threshold=0.03):
     """Render a standard mode preview with fully parameterized pipeline.
 
     Every tunable is an explicit parameter so the optometrist can sweep them.
 
-    contrast_mode: 'auto' (default adaptive), 'scurve' (always S-curve),
-                   'gamma' (always gamma), 'none' (passthrough)
+    grayscale_method: 'bt601' (luminance weights) or 'lab_l' (LAB L-channel)
+    heightmap_mode: 'linear' (default) or 'equalized' (histogram equalization)
+    preview_mode: 'interp' (LAB interpolation) or 'step' (nearest band color)
+    contrast_algorithm: 'global' (S-curve) or 'clahe' (adaptive local contrast)
+    min_height_mode: 'band1' (z_boundaries[1]) or 'layer' (single layer_height)
+    heightmap_gamma: power curve on normalized grayscale before heightmap (1.0=linear)
     """
+    from skimage import color as skcolor
+
     alpha_pixels = alpha_mask >= 0.5
-    pixel_size = nozzle_diameter  # 1 pixel = 1 nozzle width
+    pixel_size = nozzle_diameter
 
-    # Grayscale
-    grayscale = (0.2126 * image_rgb[:, :, 0] +
-                 0.7152 * image_rgb[:, :, 1] +
-                 0.0722 * image_rgb[:, :, 2])
-    if grayscale.max() > grayscale.min():
-        grayscale = (grayscale - grayscale.min()) / (grayscale.max() - grayscale.min())
+    # Image preprocessing (denoising + grayscale smoothing)
+    processed_rgb, grayscale = preprocess_image(
+        image_rgb, alpha_mask,
+        rgb_denoise=rgb_denoise, rgb_denoise_strength=rgb_denoise_strength,
+        rgb_denoise_spatial=rgb_denoise_spatial,
+        gray_smooth=gray_smooth, gray_smooth_sigma=gray_smooth_sigma,
+        edge_threshold=edge_threshold)
 
-    # Contrast enhancement with selectable algorithm
-    if contrast_mode == 'none' or contrast_strength == 1.0:
+    # Override grayscale method if requested
+    if grayscale_method == 'lab_l':
+        lab = skcolor.rgb2lab(processed_rgb)
+        grayscale = lab[:, :, 0] / 100.0
+        grayscale = np.where(alpha_pixels, grayscale, 0)
+        if grayscale[alpha_pixels].max() > grayscale[alpha_pixels].min():
+            gmin = grayscale[alpha_pixels].min()
+            gmax = grayscale[alpha_pixels].max()
+            grayscale = np.where(alpha_pixels, (grayscale - gmin) / (gmax - gmin), 0)
+
+    # Contrast enhancement
+    if contrast_algorithm == 'clahe':
+        from skimage.exposure import equalize_adapthist
+        grayscale_uint = np.clip(grayscale, 0, 1)
+        enhanced = equalize_adapthist(grayscale_uint, clip_limit=0.03)
+        enhanced = np.where(alpha_pixels, enhanced, 0)
+    elif contrast_mode == 'none' or contrast_strength == 1.0:
         enhanced = grayscale.copy()
     elif contrast_mode == 'scurve':
         center = 0.5
@@ -81,17 +173,18 @@ def render_standard_image(image_rgb, alpha_mask, sorted_filaments,
     elif contrast_mode == 'gamma':
         enhanced = np.power(grayscale, bright_gamma)
     else:
-        # 'auto' — use the existing adaptive function
         enhanced = apply_contrast_enhancement(grayscale.copy(), alpha_mask, contrast_strength)
 
-    # Unsharp mask with custom params
+    # Heightmap gamma (power curve to redistribute brightness)
+    if heightmap_gamma != 1.0:
+        enhanced = np.power(np.clip(enhanced, 0, 1), heightmap_gamma)
+
+    # Unsharp mask (disabled by default from optometrist results)
     if unsharp_strength > 0:
         from scipy.ndimage import gaussian_filter, maximum_filter, minimum_filter
         blurred = gaussian_filter(enhanced, sigma=unsharp_radius)
         sharpened = enhanced + unsharp_strength * (enhanced - blurred)
         sharpened = np.clip(sharpened, 0, 1)
-
-        # Spike suppression with custom tolerance
         orig_local_max = maximum_filter(enhanced, size=3)
         orig_local_min = minimum_filter(enhanced, size=3)
         upper_bound = orig_local_max + spike_tolerance
@@ -111,10 +204,25 @@ def render_standard_image(image_rgb, alpha_mask, sorted_filaments,
     _, _, z_boundaries = allocate_layers_standard(
         filament_tds, num_layers, layer_height)
 
+    # Min height
+    if min_height_mode == 'layer':
+        min_h = layer_height
+    else:
+        min_h = float(z_boundaries[1])
+
     # Heightmap
     pixel_height = compute_heightmap(
         enhanced, alpha_pixels, model_height, layer_height,
-        min_height=float(z_boundaries[1]))
+        min_height=min_h)
+
+    # Histogram equalization of heightmap
+    if heightmap_mode == 'equalized':
+        active = pixel_height[alpha_pixels]
+        if len(active) > 0:
+            sorted_vals = np.sort(active)
+            ranks = np.searchsorted(sorted_vals, pixel_height[alpha_pixels])
+            equalized = min_h + (ranks / len(sorted_vals)) * (model_height - min_h)
+            pixel_height[alpha_pixels] = equalized
 
     # Edge inset with custom rate
     if nozzle_diameter is not None and edge_inset_rate > 0:
@@ -122,9 +230,28 @@ def render_standard_image(image_rgb, alpha_mask, sorted_filaments,
             pixel_height, z_boundaries, nozzle_diameter, pixel_size)
 
     # Render preview
-    preview = render_standard_preview(pixel_height, z_boundaries, sorted_filaments)
-    result = auto_contrast_preview(preview, alpha_pixels)
-    result[~alpha_pixels] = 0.1
+    if preview_mode == 'step':
+        # Step function: each pixel gets the color of the band it's in
+        from skimage import color as skc
+        H, W = pixel_height.shape
+        num_colors = len(sorted_filaments)
+        filament_rgbs = np.array([f['rgb'] for _, f in sorted_filaments.iterrows()])
+
+        result = np.full((H, W, 3), 0.1)
+        for i in range(num_colors):
+            z_lo = z_boundaries[i]
+            z_hi = z_boundaries[i + 1]
+            in_band = alpha_pixels & (pixel_height > z_lo) & (pixel_height <= z_hi)
+            if i == num_colors - 1:
+                in_band |= alpha_pixels & (pixel_height > z_hi)
+            result[in_band] = filament_rgbs[i]
+        # Also color anything at or below band 0 top with band 0 color
+        below = alpha_pixels & (pixel_height <= z_boundaries[1])
+        result[below] = filament_rgbs[0]
+    else:
+        preview = render_standard_preview(pixel_height, z_boundaries, sorted_filaments)
+        result = auto_contrast_preview(preview, alpha_pixels)
+        result[~alpha_pixels] = 0.1
 
     return result
 
@@ -350,32 +477,61 @@ def run_single_round(round_name, val_a, val_b, base_kwargs, args,
         'edge_inset_rate': ('edge_inset_rate', float),
         'bright_gamma': ('bright_gamma', float),
         'bright_scurve': ('bright_scurve', float),
+        'heightmap_gamma': ('heightmap_gamma', float),
+        'rgb_denoise_strength': ('rgb_denoise_strength', float),
+        'rgb_denoise_spatial': ('rgb_denoise_spatial', float),
+        'gray_smooth_sigma': ('gray_smooth_sigma', float),
+        'edge_threshold': ('edge_threshold', float),
     }
 
-    # String-value rounds (contrast algorithm selection)
-    string_rounds = {'contrast_mode'}
+    # String-value rounds (algorithm selection)
+    string_rounds = {'contrast_mode', 'grayscale_method', 'heightmap_mode',
+                     'preview_mode', 'contrast_algorithm', 'min_height_mode',
+                     'rgb_denoise', 'gray_smooth'}
     if round_name in string_rounds:
-        va_str = str(val_a) if not isinstance(val_a, str) else val_a
-        vb_str = str(val_b) if not isinstance(val_b, str) else val_b
-        # val_a/val_b were passed as floats, map back to strings
-        mode_map = {0: 'none', 1: 'auto', 2: 'scurve', 3: 'gamma'}
-        va_str = mode_map.get(int(val_a), str(val_a))
-        vb_str = mode_map.get(int(val_b), str(val_b))
+        # Map numeric shorthand to string values
+        mode_maps = {
+            'contrast_mode': {0: 'none', 1: 'auto', 2: 'scurve', 3: 'gamma'},
+            'grayscale_method': {0: 'bt601', 1: 'lab_l'},
+            'heightmap_mode': {0: 'linear', 1: 'equalized'},
+            'preview_mode': {0: 'interp', 1: 'step'},
+            'contrast_algorithm': {0: 'global', 1: 'clahe'},
+            'min_height_mode': {0: 'band1', 1: 'layer'},
+            'rgb_denoise': {0: 'none', 1: 'bilateral', 2: 'tv', 3: 'gaussian'},
+            'gray_smooth': {0: 'none', 1: 'bilateral', 2: 'edge_aware', 3: 'gaussian'},
+        }
+        m = mode_maps.get(round_name, {})
+        try:
+            va_str = m.get(int(val_a), str(val_a))
+            vb_str = m.get(int(val_b), str(val_b))
+        except (ValueError, TypeError):
+            va_str = str(val_a)
+            vb_str = str(val_b)
 
-        print(f"\nRendering A (contrast_mode={va_str})...")
+        print(f"\nRendering A ({round_name}={va_str})...")
         t0 = time.time()
-        img_a = render_standard_image(**base_kwargs, contrast_mode=va_str)
+        img_a = render_standard_image(**base_kwargs, **{round_name: va_str})
         print(f"  Done in {time.time()-t0:.1f}s")
 
-        print(f"Rendering B (contrast_mode={vb_str})...")
+        print(f"Rendering B ({round_name}={vb_str})...")
         t0 = time.time()
-        img_b = render_standard_image(**base_kwargs, contrast_mode=vb_str)
+        img_b = render_standard_image(**base_kwargs, **{round_name: vb_str})
         print(f"  Done in {time.time()-t0:.1f}s")
 
         label_a = f"A: {va_str}"
         label_b = f"B: {vb_str}"
-        question = "Which has better tonal range and detail?"
-        round_info = f"Contrast algorithm: {va_str} vs {vb_str}"
+        questions = {
+            'contrast_mode': "Which has better tonal range and detail?",
+            'grayscale_method': "Which has sharper text and better detail?",
+            'heightmap_mode': "Which uses more of the color palette?",
+            'preview_mode': "Which looks more like a real print?",
+            'contrast_algorithm': "Which has better text AND color detail?",
+            'min_height_mode': "Which has better dark region detail?",
+            'rgb_denoise': "Which has smoother colors while keeping text sharp?",
+            'gray_smooth': "Which has a cleaner heightmap while keeping text sharp?",
+        }
+        question = questions.get(round_name, "Which looks better?")
+        round_info = f"{round_name}: {va_str} vs {vb_str}"
         show_ab(img_a, img_b, label_a, label_b, question, round_info)
         print(f"\nOpened in browser. Which is better, A or B?")
         return

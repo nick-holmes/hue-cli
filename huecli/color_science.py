@@ -272,7 +272,7 @@ def apply_edge_inset(pixel_height, z_boundaries, nozzle_diameter, pixel_size):
     """
     from scipy.ndimage import binary_erosion
 
-    inset_mm_per_layer = 0.25 * nozzle_diameter
+    inset_mm_per_layer = 0.1 * nozzle_diameter
     min_thickness = z_boundaries[1] - z_boundaries[0] if len(z_boundaries) > 1 else 0.1
 
     for k in range(1, len(z_boundaries) - 1):
@@ -324,10 +324,10 @@ def apply_contrast_enhancement(brightness, alpha_mask, contrast_strength):
     mean_brightness = np.mean(brightness[alpha_mask >= 0.5])
 
     if mean_brightness > 0.65:
-        gamma = 1.8
+        gamma = 1.5
         enhanced = np.power(brightness, gamma)
         center = np.mean(enhanced)
-        strength = 6.0
+        strength = 7.0
         enhanced = 1.0 / (1.0 + np.exp(-strength * (enhanced - center)))
         enhanced = (enhanced - enhanced.min()) / (enhanced.max() - enhanced.min())
         logger.info(f"Contrast: bright image (mean={mean_brightness:.3f}), gamma={gamma:.2f} + S-curve")

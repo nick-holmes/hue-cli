@@ -65,7 +65,7 @@ The browser preview is an interactive Three.js viewer that renders a downsampled
 
 Stacked topographical STLs — one per colour. Load all into your slicer and assign filaments.
 
-Pipeline: contrast enhancement (adaptive gamma + S-curve) → heightmap → edge inset → topographical mesh. No unsharp mask or median smoothing — these blur text detail.
+Pipeline: TV+bilateral image denoise → contrast enhancement (adaptive gamma + S-curve) → heightmap → edge inset → topographical mesh. Denoising creates clean piecewise-flat colour regions while preserving text edges. No unsharp mask or median smoothing — these blur text detail.
 
 ### Flat (`--mode flat`)
 
